@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+"""
+sample-information command
+==========================
+
+Process a CSV file containing sample information and create a Python dictionary
+pickle file that can be used by create-config.
+
+This command is intended for users who generated their own single-cell FASTQ files
+and did not use SRAscraper to download from GEO.
+
+Expected CSV columns:
+- sample_id: Unique identifier for each sample
+- fastq_r1: Path to R1 FASTQ file (can be comma-separated for multiple lanes)
+- fastq_r2: Path to R2 FASTQ file (can be comma-separated for multiple lanes)
+- sample_name: Human-readable sample name (optional)
+- condition: Experimental condition/group (optional)
+- donor: Donor/patient ID for multi-sample studies (optional)
+
+Additional optional columns will be preserved in the metadata.
+"""
+
+import click
+import os
+import sys
+import pickle
+import pandas as pd
+from pathlib import Path
+
+
+def validate_fastq_paths(df, check_existence=True):
+    """
+    Validate that FASTQ paths exist and are properly formatted.
+    
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame with fastq_r1 and fastq_r2 columns
+    check_existence : bool
+        Whether to check if files actually exist
+        
+    Returns
+    -------
+    tuple
+        (is_valid, error_messages)
+    """
+    errors = []
+    
+    for idx, row in df.iterrows():
+        sample_id = row['sample_id']
+        
+        # Handle comma-separated paths for multiple lanes
+        r1_paths = [p.strip() for p in str(row['fastq_r1']).split(',')]
+        r2_paths = [p.strip() for p in str(row['fastq_r2']).split(',')]
+        
+        # Check matching number of R1 and R2 files
+        if len(r1_paths) != len(r2_paths):
+            errors.append(
+                f"Sample {sample_id}: Mismatched number of R1 ({len(r1_paths)}) "
+                f"and R2 ({len(r2_paths)}) files"
+            )
+            continue
+            
+        if check_existence:
+            for r1, r2 in zip(r1_paths, r2_paths):
+                if not os.path.exists(r1):
+                    errors.append(f"Sample {sample_id}: R1 file not found: {r1}")
+                if not os.path.exists(r2):
+                    errors.append(f"Sample {sample_id}: R2 file not found: {r2}")
+                    
+    return len(errors) == 0, errors
+
+
+def create_sample_dict(df):
+    """
+    Convert DataFrame to nested dictionary structure.
+    
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Validated sample information DataFrame
+        
+    Returns
+    -------
+    dict
+        Nested dictionary with sample information
+    """
+    sample_dict = {}
+    
+    for idx, row in df.iterrows():
+        sample_id = row['sample_id']
+        
+        # Parse FASTQ paths
+        r1_paths = [p.strip() for p in str(row['fastq_r1']).split(',')]
+        r2_paths = [p.strip() for p in str(row['fastq_r2']).split(',')]
+        
+        # Build sample entry
+        sample_entry = {
+            'fastq_r1': r1_paths,
+            'fastq_r2': r2_paths,
+            'lanes': len(r1_paths),
+        }
+        
+        # Add optional fields
+        optional_fields = ['sample_name', 'condition', 'donor', 'tissue', 
+                          'species', 'chemistry', 'notes']
+        for field in optional_fields:
+            if field in row and pd.notna(row[field]):
+                sample_entry[field] = row[field]
+                
+        # Add any additional columns as metadata
+        standard_cols = ['sample_id', 'fastq_r1', 'fastq_r2'] + optional_fields
+        for col in df.columns:
+            if col not in standard_cols and pd.notna(row[col]):
+                sample_entry[col] = row[col]
+                
+        sample_dict[sample_id] = sample_entry
+        
+    return sample_dict
+
+
+@click.command('sample-information')
+@click.option(
+    '--input', '-i', 'input_csv',
+    required=True,
+    type=click.Path(exists=True),
+    help='Path to CSV file containing sample information'
+)
+@click.option(
+    '--output', '-o', 'output_pkl',
+    required=True,
+    type=click.Path(),
+    help='Path for output pickle file (sample dictionary)'
+)
+@click.option(
+    '--skip-validation', '-s',
+    is_flag=True,
+    default=False,
+    help='Skip validation of FASTQ file existence (useful for cluster environments)'
+)
+@click.option(
+    '--verbose', '-v',
+    is_flag=True,
+    default=False,
+    help='Print verbose output'
+)
+def sample_information(input_csv, output_pkl, skip_validation, verbose):
+    """
+    Process sample CSV and create sample dictionary pickle.
+    
+    This command reads a CSV file containing information about your single-cell
+    FASTQ files and creates a standardized pickle file that can be used with
+    the create-config command.
+    
+    \b
+    Required CSV columns:
+      - sample_id: Unique identifier for each sample
+      - fastq_r1: Path(s) to R1 FASTQ file(s) - comma-separated for multiple lanes
+      - fastq_r2: Path(s) to R2 FASTQ file(s) - comma-separated for multiple lanes
+    
+    \b
+    Optional CSV columns:
+      - sample_name: Human-readable sample name
+      - condition: Experimental condition/group
+      - donor: Donor/patient ID
+      - tissue: Tissue type
+      - species: Species (default: human)
+      - chemistry: 10X chemistry version (e.g., SC3Pv3)
+      - notes: Additional notes
+    
+    \b
+    Example CSV:
+      sample_id,fastq_r1,fastq_r2,condition,donor
+      S1,/path/S1_R1.fq.gz,/path/S1_R2.fq.gz,tumor,P001
+      S2,/path/S2_R1.fq.gz,/path/S2_R2.fq.gz,normal,P001
+    
+    \b
+    For multi-lane samples:
+      sample_id,fastq_r1,fastq_r2
+      S1,/path/S1_L1_R1.fq.gz,/path/S1_L2_R1.fq.gz,/path/S1_L1_R2.fq.gz,/path/S1_L2_R2.fq.gz
+    
+    \b
+    Example:
+      ClusterCatcher sample-information -i samples.csv -o samples.pkl
+    """
+    
+    click.echo(f"\n{'='*60}")
+    click.echo("ClusterCatcher: sample-information")
+    click.echo(f"{'='*60}\n")
+    
+    # Read CSV
+    click.echo(f"Reading sample information from: {input_csv}")
+    try:
+        df = pd.read_csv(input_csv)
+    except Exception as e:
+        click.echo(f"ERROR: Failed to read CSV file: {e}", err=True)
+        sys.exit(1)
+        
+    # Check required columns
+    required_cols = ['sample_id', 'fastq_r1', 'fastq_r2']
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    if missing_cols:
+        click.echo(f"ERROR: Missing required columns: {missing_cols}", err=True)
+        click.echo(f"Found columns: {list(df.columns)}", err=True)
+        sys.exit(1)
+        
+    # Check for duplicate sample IDs
+    if df['sample_id'].duplicated().any():
+        dups = df[df['sample_id'].duplicated()]['sample_id'].tolist()
+        click.echo(f"ERROR: Duplicate sample IDs found: {dups}", err=True)
+        sys.exit(1)
+        
+    click.echo(f"Found {len(df)} samples")
+    
+    if verbose:
+        click.echo("\nSample IDs:")
+        for sid in df['sample_id']:
+            click.echo(f"  - {sid}")
+            
+    # Validate FASTQ paths
+    if not skip_validation:
+        click.echo("\nValidating FASTQ paths...")
+        is_valid, errors = validate_fastq_paths(df, check_existence=True)
+        if not is_valid:
+            click.echo("ERROR: FASTQ validation failed:", err=True)
+            for err in errors:
+                click.echo(f"  - {err}", err=True)
+            click.echo("\nUse --skip-validation to skip file existence checks", err=True)
+            sys.exit(1)
+        click.echo("  All FASTQ paths validated successfully")
+    else:
+        click.echo("\nSkipping FASTQ path validation (--skip-validation)")
+        
+    # Create sample dictionary
+    click.echo("\nCreating sample dictionary...")
+    sample_dict = create_sample_dict(df)
+    
+    # Create output directory if needed
+    output_dir = os.path.dirname(output_pkl)
+    if output_dir and not os.path.exists(output_dir):
+        os.makedirs(output_dir, exist_ok=True)
+        
+    # Save pickle
+    click.echo(f"Saving to: {output_pkl}")
+    with open(output_pkl, 'wb') as f:
+        pickle.dump(sample_dict, f)
+        
+    click.echo(f"\n{'='*60}")
+    click.echo("SUCCESS: Sample information processed")
+    click.echo(f"{'='*60}")
+    click.echo(f"\nOutput: {output_pkl}")
+    click.echo(f"Samples: {len(sample_dict)}")
+    click.echo("\nNext step:")
+    click.echo(f"  ClusterCatcher create-config --samples {output_pkl} --output config.yaml")
+    click.echo("")
+
+
+if __name__ == '__main__':
+    sample_information()

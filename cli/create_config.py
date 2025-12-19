@@ -47,6 +47,7 @@ def get_default_config():
             'genome': 'GRCh38',
             'transcriptome': None,  # Path to Cell Ranger transcriptome reference (REQUIRED)
             'fasta': None,          # Path to reference FASTA (for SComatic)
+            'gtf': None,            # Path to GTF annotation file (for inferCNV)
         },
         
         # Cell Ranger settings
@@ -68,14 +69,27 @@ def get_default_config():
             'min_genes': 200,
             'min_cells': 3,
             'max_genes': 5000,
+            'min_counts': 500,
+            'max_counts': 50000,
             'max_pct_mito': 20,
             'doublet_removal': True,
+            'doublet_rate': 0.06,
+        },
+        
+        # Preprocessing parameters
+        'preprocessing': {
+            'target_sum': 1e4,       # Normalization target
+            'n_top_genes': 2000,     # Number of HVGs
+            'n_pcs': 50,             # PCA components
+            'n_neighbors': 15,       # For neighbor graph
+            'leiden_resolution': 1.0,
         },
         
         # Cell annotation
         'annotation': {
-            'method': 'popv',  # popv, celltypist, or both
-            'reference_dataset': 'pbmc',  # Reference for annotation
+            'method': 'popv',  # popv or leiden
+            'popv_model': 'popv_immune_All_human_umap_from_cellxgene',  # HuggingFace model
+            'batch_key': 'sample_id',
             'min_confidence': 0.5,
         },
         
@@ -273,6 +287,11 @@ def merge_configs(default, user):
     help='Path to reference FASTA for SComatic'
 )
 @click.option(
+    '--gtf',
+    type=click.Path(),
+    help='Path to GTF annotation file (for inferCNV chromosomal locations)'
+)
+@click.option(
     '--kraken2-db',
     type=click.Path(),
     help='Path to Kraken2 database for viral detection'
@@ -330,8 +349,25 @@ def merge_configs(default, user):
 @click.option(
     '--annotation-method',
     default='popv',
-    type=click.Choice(['popv', 'celltypist', 'both']),
+    type=click.Choice(['popv', 'leiden']),
     help='Cell type annotation method (default: popv)'
+)
+@click.option(
+    '--popv-model',
+    default='popv_immune_All_human_umap_from_cellxgene',
+    help='popV model from HuggingFace (default: popv_immune_All_human_umap_from_cellxgene)'
+)
+@click.option(
+    '--leiden-resolution',
+    default=1.0,
+    type=float,
+    help='Resolution for Leiden clustering (default: 1.0)'
+)
+@click.option(
+    '--n-hvgs',
+    default=2000,
+    type=int,
+    help='Number of highly variable genes for preprocessing (default: 2000)'
 )
 @click.option(
     '--min-genes',
@@ -358,10 +394,11 @@ def merge_configs(default, user):
     help='Print verbose output'
 )
 def create_config(samples_pkl, output_yaml, results_dir, threads, memory,
-                  transcriptome, genome, reference_fasta, kraken2_db,
+                  transcriptome, genome, reference_fasta, gtf, kraken2_db,
                   chemistry, expect_cells, force_cells, no_introns, no_bam,
                   no_viral_detection, no_scomatic,
                   no_signatures, cosmic_signatures, annotation_method,
+                  popv_model, leiden_resolution, n_hvgs,
                   min_genes, max_mito, force, verbose):
     """
     Generate master configuration YAML for the pipeline.
@@ -430,6 +467,7 @@ def create_config(samples_pkl, output_yaml, results_dir, threads, memory,
     config['reference']['genome'] = genome
     config['reference']['transcriptome'] = transcriptome
     config['reference']['fasta'] = reference_fasta
+    config['reference']['gtf'] = gtf
     
     config['cellranger']['chemistry'] = chemistry
     config['cellranger']['localcores'] = threads
@@ -445,7 +483,11 @@ def create_config(samples_pkl, output_yaml, results_dir, threads, memory,
     config['qc']['min_genes'] = min_genes
     config['qc']['max_pct_mito'] = max_mito
     
+    config['preprocessing']['n_top_genes'] = n_hvgs
+    config['preprocessing']['leiden_resolution'] = leiden_resolution
+    
     config['annotation']['method'] = annotation_method
+    config['annotation']['popv_model'] = popv_model
     
     config['viral_detection']['enabled'] = not no_viral_detection
     config['viral_detection']['kraken2_db'] = kraken2_db

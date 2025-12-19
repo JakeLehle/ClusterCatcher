@@ -1,47 +1,44 @@
-import setuptools
+#!/usr/bin/env python3
 
-#with open('README.md', 'r') as fh:
-#   long_description = fh.read()
+from setuptools import setup, find_packages
 
-setuptools.setup(
-    name='OmniScrape',
+setup(
+    name='ClusterCatcher',
     version='0.1.0',
+    description='Single-cell sequencing analysis pipeline for mutation signature detection and cell annotation',
     author='Jake Lehle',
-    author_email='jlehle@txbiomed.org',
-    description='Scraping the GEO database for ALL scRNA-seq datasets.',
-    packages=[
-        'cli',
-        'snakemake_wrapper'
-    ],
-    py_modules=[
-        'cli'
-    ],
+    author_email='',
+    url='https://github.com/JakeLehle/ClusterCatcher',
+    license='GPL-3.0',
+    packages=find_packages(),
+    include_package_data=True,
     package_data={
-        'snakemake_wrapper': [
-            'scripts/*.py',
-            'scripts/*.sh',
-            'envs/*.yaml',
-            'Snakefile'
+        'snakemake_wrapper': ['Snakefile', 'scripts/*', 'envs/*'],
+    },
+    entry_points={
+        'console_scripts': [
+            'ClusterCatcher=cli.cli:main',
         ],
-        'cli': [
-            'optionals.yaml'
-        ]
     },
     install_requires=[
         'click',
-        'ruamel.yaml',
-        'snakemake'
+        'snakemake>=7.0',
+        'pyyaml',
+        'pandas',
+        'numpy',
     ],
+    python_requires='>=3.8',
     classifiers=[
-        'Programming Language :: Python :: 3',
+        'Development Status :: 3 - Alpha',
+        'Intended Audience :: Science/Research',
         'License :: OSI Approved :: GNU General Public License v3 (GPLv3)',
-        'Operating System :: POSIX :: Linux',
+        'Natural Language :: English',
+        'Programming Language :: Python :: 3',
+        'Programming Language :: Python :: 3.8',
+        'Programming Language :: Python :: 3.9',
+        'Programming Language :: Python :: 3.10',
+        'Programming Language :: Python :: 3.11',
         'Topic :: Scientific/Engineering :: Bio-Informatics',
-        'Development Status :: 4 - Beta',
-        'Intended Audience :: Science/Research'
     ],
-    entry_points='''
-        [console_scripts]
-        OmniScrape=cli.cli:main
-    '''
+    keywords='single-cell sequencing mutational-signatures cancer bioinformatics',
 )
