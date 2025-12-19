@@ -1,14 +1,46 @@
-name: OmniScrape
+name: ClusterCatcher
 channels:
   - conda-forge
   - bioconda
+  - defaults
 dependencies:
-  - python >=3.10,<3.11.0a0
-  - r-base
-  - spyder
-  - sra-tools >=3.0.0
-  - parallel-fastq-dump
-  - jupyterlab
-  - firefox
-  - geoparse
-  - cython
+  # Core Python
+  - python>=3.11
+  - pip
+  
+  # Pipeline management
+  - snakemake>=7.0
+  - mamba
+  
+  # CLI and utilities
+  - click
+  - pyyaml
+  - pandas
+  - numpy
+  
+  # Bioinformatics core
+  - samtools
+  - bedtools
+  - bcftools
+  
+  # Cell Ranger (note: requires separate installation from 10X)
+  # Install via: https://support.10xgenomics.com/single-cell-gene-expression/software/downloads/latest
+  
+  # Scanpy ecosystem
+  - scanpy
+  - anndata
+  - leidenalg
+  - python-igraph
+  
+  # Visualization
+  - matplotlib
+  - seaborn
+  
+  # Kraken2 for viral detection
+  - kraken2
+  
+  # Additional tools installed via pip
+  - pip:
+    - scipy
+    - scikit-learn
+    - popV

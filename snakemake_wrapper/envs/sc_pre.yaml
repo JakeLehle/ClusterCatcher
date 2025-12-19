@@ -1,0 +1,76 @@
+channels:
+  - conda-forge
+  - bioconda
+  - plotly
+dependencies:
+  # Core Python
+  - python=3.11
+  - cython
+  - numpy
+  - pandas
+  - scipy
+  - scikit-learn
+  
+  # Scanpy ecosystem
+  - scanpy
+  - anndata
+  - leidenalg
+  - louvain
+  - python-igraph
+  - bbknn
+  - umap-learn
+  - pynndescent
+  - fa2
+  
+  # Cell annotation
+  - celltypist
+  - cellxgene-census
+  - scvi-tools
+  
+  # CNV analysis
+  - infercnvpy
+  - gffutils
+  
+  # Visualization
+  - matplotlib-base
+  - seaborn
+  - plotly-orca
+  - hvplot
+  - adjusttext
+  
+  # Data handling
+  - pybiomart
+  - goatools
+  - geoparse
+  
+  # SRA tools (for SRAscraper compatibility)
+  - awscli
+  - parallel-fastq-dump
+  - pysradb
+  - python-wget
+  - sra-tools>=3.0.0
+  
+  # Utilities
+  - pyyaml
+  - shutil
+  - jupyter_core
+  - jupyterlab
+  
+  # MultiQC for reports
+  - multiqc
+  
+  # GSEA
+  - bioconda::gseapy
+  
+  # GUI tools (optional, can be removed for headless)
+  - pyqt
+  - qt
+  - firefox
+  - pygraphviz
+  
+  # pip dependencies
+  - pip
+  - pip:
+    - scrublet           # For doublet detection
+    - popv               # For cell annotation consensus
+    - cytotrace2-py      # For stemness scoring (install from github if needed)
