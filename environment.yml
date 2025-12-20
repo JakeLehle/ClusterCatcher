@@ -5,7 +5,7 @@ channels:
   - defaults
 dependencies:
   # Core Python
-  - python>=3.11
+  - python>=3.8
   - pip
   
   # Pipeline management
@@ -43,4 +43,3 @@ dependencies:
   - pip:
     - scipy
     - scikit-learn
-    - popV

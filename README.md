@@ -67,6 +67,87 @@ wget https://cf.10xgenomics.com/supp/cell-exp/refdata-gex-GRCh38-2020-A.tar.gz
 tar -xzf refdata-gex-GRCh38-2020-A.tar.gz
 ```
 
+### 6. Set up Kraken2 database (optional, for viral detection)
+
+If you want to use the viral/microbial detection feature, you need to set up a Kraken2 database. This is a one-time setup.
+
+#### Option A: Download pre-built database
+
+```bash
+# Create database directory
+mkdir -p ~/kraken2_db
+
+# Download a pre-built viral database (smallest option)
+# See: https://benlangmead.github.io/aws-indexes/k2 for options
+wget https://genome-idx.s3.amazonaws.com/kraken/k2_viral_20231009.tar.gz
+tar -xzf k2_viral_20231009.tar.gz -C ~/kraken2_db/viral
+```
+
+#### Option B: Build custom database
+
+For more control, build your own database:
+
+```bash
+# Install Kraken2 (if not already installed)
+conda create -n kraken2_build -c bioconda kraken2 blast
+conda activate kraken2_build
+
+# Create database directory
+mkdir -p ~/kraken2_db/custom_viral
+cd ~/kraken2_db/custom_viral
+
+# Download taxonomy
+kraken2-build --download-taxonomy --db .
+
+# Download viral library
+kraken2-build --download-library viral --db .
+
+# Or add custom sequences (e.g., human disease-associated viruses only)
+# kraken2-build --add-to-library your_sequences.fasta --db .
+
+# Build the database (adjust threads as needed)
+kraken2-build --build --db . --threads 16
+
+# Generate inspect file (required for organism names)
+kraken2-inspect --db . > inspect.txt
+
+# Clean up intermediate files (optional, saves space)
+kraken2-build --clean --db .
+```
+
+#### Option C: Human disease-associated viruses only
+
+For cancer research, you may want only human viruses known to cause disease:
+
+```bash
+# Create filtered database
+mkdir -p ~/kraken2_db/human_viral
+
+# Download NCBI viral sequences
+datasets download virus genome taxon "human virus" --filename human_viruses.zip
+unzip human_viruses.zip
+
+# Add to Kraken2 database
+kraken2-build --download-taxonomy --db ~/kraken2_db/human_viral
+kraken2-build --add-to-library ncbi_dataset/data/genomic.fna --db ~/kraken2_db/human_viral
+kraken2-build --build --db ~/kraken2_db/human_viral --threads 16
+kraken2-inspect --db ~/kraken2_db/human_viral > ~/kraken2_db/human_viral/inspect.txt
+```
+
+#### Verify database setup
+
+```bash
+# Check database files exist
+ls -la ~/kraken2_db/viral/
+# Should contain: hash.k2d, opts.k2d, taxo.k2d, inspect.txt
+
+# Test with a small query
+echo ">test" > test.fa
+echo "ATCGATCGATCGATCG" >> test.fa
+kraken2 --db ~/kraken2_db/viral test.fa
+rm test.fa
+```
+
 ## Quick Start
 
 ### For new users (with their own FASTQ files)
@@ -234,6 +315,155 @@ Cell Ranger will attempt automatic chemistry detection. If needed, you can speci
 - `SC5P-PE`, `SC5P-R2`: 5' paired-end or R2-only
 
 The pipeline will automatically try multiple chemistry options if the specified one fails.
+
+## Cancer Cell Detection
+
+The pipeline uses a dual-model approach combining CytoTRACE2 (stemness scoring) and inferCNV (copy number variation) to identify cancer cells with high confidence.
+
+### How it works
+
+1. **CytoTRACE2**: Scores each cell's developmental potential/stemness (0-1 scale)
+2. **Threshold Detection**: Automatically detects the bimodal threshold separating normal and cancer populations
+3. **InferCNV**: Uses normal cells as reference to detect copy number variations
+4. **Agreement Scoring**: Calculates weighted agreement between both models
+5. **Final Classification**: Cells are classified as cancer only if both models agree
+
+### CytoTRACE2 Setup
+
+CytoTRACE2 requires manual installation from GitHub:
+
+```bash
+# Clone the repository
+git clone https://github.com/digitalcytometry/cytotrace2.git
+cd cytotrace2/cytotrace2_python
+
+# Install in your conda environment
+conda activate ClusterCatcher
+pip install .
+```
+
+### GTF File Requirement
+
+InferCNV requires a GTF annotation file to map genes to chromosomal positions. You should provide the same GTF file used for Cell Ranger reference:
+
+```bash
+# For Cell Ranger GRCh38 reference
+gunzip refdata-gex-GRCh38-2020-A/genes/genes.gtf.gz
+
+# Then specify in config
+ClusterCatcher create-config \
+    --samples samples.pkl \
+    --gtf /path/to/genes.gtf \
+    ...
+```
+
+### Configuration Options
+
+```yaml
+dysregulation:
+  enabled: true
+  cytotrace2:
+    species: human          # human or mouse
+    max_cells_per_chunk: 200000  # Reduce for memory issues
+    seed: 42
+  infercnv:
+    window_size: 250        # Genomic window size
+  agreement:
+    alpha: 0.5              # 0.5 = equal weight to rank and value agreement
+    min_correlation: 0.5    # Minimum Spearman rho for quartile selection
+```
+
+### Outputs
+
+The cancer detection step produces:
+- `adata_cancer_detected.h5ad`: AnnData with all scores and classifications
+- `cancer_detection_summary.tsv`: Summary statistics
+- `figures/`: Comprehensive visualization plots including:
+  - Score distribution histograms
+  - Threshold detection plots
+  - Chromosome heatmaps
+  - Agreement analysis
+  - Final UMAP visualizations
+
+## Viral Detection
+
+The viral detection module uses Kraken2 to identify viral/microbial sequences in unmapped reads from Cell Ranger. This creates a sparse matrix similar to Cell Ranger's gene expression matrix, but with organisms instead of genes.
+
+### How it works
+
+1. **Extract unmapped reads**: Reads that didn't map to the human genome are extracted from Cell Ranger's BAM file
+2. **Kraken2 classification**: Unmapped reads are classified against a Kraken2 database
+3. **Single-cell assignment**: Using cell barcodes and UMIs from the original BAM, each organism detection is linked back to specific cells
+4. **Matrix generation**: A sparse matrix (cells × organisms) is created for integration with downstream analysis
+5. **Viral integration**: Optionally filter to human-specific viruses and integrate with gene expression
+
+### Two Kraken2 Databases
+
+The pipeline can use two Kraken2 databases:
+
+1. **Primary Database** (`--kraken2-db`): Used for classification. Can be broad (all viruses) or specific.
+2. **Human Viral Database** (`--human-viral-db`): Optional. Filters results to human-associated viruses only.
+
+### Setting up the Human Viral Database
+
+```bash
+# Create human-specific viral database
+mkdir -p ~/kraken2_db/human_viral
+kraken2-build --download-taxonomy --db ~/kraken2_db/human_viral
+
+# Download human viral sequences
+datasets download virus genome taxon "human virus" --filename human_viruses.zip
+unzip human_viruses.zip
+
+# Build database
+kraken2-build --add-to-library ncbi_dataset/data/genomic.fna --db ~/kraken2_db/human_viral
+kraken2-build --build --db ~/kraken2_db/human_viral --threads 16
+
+# Generate inspect file (REQUIRED for viral integration)
+kraken2-inspect --db ~/kraken2_db/human_viral > ~/kraken2_db/human_viral/inspect.txt
+```
+
+### Configuration options
+
+```yaml
+viral_detection:
+  enabled: true
+  kraken2_db: /path/to/kraken2_db          # Primary database
+  human_viral_db: /path/to/inspect.txt     # For human virus filtering
+  confidence: 0.0                           # Kraken2 confidence (0.0-1.0)
+  include_organisms:                        # Only include these (optional)
+    - "Human papillomavirus"
+    - "Epstein-Barr"
+  exclude_organisms:                        # Exclude these (optional)
+    - "Bacteriophage"
+  organisms_of_interest:                    # Highlight in reports
+    - "Human papillomavirus"
+    - "Epstein-Barr virus"
+```
+
+### Filtering organisms
+
+You can filter the results in two ways:
+
+1. **At detection time**: Use `--include-organisms` or `--exclude-organisms` to filter during Kraken2 processing
+2. **At integration time**: Provide `--human-viral-db` to filter to human-specific viruses
+
+Example:
+```bash
+ClusterCatcher create-config \
+    --samples samples.pkl \
+    --kraken2-db ~/kraken2_db/viral \
+    --human-viral-db ~/kraken2_db/human_viral/inspect.txt \
+    --output config.yaml
+```
+
+### Viral Integration Outputs
+
+- `adata_with_virus.h5ad`: Expression data with top virus counts added
+- `adata_viral_integrated.h5ad`: Full integrated data (genes + viruses)
+- `viral_integration_summary.tsv`: Summary statistics
+- `virus_scores.tsv`: Aggregated scores by cell type
+- `figures/`: Matrix plots, UMAPs, violin plots
 
 ## Configuration Reference
 

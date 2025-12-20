@@ -1,0 +1,40 @@
+channels:
+  - conda-forge
+  - bioconda
+  - plotly
+dependencies:
+  # Alignment and mapping tools
+  - bbmap=38.90
+  - bowtie2=2.4.2
+  
+  # BAM/SAM processing
+  - pysam=0.22.0
+  - samtools
+  - htseq=2.0.5
+  
+  # Bed tools
+  - pybedtools>=0.8.1
+  - bedops
+  - deeptools>=3.5.5
+  - pygenometracks>=3.6
+  
+  # Kraken2 and related
+  - bioconda::kraken2
+  - bracken
+  
+  # Data handling
+  - biopython
+  - ncbi-datasets-cli
+  - conda-forge::regex
+  
+  # Visualization
+  - matplotlib
+  - seaborn>=0.13
+  
+  # Utilities
+  - scipy
+  - pandas
+  - numpy
+  
+  # System
+  - menuinst=2.1.2
