@@ -93,32 +93,44 @@ def get_default_config():
             'min_confidence': 0.5,
         },
         
-        # Dysregulation detection
+        # Dysregulation detection (Cancer cell identification)
+        # Uses CytoTRACE2 (stemness) and inferCNV (copy number variation)
         'dysregulation': {
-            'run_cytotrace2': True,
-            'run_infercnv': True,
+            'enabled': True,
             'cytotrace2': {
-                'species': 'human',
+                'species': 'human',           # human or mouse
+                'max_cells_per_chunk': 200000,  # Chunk size for large datasets
+                'seed': 42,
             },
             'infercnv': {
-                'cutoff': 0.1,
-                'cluster_by_groups': True,
-                'denoise': True,
-                'HMM': True,
+                'window_size': 250,           # Genomic window size
+                'step': 10,
+                'dynamic_threshold': 1.5,
+            },
+            'agreement': {
+                'alpha': 0.5,                 # Weight: 0=value only, 1=rank only, 0.5=both
+                'min_correlation': 0.5,       # Min Spearman rho for quartile selection
             },
         },
         
-        # Viral detection
+        # Viral detection (Kraken2)
+        # Requires: Kraken2 database setup (see README for instructions)
         'viral_detection': {
             'enabled': True,
-            'kraken2_db': None,  # Path to Kraken2 database
-            'confidence': 0.1,
-            'min_hit_groups': 2,
-            'viruses_of_interest': [
+            'kraken2_db': None,       # Path to Kraken2 database (REQUIRED if enabled)
+            'human_viral_db': None,   # Path to human-specific viral Kraken2 inspect.txt (for filtering)
+            'confidence': 0.0,        # Kraken2 confidence threshold (0.0-1.0)
+            'include_organisms': None,  # List of organism patterns to include (None = all)
+            'exclude_organisms': None,  # List of organism patterns to exclude
+            'organisms_of_interest': [  # Organisms to highlight in reports
                 'Human papillomavirus',
                 'Epstein-Barr virus',
                 'Hepatitis B virus',
+                'Hepatitis C virus',
                 'Human T-lymphotropic virus',
+                'Human immunodeficiency virus',
+                'Merkel cell polyomavirus',
+                'Kaposi sarcoma-associated herpesvirus',
             ],
         },
         
@@ -297,6 +309,11 @@ def merge_configs(default, user):
     help='Path to Kraken2 database for viral detection'
 )
 @click.option(
+    '--human-viral-db',
+    type=click.Path(),
+    help='Path to human-specific viral Kraken2 database inspect.txt (for filtering)'
+)
+@click.option(
     '--chemistry',
     default='auto',
     help='10X chemistry version (default: auto)'
@@ -330,10 +347,50 @@ def merge_configs(default, user):
     help='Disable viral detection step'
 )
 @click.option(
+    '--kraken2-confidence',
+    default=0.0,
+    type=float,
+    help='Kraken2 confidence threshold (0.0-1.0, default: 0.0)'
+)
+@click.option(
+    '--include-organisms',
+    type=str,
+    help='Comma-separated organism patterns to include in viral detection'
+)
+@click.option(
+    '--exclude-organisms',
+    type=str,
+    help='Comma-separated organism patterns to exclude from viral detection'
+)
+@click.option(
     '--no-scomatic',
     is_flag=True,
     default=False,
     help='Disable somatic mutation calling'
+)
+@click.option(
+    '--no-cancer-detection',
+    is_flag=True,
+    default=False,
+    help='Disable cancer cell detection (CytoTRACE2 + inferCNV)'
+)
+@click.option(
+    '--cytotrace-species',
+    default='human',
+    type=click.Choice(['human', 'mouse']),
+    help='Species for CytoTRACE2 (default: human)'
+)
+@click.option(
+    '--cytotrace-chunk-size',
+    default=200000,
+    type=int,
+    help='Max cells per CytoTRACE2 chunk (default: 200000)'
+)
+@click.option(
+    '--agreement-alpha',
+    default=0.5,
+    type=float,
+    help='Weight for rank vs value agreement (0-1, default: 0.5)'
 )
 @click.option(
     '--no-signatures',
@@ -394,9 +451,11 @@ def merge_configs(default, user):
     help='Print verbose output'
 )
 def create_config(samples_pkl, output_yaml, results_dir, threads, memory,
-                  transcriptome, genome, reference_fasta, gtf, kraken2_db,
+                  transcriptome, genome, reference_fasta, gtf, kraken2_db, human_viral_db,
                   chemistry, expect_cells, force_cells, no_introns, no_bam,
-                  no_viral_detection, no_scomatic,
+                  no_viral_detection, kraken2_confidence, include_organisms, exclude_organisms,
+                  no_scomatic, no_cancer_detection, cytotrace_species, cytotrace_chunk_size,
+                  agreement_alpha,
                   no_signatures, cosmic_signatures, annotation_method,
                   popv_model, leiden_resolution, n_hvgs,
                   min_genes, max_mito, force, verbose):
@@ -491,9 +550,20 @@ def create_config(samples_pkl, output_yaml, results_dir, threads, memory,
     
     config['viral_detection']['enabled'] = not no_viral_detection
     config['viral_detection']['kraken2_db'] = kraken2_db
+    config['viral_detection']['human_viral_db'] = human_viral_db
+    config['viral_detection']['confidence'] = kraken2_confidence
+    if include_organisms:
+        config['viral_detection']['include_organisms'] = include_organisms.split(',')
+    if exclude_organisms:
+        config['viral_detection']['exclude_organisms'] = exclude_organisms.split(',')
     
     config['scomatic']['enabled'] = not no_scomatic
     config['scomatic']['reference_fasta'] = reference_fasta
+    
+    config['dysregulation']['enabled'] = not no_cancer_detection
+    config['dysregulation']['cytotrace2']['species'] = cytotrace_species
+    config['dysregulation']['cytotrace2']['max_cells_per_chunk'] = cytotrace_chunk_size
+    config['dysregulation']['agreement']['alpha'] = agreement_alpha
     
     config['signatures']['enabled'] = not no_signatures
     config['signatures']['relevant_signatures'] = cosmic_signatures.split(',')

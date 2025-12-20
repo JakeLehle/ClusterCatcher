@@ -1,536 +1,542 @@
-#!/usr/bin/env python3
 """
-create-config command
-=====================
+ClusterCatcher Snakemake Pipeline
+=================================
 
-Generate the master configuration YAML file for the ClusterCatcher pipeline.
+Single-cell sequencing analysis pipeline for:
+1. Cell Ranger alignment and counting
+2. Scanpy QC and cell filtering
+3. Cell type annotation (popV/CellTypist)
+4. Dysregulation detection (CytoTRACE2 + inferCNV)
+5. Viral detection in unmapped reads (Kraken2)
+6. Somatic mutation calling (SComatic)
+7. Mutational signature deconvolution (semi-supervised NMF)
 
-This command takes sample information (either from sample-information command
-or directly from SRAscraper output) and user-specified parameters to create
-a comprehensive configuration file for the Snakemake pipeline.
+Configuration is loaded from the YAML file specified at runtime.
 """
 
-import click
 import os
-import sys
-import pickle
-import yaml
 from pathlib import Path
-from datetime import datetime
 
+# ============================================================================
+# Configuration
+# ============================================================================
 
-def get_default_config():
+configfile: "config.yaml"
+
+# Extract configuration values
+OUTPUT_DIR = config.get("output_dir", "results")
+TEMP_DIR = config.get("temp_dir", "tmp")
+LOG_DIR = config.get("log_dir", "logs")
+THREADS = config.get("threads", 8)
+
+# Sample information
+SAMPLES = config.get("samples", {})
+SAMPLE_IDS = list(SAMPLES.keys())
+
+# Reference paths
+TRANSCRIPTOME_REF = config.get("reference", {}).get("transcriptome")
+GENOME_BUILD = config.get("reference", {}).get("genome", "GRCh38")
+REFERENCE_FASTA = config.get("reference", {}).get("fasta")
+KRAKEN2_DB = config.get("viral_detection", {}).get("kraken2_db")
+
+# Feature flags
+VIRAL_DETECTION_ENABLED = config.get("viral_detection", {}).get("enabled", False)
+SCOMATIC_ENABLED = config.get("scomatic", {}).get("enabled", False)
+SIGNATURES_ENABLED = config.get("signatures", {}).get("enabled", False)
+
+# Scripts directory
+SCRIPTS_DIR = Path(workflow.basedir) / "scripts"
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+def get_fastq_r1(wildcards):
+    """Get R1 FASTQ files for a sample."""
+    sample_info = SAMPLES.get(wildcards.sample, {})
+    return sample_info.get("fastq_r1", [])
+
+def get_fastq_r2(wildcards):
+    """Get R2 FASTQ files for a sample."""
+    sample_info = SAMPLES.get(wildcards.sample, {})
+    return sample_info.get("fastq_r2", [])
+
+def get_all_bams():
+    """Get all BAM files from Cell Ranger output."""
+    return expand(
+        f"{OUTPUT_DIR}/cellranger/{{sample}}/outs/possorted_genome_bam.bam",
+        sample=SAMPLE_IDS
+    )
+
+def get_final_targets():
+    """Generate list of final target files based on configuration."""
+    targets = []
+    
+    # Cell Ranger outputs
+    targets.extend(expand(
+        f"{OUTPUT_DIR}/cellranger/{{sample}}/outs/filtered_feature_bc_matrix.h5",
+        sample=SAMPLE_IDS
+    ))
+    
+    # QC and annotation outputs
+    targets.append(f"{OUTPUT_DIR}/qc/multiqc_report.html")
+    targets.append(f"{OUTPUT_DIR}/annotation/adata_annotated.h5ad")
+    targets.append(f"{OUTPUT_DIR}/annotation/annotation_summary.tsv")
+    
+    # Dysregulation outputs (cancer cell detection)
+    targets.append(f"{OUTPUT_DIR}/dysregulation/dysregulation_summary.tsv")
+    targets.append(f"{OUTPUT_DIR}/dysregulation/adata_cancer_detected.h5ad")
+    
+    # Conditional targets
+    if VIRAL_DETECTION_ENABLED:
+        targets.append(f"{OUTPUT_DIR}/viral/viral_detection_summary.tsv")
+        # Viral integration (if human viral db provided)
+        if config.get("viral_detection", {}).get("human_viral_db"):
+            targets.append(f"{OUTPUT_DIR}/viral_integration/adata_with_virus.h5ad")
+            targets.append(f"{OUTPUT_DIR}/viral_integration/viral_integration_summary.tsv")
+        
+    if SCOMATIC_ENABLED:
+        targets.append(f"{OUTPUT_DIR}/mutations/somatic_mutations.vcf.gz")
+        
+    if SIGNATURES_ENABLED:
+        targets.append(f"{OUTPUT_DIR}/signatures/signature_weights.tsv")
+        
+    # Master summary
+    targets.append(f"{OUTPUT_DIR}/master_summary.yaml")
+    
+    return targets
+
+# ============================================================================
+# Rules
+# ============================================================================
+
+rule all:
+    """Target rule specifying all final outputs."""
+    input:
+        get_final_targets()
+
+# ----------------------------------------------------------------------------
+# Cell Ranger Rules
+# ----------------------------------------------------------------------------
+
+rule cellranger_count:
     """
-    Return default configuration values.
+    Run Cell Ranger count for a single sample.
     
-    Returns
-    -------
-    dict
-        Default configuration dictionary
+    This rule aligns FASTQ files to the reference transcriptome and generates
+    gene expression matrices. Uses automatic chemistry detection with fallback
+    options if the specified chemistry fails.
+    
+    Note: Cell Ranger must be installed separately and available in PATH.
+    See: https://support.10xgenomics.com/single-cell-gene-expression/software/downloads/latest
     """
-    return {
-        # Pipeline info
-        'pipeline_version': '0.1.0',
-        'created': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-        
-        # Output settings
-        'output_dir': './results',
-        'temp_dir': './tmp',
-        'log_dir': './logs',
-        
-        # Computing resources
-        'threads': 8,
-        'memory_gb': 32,
-        
-        # Reference data
-        'reference': {
-            'genome': 'GRCh38',
-            'transcriptome': None,  # Path to Cell Ranger transcriptome reference (REQUIRED)
-            'fasta': None,          # Path to reference FASTA (for SComatic)
-        },
-        
-        # Cell Ranger settings
-        # Note: Cell Ranger must be installed separately and available in PATH
-        # See: https://support.10xgenomics.com/single-cell-gene-expression/software/downloads/latest
-        'cellranger': {
-            'chemistry': 'auto',      # auto, SC3Pv2, SC3Pv3, SC3Pv3HT, SC3Pv4, threeprime, fiveprime, etc.
-            'expect_cells': None,     # None for auto-detection
-            'force_cells': None,      # Force specific cell count
-            'include_introns': True,  # Include intronic reads (recommended for most analyses)
-            'create_bam': True,       # Create BAM file (needed for mutation calling)
-            'localcores': 8,          # Cores per Cell Ranger job
-            'localmem': 32,           # Memory (GB) per Cell Ranger job
-            'no_bam': False,          # Skip BAM creation entirely
-        },
-        
-        # QC and filtering (Scanpy)
-        'qc': {
-            'min_genes': 200,
-            'min_cells': 3,
-            'max_genes': 5000,
-            'max_pct_mito': 20,
-            'doublet_removal': True,
-        },
-        
-        # Cell annotation
-        'annotation': {
-            'method': 'popv',  # popv, celltypist, or both
-            'reference_dataset': 'pbmc',  # Reference for annotation
-            'min_confidence': 0.5,
-        },
-        
-        # Dysregulation detection
-        'dysregulation': {
-            'run_cytotrace2': True,
-            'run_infercnv': True,
-            'cytotrace2': {
-                'species': 'human',
-            },
-            'infercnv': {
-                'cutoff': 0.1,
-                'cluster_by_groups': True,
-                'denoise': True,
-                'HMM': True,
-            },
-        },
-        
-        # Viral detection
-        'viral_detection': {
-            'enabled': True,
-            'kraken2_db': None,  # Path to Kraken2 database
-            'confidence': 0.1,
-            'min_hit_groups': 2,
-            'viruses_of_interest': [
-                'Human papillomavirus',
-                'Epstein-Barr virus',
-                'Hepatitis B virus',
-                'Human T-lymphotropic virus',
-            ],
-        },
-        
-        # Somatic mutation calling
-        'scomatic': {
-            'enabled': True,
-            'min_cells': 5,
-            'min_cov': 5,
-            'min_cc': 5,
-            'min_ar': 0.1,
-            # reference_fasta comes from reference.fasta
-        },
-        
-        # Mutational signature analysis
-        'signatures': {
-            'enabled': True,
-            'method': 'semi_supervised_nmf',
-            'cosmic_version': '3.4',
-            'relevant_signatures': [
-                'SBS1', 'SBS2', 'SBS5', 'SBS13', 'SBS18',
-                'SBS29', 'SBS40', 'SBS44', 'SBS88', 'SBS89',
-            ],
-            'min_mutations': 10,
-            'similarity_metrics': ['cosine', 'euclidean', 'dot_product'],
-        },
-        
-        # Target files for the pipeline
-        'targets': [
-            'cellranger_counts',
-            'qc_report',
-            'cell_annotations',
-            'dysregulation_scores',
-            'viral_detection_report',
-            'somatic_mutations',
-            'signature_profiles',
-            'master_summary',
-        ],
-    }
+    output:
+        matrix=f"{OUTPUT_DIR}/cellranger/{{sample}}/outs/filtered_feature_bc_matrix.h5",
+        bam=f"{OUTPUT_DIR}/cellranger/{{sample}}/outs/possorted_genome_bam.bam",
+        bai=f"{OUTPUT_DIR}/cellranger/{{sample}}/outs/possorted_genome_bam.bam.bai",
+        summary=f"{OUTPUT_DIR}/cellranger/{{sample}}/outs/web_summary.html",
+    params:
+        transcriptome=TRANSCRIPTOME_REF,
+        chemistry=config.get("cellranger", {}).get("chemistry", "auto"),
+        expect_cells=config.get("cellranger", {}).get("expect_cells"),
+        include_introns=config.get("cellranger", {}).get("include_introns", True),
+        localcores=config.get("cellranger", {}).get("localcores", THREADS),
+        localmem=config.get("cellranger", {}).get("localmem", 32),
+        create_bam=config.get("cellranger", {}).get("create_bam", True),
+    log:
+        f"{LOG_DIR}/cellranger/{{sample}}.log"
+    threads: THREADS
+    conda:
+        "envs/sc_pre.yaml"
+    script:
+        "scripts/cellranger_count.py"
 
+# ----------------------------------------------------------------------------
+# QC and Annotation Rules (Combined)
+# ----------------------------------------------------------------------------
 
-def validate_config(config):
+rule qc_and_annotation:
     """
-    Validate configuration values.
+    Combined QC filtering and cell type annotation.
     
-    Parameters
-    ----------
-    config : dict
-        Configuration dictionary to validate
-        
-    Returns
-    -------
-    tuple
-        (is_valid, error_messages, warnings)
+    This rule performs:
+    1. Loading Cell Ranger outputs
+    2. QC filtering (genes, counts, mitochondrial content)
+    3. Doublet removal (Scrublet)
+    4. Normalization and preprocessing
+    5. Dimensionality reduction (PCA, UMAP)
+    6. Clustering (Leiden)
+    7. Cell type annotation (popV)
     """
-    errors = []
-    warnings = []
-    
-    # Check required paths
-    if config['reference']['transcriptome'] is None:
-        errors.append("Cell Ranger transcriptome reference path is required (--transcriptome)")
-        errors.append("  Download from: https://support.10xgenomics.com/single-cell-gene-expression/software/downloads/latest")
-        
-    if config['scomatic']['enabled'] and config['reference'].get('fasta') is None:
-        errors.append("SComatic requires reference FASTA (--reference-fasta)")
-        
-    if config['viral_detection']['enabled'] and config['viral_detection']['kraken2_db'] is None:
-        errors.append("Viral detection requires Kraken2 database path (--kraken2-db)")
-        
-    # Check sample information
-    if 'samples' not in config or not config['samples']:
-        errors.append("No samples provided")
-        
-    # Validate sample FASTQ paths
-    samples = config.get('samples', {})
-    for sample_id, sample_info in samples.items():
-        fastq_r1 = sample_info.get('fastq_r1', [])
-        if not fastq_r1:
-            errors.append(f"Sample {sample_id}: No FASTQ R1 files specified")
-            
-    # Warnings for suboptimal settings
-    if config['qc']['max_pct_mito'] > 30:
-        warnings.append(f"High mitochondrial percentage threshold ({config['qc']['max_pct_mito']}%) may include low-quality cells")
-        
-    if config['threads'] > 32:
-        warnings.append(f"High thread count ({config['threads']}) - ensure your system can handle this")
-        
-    if config['cellranger']['chemistry'] != 'auto':
-        warnings.append(f"Using fixed chemistry '{config['cellranger']['chemistry']}' - will fallback to auto if this fails")
-        
-    if not config['cellranger']['create_bam'] and config['scomatic']['enabled']:
-        errors.append("BAM creation is disabled but SComatic (mutation calling) is enabled - BAM files are required")
-        
-    return len(errors) == 0, errors, warnings
+    input:
+        cellranger_dirs=expand(
+            f"{OUTPUT_DIR}/cellranger/{{sample}}",
+            sample=SAMPLE_IDS
+        ),
+    output:
+        adata=f"{OUTPUT_DIR}/annotation/adata_annotated.h5ad",
+        qc_metrics=f"{OUTPUT_DIR}/qc/qc_metrics.tsv",
+        annotation_summary=f"{OUTPUT_DIR}/annotation/annotation_summary.tsv",
+        figures=directory(f"{OUTPUT_DIR}/figures"),
+    params:
+        qc_params=config.get("qc", {}),
+        preprocessing_params=config.get("preprocessing", {}),
+        annotation_params=config.get("annotation", {}),
+    log:
+        f"{LOG_DIR}/qc_annotation/qc_annotation.log"
+    threads: THREADS
+    conda:
+        "envs/sc_pre.yaml"
+    script:
+        "scripts/scanpy_qc_annotation.py"
 
+rule multiqc:
+    """Generate MultiQC report from all QC outputs."""
+    input:
+        cellranger=expand(
+            f"{OUTPUT_DIR}/cellranger/{{sample}}/outs/web_summary.html",
+            sample=SAMPLE_IDS
+        ),
+        qc_metrics=f"{OUTPUT_DIR}/qc/qc_metrics.tsv",
+    output:
+        report=f"{OUTPUT_DIR}/qc/multiqc_report.html",
+    params:
+        outdir=f"{OUTPUT_DIR}/qc",
+    log:
+        f"{LOG_DIR}/qc/multiqc.log"
+    conda:
+        "envs/sc_pre.yaml"
+    shell:
+        """
+        multiqc {params.outdir} -o {params.outdir} -n multiqc_report.html 2>&1 | tee {log}
+        """
 
-def merge_configs(default, user):
+# ----------------------------------------------------------------------------
+# Cancer Cell Detection Rules (CytoTRACE2 + InferCNV)
+# ----------------------------------------------------------------------------
+
+rule cancer_cell_detection:
     """
-    Recursively merge user config into default config.
+    Detect cancer cells using dual-model approach.
     
-    Parameters
-    ----------
-    default : dict
-        Default configuration
-    user : dict
-        User-specified configuration
-        
-    Returns
-    -------
-    dict
-        Merged configuration
+    This rule:
+    1. Runs CytoTRACE2 for stemness/potency scoring
+    2. Uses CytoTRACE2 threshold to define reference normal cells
+    3. Runs inferCNV using normal cells as reference
+    4. Calculates weighted agreement between models
+    5. Classifies cells as Cancer/Normal based on agreement
+    
+    Requires: GTF annotation file for chromosomal information
     """
-    result = default.copy()
-    for key, value in user.items():
-        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
-            result[key] = merge_configs(result[key], value)
-        else:
-            result[key] = value
-    return result
+    input:
+        adata=f"{OUTPUT_DIR}/annotation/adata_annotated.h5ad",
+    output:
+        adata=f"{OUTPUT_DIR}/dysregulation/adata_cancer_detected.h5ad",
+        summary=f"{OUTPUT_DIR}/dysregulation/cancer_detection_summary.tsv",
+        figures=directory(f"{OUTPUT_DIR}/dysregulation/figures"),
+    params:
+        gtf_path=config.get("reference", {}).get("gtf"),
+        species=config.get("dysregulation", {}).get("cytotrace2", {}).get("species", "human"),
+        max_cells_chunk=config.get("dysregulation", {}).get("cytotrace2", {}).get("max_cells_per_chunk", 200000),
+        infercnv_window=config.get("dysregulation", {}).get("infercnv", {}).get("window_size", 250),
+        agreement_alpha=config.get("dysregulation", {}).get("agreement", {}).get("alpha", 0.5),
+        min_correlation=config.get("dysregulation", {}).get("agreement", {}).get("min_correlation", 0.5),
+    log:
+        f"{LOG_DIR}/dysregulation/cancer_detection.log"
+    threads: THREADS
+    conda:
+        "envs/sc_post.yaml"
+    script:
+        "scripts/cancer_cell_detection.py"
 
-
-@click.command('create-config')
-@click.option(
-    '--samples', '-s', 'samples_pkl',
-    required=True,
-    type=click.Path(exists=True),
-    help='Path to sample dictionary pickle (from sample-information or SRAscraper)'
-)
-@click.option(
-    '--output', '-o', 'output_yaml',
-    required=True,
-    type=click.Path(),
-    help='Path for output config YAML file'
-)
-@click.option(
-    '--results-dir', '-r',
-    default='./results',
-    type=click.Path(),
-    help='Directory for pipeline output (default: ./results)'
-)
-@click.option(
-    '--threads', '-t',
-    default=8,
-    type=int,
-    help='Number of threads per job (default: 8)'
-)
-@click.option(
-    '--memory', '-m',
-    default=32,
-    type=int,
-    help='Memory in GB per job (default: 32)'
-)
-@click.option(
-    '--transcriptome',
-    type=click.Path(),
-    help='Path to Cell Ranger transcriptome reference'
-)
-@click.option(
-    '--genome',
-    default='GRCh38',
-    type=click.Choice(['GRCh38', 'GRCh37', 'mm10', 'mm39']),
-    help='Reference genome build (default: GRCh38)'
-)
-@click.option(
-    '--reference-fasta',
-    type=click.Path(),
-    help='Path to reference FASTA for SComatic'
-)
-@click.option(
-    '--kraken2-db',
-    type=click.Path(),
-    help='Path to Kraken2 database for viral detection'
-)
-@click.option(
-    '--chemistry',
-    default='auto',
-    help='10X chemistry version (default: auto)'
-)
-@click.option(
-    '--expect-cells',
-    type=int,
-    help='Expected number of cells per sample'
-)
-@click.option(
-    '--force-cells',
-    type=int,
-    help='Force this exact number of cells (use with caution)'
-)
-@click.option(
-    '--no-introns',
-    is_flag=True,
-    default=False,
-    help='Exclude intronic reads from Cell Ranger counting'
-)
-@click.option(
-    '--no-bam',
-    is_flag=True,
-    default=False,
-    help='Skip BAM file creation (disables mutation calling)'
-)
-@click.option(
-    '--no-viral-detection',
-    is_flag=True,
-    default=False,
-    help='Disable viral detection step'
-)
-@click.option(
-    '--no-scomatic',
-    is_flag=True,
-    default=False,
-    help='Disable somatic mutation calling'
-)
-@click.option(
-    '--no-signatures',
-    is_flag=True,
-    default=False,
-    help='Disable mutational signature analysis'
-)
-@click.option(
-    '--cosmic-signatures',
-    default='SBS1,SBS2,SBS5,SBS13,SBS18,SBS29,SBS40,SBS44,SBS88,SBS89',
-    help='Comma-separated list of COSMIC signatures to use'
-)
-@click.option(
-    '--annotation-method',
-    default='popv',
-    type=click.Choice(['popv', 'celltypist', 'both']),
-    help='Cell type annotation method (default: popv)'
-)
-@click.option(
-    '--min-genes',
-    default=200,
-    type=int,
-    help='Minimum genes per cell for QC (default: 200)'
-)
-@click.option(
-    '--max-mito',
-    default=20,
-    type=float,
-    help='Maximum mitochondrial percentage for QC (default: 20)'
-)
-@click.option(
-    '--force',
-    is_flag=True,
-    default=False,
-    help='Overwrite existing config file'
-)
-@click.option(
-    '--verbose', '-v',
-    is_flag=True,
-    default=False,
-    help='Print verbose output'
-)
-def create_config(samples_pkl, output_yaml, results_dir, threads, memory,
-                  transcriptome, genome, reference_fasta, kraken2_db,
-                  chemistry, expect_cells, force_cells, no_introns, no_bam,
-                  no_viral_detection, no_scomatic,
-                  no_signatures, cosmic_signatures, annotation_method,
-                  min_genes, max_mito, force, verbose):
+rule dysregulation_summary:
     """
-    Generate master configuration YAML for the pipeline.
+    Generate summary of dysregulation analysis.
     
-    This command creates a comprehensive configuration file that controls
-    all aspects of the ClusterCatcher pipeline. The configuration can be
-    manually edited after creation if needed.
-    
-    \b
-    The pipeline steps controlled by this config:
-      1. Cell Ranger alignment and counting
-      2. Scanpy QC and filtering
-      3. Cell type annotation (popV/CellTypist)
-      4. Dysregulation detection (CytoTRACE2 + inferCNV)
-      5. Viral detection in unmapped reads (Kraken2)
-      6. Somatic mutation calling (SComatic)
-      7. Mutational signature deconvolution (semi-supervised NMF)
-    
-    \b
-    Example:
-      ClusterCatcher create-config \\
-        --samples samples.pkl \\
-        --output config.yaml \\
-        --transcriptome /path/to/refdata-gex-GRCh38-2020-A \\
-        --reference-fasta /path/to/GRCh38.fa \\
-        --kraken2-db /path/to/k2_viral_db \\
-        --threads 16 \\
-        --memory 64
+    Combines CytoTRACE2, inferCNV, and cancer classification results.
     """
-    
-    click.echo(f"\n{'='*60}")
-    click.echo("ClusterCatcher: create-config")
-    click.echo(f"{'='*60}\n")
-    
-    # Check if output exists
-    if os.path.exists(output_yaml) and not force:
-        click.echo(f"ERROR: Output file exists: {output_yaml}", err=True)
-        click.echo("Use --force to overwrite", err=True)
-        sys.exit(1)
+    input:
+        adata=f"{OUTPUT_DIR}/dysregulation/adata_cancer_detected.h5ad",
+        cancer_summary=f"{OUTPUT_DIR}/dysregulation/cancer_detection_summary.tsv",
+    output:
+        summary=f"{OUTPUT_DIR}/dysregulation/dysregulation_summary.tsv",
+    log:
+        f"{LOG_DIR}/dysregulation/summary.log"
+    run:
+        import pandas as pd
+        import scanpy as sc
         
-    # Load sample information
-    click.echo(f"Loading sample information from: {samples_pkl}")
-    try:
-        with open(samples_pkl, 'rb') as f:
-            samples = pickle.load(f)
-    except Exception as e:
-        click.echo(f"ERROR: Failed to load sample pickle: {e}", err=True)
-        sys.exit(1)
+        # Load data
+        adata = sc.read_h5ad(input.adata)
+        cancer_summary = pd.read_csv(input.cancer_summary, sep='\t')
         
-    click.echo(f"Found {len(samples)} samples")
-    
-    if verbose:
-        click.echo("\nSamples:")
-        for sample_id in samples:
-            click.echo(f"  - {sample_id}")
-            
-    # Build configuration
-    click.echo("\nBuilding configuration...")
-    config = get_default_config()
-    
-    # Update with user options
-    config['output_dir'] = results_dir
-    config['threads'] = threads
-    config['memory_gb'] = memory
-    
-    config['reference']['genome'] = genome
-    config['reference']['transcriptome'] = transcriptome
-    config['reference']['fasta'] = reference_fasta
-    
-    config['cellranger']['chemistry'] = chemistry
-    config['cellranger']['localcores'] = threads
-    config['cellranger']['localmem'] = memory
-    config['cellranger']['include_introns'] = not no_introns
-    config['cellranger']['create_bam'] = not no_bam
-    config['cellranger']['no_bam'] = no_bam
-    if expect_cells:
-        config['cellranger']['expect_cells'] = expect_cells
-    if force_cells:
-        config['cellranger']['force_cells'] = force_cells
+        # Create comprehensive summary
+        summary_data = {
+            'total_cells': adata.n_obs,
+            'cancer_cells': (adata.obs['Final_cancer_cell_status'] == 'Cancer cell').sum(),
+            'normal_cells': (adata.obs['Final_cancer_cell_status'] == 'Normal cell').sum(),
+            'mean_cytotrace_score': adata.obs['CytoTRACE2_Score'].mean(),
+            'mean_cnv_score': adata.obs['cnv_score'].mean(),
+            'mean_agreement_score': adata.obs['agreement_score'].mean(),
+            'cytotrace_threshold': cancer_summary['cytotrace_threshold'].iloc[0],
+            'agreement_threshold': cancer_summary['agreement_threshold'].iloc[0],
+            'spearman_correlation': cancer_summary['spearman_correlation'].iloc[0],
+        }
         
-    config['qc']['min_genes'] = min_genes
-    config['qc']['max_pct_mito'] = max_mito
-    
-    config['annotation']['method'] = annotation_method
-    
-    config['viral_detection']['enabled'] = not no_viral_detection
-    config['viral_detection']['kraken2_db'] = kraken2_db
-    
-    config['scomatic']['enabled'] = not no_scomatic
-    config['scomatic']['reference_fasta'] = reference_fasta
-    
-    config['signatures']['enabled'] = not no_signatures
-    config['signatures']['relevant_signatures'] = cosmic_signatures.split(',')
-    
-    # Add sample information
-    config['samples'] = samples
-    
-    # Determine targets based on enabled steps
-    targets = ['cellranger_counts', 'qc_report', 'cell_annotations', 'dysregulation_scores']
-    if not no_viral_detection:
-        targets.append('viral_detection_report')
-    if not no_scomatic:
-        targets.append('somatic_mutations')
-    if not no_signatures:
-        targets.append('signature_profiles')
-    targets.append('master_summary')
-    config['targets'] = targets
-    
-    # Validate configuration
-    click.echo("\nValidating configuration...")
-    is_valid, errors, warnings = validate_config(config)
-    
-    if warnings:
-        click.echo("\nWarnings:")
-        for w in warnings:
-            click.echo(f"  ⚠ {w}")
-            
-    if not is_valid:
-        click.echo("\nERRORS:", err=True)
-        for e in errors:
-            click.echo(f"  ✗ {e}", err=True)
-        sys.exit(1)
+        # Add cell type breakdown
+        if 'final_annotation' in adata.obs.columns:
+            cancer_by_type = adata.obs[adata.obs['Final_cancer_cell_status'] == 'Cancer cell']['final_annotation'].value_counts()
+            for ct, count in cancer_by_type.items():
+                summary_data[f'cancer_cells_{ct}'] = count
         
-    click.echo("  ✓ Configuration validated")
-    
-    # Create output directory if needed
-    output_dir = os.path.dirname(output_yaml)
-    if output_dir and not os.path.exists(output_dir):
-        os.makedirs(output_dir, exist_ok=True)
-        
-    # Write configuration
-    click.echo(f"\nWriting configuration to: {output_yaml}")
-    
-    # Custom YAML representer for cleaner output
-    def str_representer(dumper, data):
-        if '\n' in data:
-            return dumper.represent_scalar('tag:yaml.org,2002:str', data, style='|')
-        return dumper.represent_scalar('tag:yaml.org,2002:str', data)
-    
-    yaml.add_representer(str, str_representer)
-    
-    with open(output_yaml, 'w') as f:
-        f.write("# ClusterCatcher Pipeline Configuration\n")
-        f.write(f"# Generated: {config['created']}\n")
-        f.write(f"# Pipeline version: {config['pipeline_version']}\n")
-        f.write("#\n")
-        f.write("# Edit this file to customize pipeline parameters.\n")
-        f.write("# See documentation for detailed parameter descriptions.\n")
-        f.write("#\n\n")
-        yaml.dump(config, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
-        
-    click.echo(f"\n{'='*60}")
-    click.echo("SUCCESS: Configuration created")
-    click.echo(f"{'='*60}")
-    click.echo(f"\nOutput: {output_yaml}")
-    click.echo(f"Samples: {len(samples)}")
-    click.echo(f"Targets: {len(targets)}")
-    click.echo("\nEnabled steps:")
-    click.echo(f"  ✓ Cell Ranger counting")
-    click.echo(f"  ✓ Scanpy QC")
-    click.echo(f"  ✓ Cell annotation ({annotation_method})")
-    click.echo(f"  ✓ Dysregulation detection (CytoTRACE2 + inferCNV)")
-    click.echo(f"  {'✓' if not no_viral_detection else '✗'} Viral detection")
-    click.echo(f"  {'✓' if not no_scomatic else '✗'} Somatic mutation calling")
-    click.echo(f"  {'✓' if not no_signatures else '✗'} Mutational signatures")
-    click.echo("\nNext step:")
-    click.echo(f"  ClusterCatcher run-config {output_yaml}")
-    click.echo("")
+        pd.DataFrame([summary_data]).to_csv(output.summary, sep='\t', index=False)
 
+rule combine_dysregulation:
+    """
+    Combine CytoTRACE2 and inferCNV results to identify dysregulated cells.
+    
+    Cells with both high stemness and chromosomal instability are flagged.
+    """
+    input:
+        cytotrace=f"{OUTPUT_DIR}/dysregulation/cytotrace2_scores.tsv",
+        infercnv=f"{OUTPUT_DIR}/dysregulation/infercnv_scores.tsv",
+        adata=f"{OUTPUT_DIR}/annotation/cell_annotations.h5ad",
+    output:
+        summary=f"{OUTPUT_DIR}/dysregulation/dysregulation_summary.tsv",
+        adata=f"{OUTPUT_DIR}/dysregulation/dysregulation_annotated.h5ad",
+    log:
+        f"{LOG_DIR}/dysregulation/combine.log"
+    conda:
+        "envs/scanpy.yaml"
+    script:
+        "scripts/combine_dysregulation.py"
 
-if __name__ == '__main__':
-    create_config()
+# ----------------------------------------------------------------------------
+# Viral Detection Rules (Kraken2)
+# ----------------------------------------------------------------------------
+
+rule kraken2_detect:
+    """
+    Detect viral/microbial sequences in unmapped reads using Kraken2.
+    
+    This rule:
+    1. Extracts unmapped reads from Cell Ranger BAM
+    2. Runs Kraken2 classification
+    3. Builds single-cell count matrix linking barcodes to organisms
+    
+    Requires: Kraken2 database (see README for setup instructions)
+    """
+    input:
+        bam=f"{OUTPUT_DIR}/cellranger/{{sample}}/outs/possorted_genome_bam.bam",
+        bai=f"{OUTPUT_DIR}/cellranger/{{sample}}/outs/possorted_genome_bam.bam.bai",
+    output:
+        summary=f"{OUTPUT_DIR}/viral/{{sample}}/{{sample}}_organism_summary.tsv",
+        matrix_dir=directory(f"{OUTPUT_DIR}/viral/{{sample}}/kraken2_filtered_feature_bc_matrix"),
+    params:
+        db_path=KRAKEN2_DB,
+        confidence=config.get("viral_detection", {}).get("confidence", 0.0),
+        include_organisms=config.get("viral_detection", {}).get("include_organisms"),
+        exclude_organisms=config.get("viral_detection", {}).get("exclude_organisms"),
+    log:
+        f"{LOG_DIR}/viral/{{sample}}_kraken2.log"
+    threads: THREADS
+    conda:
+        "envs/kraken2.yaml"
+    script:
+        "scripts/kraken2_viral_detection.py"
+
+rule summarize_viral:
+    """
+    Summarize viral detection results across all samples.
+    
+    Creates aggregated reports and a combined AnnData object for
+    integration with cell annotations.
+    """
+    input:
+        reports=expand(
+            f"{OUTPUT_DIR}/viral/{{sample}}/{{sample}}_organism_summary.tsv",
+            sample=SAMPLE_IDS
+        ),
+    output:
+        summary=f"{OUTPUT_DIR}/viral/viral_detection_summary.tsv",
+        adata=f"{OUTPUT_DIR}/viral/viral_counts.h5ad",
+    params:
+        sample_ids=SAMPLE_IDS,
+        organisms_of_interest=config.get("viral_detection", {}).get("organisms_of_interest", []),
+    log:
+        f"{LOG_DIR}/viral/summarize.log"
+    conda:
+        "envs/kraken2.yaml"
+    script:
+        "scripts/summarize_viral_detection.py"
+
+rule viral_integration:
+    """
+    Integrate viral detection results with annotated expression data.
+    
+    This rule:
+    1. Merges viral counts with gene expression data
+    2. Filters for human-specific viruses
+    3. Calculates differential expression of viruses across cell types
+    4. Creates visualizations
+    5. Adds top virus to expression AnnData
+    
+    Requires: Human viral database inspect.txt file
+    """
+    input:
+        adata_pp=f"{OUTPUT_DIR}/dysregulation/adata_cancer_detected.h5ad",
+        viral_summary=f"{OUTPUT_DIR}/viral/viral_detection_summary.tsv",
+    output:
+        adata=f"{OUTPUT_DIR}/viral_integration/adata_with_virus.h5ad",
+        integrated=f"{OUTPUT_DIR}/viral_integration/adata_viral_integrated.h5ad",
+        summary=f"{OUTPUT_DIR}/viral_integration/viral_integration_summary.tsv",
+        figures=directory(f"{OUTPUT_DIR}/viral_integration/figures"),
+    params:
+        sample_ids=SAMPLE_IDS,
+        human_viral_db=config.get("viral_detection", {}).get("human_viral_db"),
+        viral_base_dir=f"{OUTPUT_DIR}/viral",
+    log:
+        f"{LOG_DIR}/viral_integration/integration.log"
+    threads: THREADS
+    conda:
+        "envs/sc_pre.yaml"
+    script:
+        "scripts/viral_integration.py"
+
+# ----------------------------------------------------------------------------
+# Somatic Mutation Rules (SComatic)
+# ----------------------------------------------------------------------------
+
+rule scomatic_basecalling:
+    """
+    Run SComatic Step 1: Base calling at single-cell level.
+    """
+    input:
+        bam=f"{OUTPUT_DIR}/cellranger/{{sample}}/outs/possorted_genome_bam.bam",
+        bai=f"{OUTPUT_DIR}/cellranger/{{sample}}/outs/possorted_genome_bam.bam.bai",
+        barcodes=f"{OUTPUT_DIR}/cellranger/{{sample}}/outs/filtered_feature_bc_matrix/barcodes.tsv.gz",
+    output:
+        basecalls=directory(f"{OUTPUT_DIR}/mutations/scomatic/{{sample}}/BaseCellCounts"),
+    params:
+        reference=REFERENCE_FASTA,
+        min_cov=config.get("scomatic", {}).get("min_cov", 5),
+    log:
+        f"{LOG_DIR}/mutations/{{sample}}_basecalling.log"
+    threads: THREADS
+    conda:
+        "envs/scomatic.yaml"
+    script:
+        "scripts/scomatic_basecalling.py"
+
+rule scomatic_merging:
+    """
+    Run SComatic Step 2: Merge base calling results.
+    """
+    input:
+        basecalls=expand(
+            f"{OUTPUT_DIR}/mutations/scomatic/{{sample}}/BaseCellCounts",
+            sample=SAMPLE_IDS
+        ),
+    output:
+        merged=f"{OUTPUT_DIR}/mutations/scomatic/merged_basecalls.tsv.gz",
+    log:
+        f"{LOG_DIR}/mutations/merging.log"
+    conda:
+        "envs/scomatic.yaml"
+    script:
+        "scripts/scomatic_merge.py"
+
+rule scomatic_calling:
+    """
+    Run SComatic Step 3: Somatic mutation calling.
+    """
+    input:
+        merged=f"{OUTPUT_DIR}/mutations/scomatic/merged_basecalls.tsv.gz",
+        annotations=f"{OUTPUT_DIR}/annotation/cell_annotations.h5ad",
+    output:
+        mutations=f"{OUTPUT_DIR}/mutations/somatic_mutations.vcf.gz",
+        mutation_matrix=f"{OUTPUT_DIR}/mutations/mutation_matrix.tsv",
+    params:
+        min_cells=config.get("scomatic", {}).get("min_cells", 5),
+        min_cc=config.get("scomatic", {}).get("min_cc", 5),
+        min_ar=config.get("scomatic", {}).get("min_ar", 0.1),
+    log:
+        f"{LOG_DIR}/mutations/calling.log"
+    threads: THREADS
+    conda:
+        "envs/scomatic.yaml"
+    script:
+        "scripts/scomatic_calling.py"
+
+# ----------------------------------------------------------------------------
+# Mutational Signature Rules
+# ----------------------------------------------------------------------------
+
+rule prepare_mutation_contexts:
+    """
+    Extract trinucleotide contexts for each mutation.
+    """
+    input:
+        mutations=f"{OUTPUT_DIR}/mutations/somatic_mutations.vcf.gz",
+        reference=REFERENCE_FASTA,
+    output:
+        contexts=f"{OUTPUT_DIR}/signatures/trinucleotide_contexts.tsv",
+        counts=f"{OUTPUT_DIR}/signatures/mutation_counts_per_cell.tsv",
+    log:
+        f"{LOG_DIR}/signatures/contexts.log"
+    conda:
+        "envs/signatures.yaml"
+    script:
+        "scripts/extract_contexts.py"
+
+rule signature_deconvolution:
+    """
+    Run semi-supervised NMF for mutational signature deconvolution.
+    
+    Uses COSMIC signatures as seeds for the NMF decomposition.
+    """
+    input:
+        contexts=f"{OUTPUT_DIR}/signatures/trinucleotide_contexts.tsv",
+        counts=f"{OUTPUT_DIR}/signatures/mutation_counts_per_cell.tsv",
+    output:
+        weights=f"{OUTPUT_DIR}/signatures/signature_weights.tsv",
+        plots=directory(f"{OUTPUT_DIR}/signatures/plots"),
+        quality=f"{OUTPUT_DIR}/signatures/quality_metrics.tsv",
+    params:
+        cosmic_version=config.get("signatures", {}).get("cosmic_version", "3.4"),
+        signatures=config.get("signatures", {}).get("relevant_signatures", []),
+        min_mutations=config.get("signatures", {}).get("min_mutations", 10),
+        metrics=config.get("signatures", {}).get("similarity_metrics", ["cosine"]),
+    log:
+        f"{LOG_DIR}/signatures/deconvolution.log"
+    threads: THREADS
+    conda:
+        "envs/signatures.yaml"
+    script:
+        "scripts/signature_deconvolution.py"
+
+# ----------------------------------------------------------------------------
+# Summary Rules
+# ----------------------------------------------------------------------------
+
+rule master_summary:
+    """
+    Generate master summary YAML combining all pipeline results.
+    """
+    input:
+        qc=f"{OUTPUT_DIR}/qc/qc_metrics.tsv",
+        annotation=f"{OUTPUT_DIR}/annotation/annotation_summary.tsv",
+        dysregulation=f"{OUTPUT_DIR}/dysregulation/dysregulation_summary.tsv",
+        viral=f"{OUTPUT_DIR}/viral/viral_detection_summary.tsv" if VIRAL_DETECTION_ENABLED else [],
+        mutations=f"{OUTPUT_DIR}/mutations/somatic_mutations.vcf.gz" if SCOMATIC_ENABLED else [],
+        signatures=f"{OUTPUT_DIR}/signatures/signature_weights.tsv" if SIGNATURES_ENABLED else [],
+    output:
+        summary=f"{OUTPUT_DIR}/master_summary.yaml",
+    params:
+        config=config,
+        sample_ids=SAMPLE_IDS,
+    log:
+        f"{LOG_DIR}/master_summary.log"
+    script:
+        "scripts/generate_summary.py"
+

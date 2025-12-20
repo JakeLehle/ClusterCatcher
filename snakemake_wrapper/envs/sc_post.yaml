@@ -1,0 +1,80 @@
+channels:
+  - bioconda
+  - conda-forge
+  - plotly
+dependencies:
+  # Core Python
+  - python=3.11
+  - cython
+  - numpy
+  - pandas
+  - scipy
+  - scikit-learn
+  - h5py
+  
+  # Scanpy ecosystem
+  - scanpy
+  - anndata
+  - scvi-tools
+  - python-igraph
+  - umap-learn
+  - pynndescent
+  - fa2
+  
+  # CNV analysis
+  - bioconda::infercnvpy
+  - bioconda::gffutils
+  
+  # Visualization
+  - matplotlib-base
+  - seaborn
+  - adjusttext
+  - plotly==6.0.0
+  - conda-forge::python-kaleido
+  - plotly-orca
+  - hvplot
+  - ipywidgets
+  
+  # Statistics
+  - conda-forge::dcor
+  - conda-forge::pingouin
+  
+  # Data handling
+  - pybiomart
+  - goatools
+  - geoparse
+  - conda-forge::dask
+  
+  # SRA tools (for compatibility)
+  - awscli
+  - parallel-fastq-dump
+  - pysradb
+  - python-wget
+  - sra-tools>=3.0.0
+  
+  # GSEA
+  - bioconda::gseapy
+  
+  # Utilities
+  - pyyaml
+  - conda-forge::pdf2image
+  
+  # Deep learning (optional)
+  - dca
+  - faiss
+  
+  # GUI tools
+  - pygraphviz
+  - pyqt
+  - qt
+  - firefox
+  - xorg-libx11
+  - xorg-libxext
+  - xorg-libxrender
+  - xorg-libxscrnsaver
+  - mesa-libgl-cos6-x86_64
+  
+  # pip dependencies
+  - pip
+  - pip:
+    - cytotrace2-py  # Install from GitHub if needed: pip install git+https://github.com/digitalcytometry/cytotrace2.git#subdirectory=cytotrace2_python
