@@ -12,7 +12,7 @@ ClusterCatcher is a comprehensive Snakemake-based pipeline for analyzing single-
 4. **Dysregulation detection** - CytoTRACE2 (stemness) + inferCNV (chromosomal instability)
 5. **Viral detection** - Kraken2-based detection of viral sequences in unmapped reads
 6. **Somatic mutation calling** - SComatic for single-cell mutation detection
-7. **Mutational signature deconvolution** - Semi-supervised NMF with COSMIC signatures
+7. **Mutational signature deconvolution** - Semi-supervised NNLS with COSMIC signatures
 
 ## Requirements
 
@@ -21,6 +21,10 @@ ClusterCatcher is a comprehensive Snakemake-based pipeline for analyzing single-
 - **Cell Ranger** (v7.0+): Required for alignment and counting
   - Download from: https://support.10xgenomics.com/single-cell-gene-expression/software/downloads/latest
   - Must be added to PATH
+
+- **SComatic** (for mutation calling): Required if using the somatic mutation module
+  - Clone from: https://github.com/cortes-ciriano-lab/SComatic
+  - See [SComatic Setup](#scomatic-setup) section below
 
 ### Conda/Mamba
 
@@ -67,87 +71,6 @@ wget https://cf.10xgenomics.com/supp/cell-exp/refdata-gex-GRCh38-2020-A.tar.gz
 tar -xzf refdata-gex-GRCh38-2020-A.tar.gz
 ```
 
-### 6. Set up Kraken2 database (optional, for viral detection)
-
-If you want to use the viral/microbial detection feature, you need to set up a Kraken2 database. This is a one-time setup.
-
-#### Option A: Download pre-built database
-
-```bash
-# Create database directory
-mkdir -p ~/kraken2_db
-
-# Download a pre-built viral database (smallest option)
-# See: https://benlangmead.github.io/aws-indexes/k2 for options
-wget https://genome-idx.s3.amazonaws.com/kraken/k2_viral_20231009.tar.gz
-tar -xzf k2_viral_20231009.tar.gz -C ~/kraken2_db/viral
-```
-
-#### Option B: Build custom database
-
-For more control, build your own database:
-
-```bash
-# Install Kraken2 (if not already installed)
-conda create -n kraken2_build -c bioconda kraken2 blast
-conda activate kraken2_build
-
-# Create database directory
-mkdir -p ~/kraken2_db/custom_viral
-cd ~/kraken2_db/custom_viral
-
-# Download taxonomy
-kraken2-build --download-taxonomy --db .
-
-# Download viral library
-kraken2-build --download-library viral --db .
-
-# Or add custom sequences (e.g., human disease-associated viruses only)
-# kraken2-build --add-to-library your_sequences.fasta --db .
-
-# Build the database (adjust threads as needed)
-kraken2-build --build --db . --threads 16
-
-# Generate inspect file (required for organism names)
-kraken2-inspect --db . > inspect.txt
-
-# Clean up intermediate files (optional, saves space)
-kraken2-build --clean --db .
-```
-
-#### Option C: Human disease-associated viruses only
-
-For cancer research, you may want only human viruses known to cause disease:
-
-```bash
-# Create filtered database
-mkdir -p ~/kraken2_db/human_viral
-
-# Download NCBI viral sequences
-datasets download virus genome taxon "human virus" --filename human_viruses.zip
-unzip human_viruses.zip
-
-# Add to Kraken2 database
-kraken2-build --download-taxonomy --db ~/kraken2_db/human_viral
-kraken2-build --add-to-library ncbi_dataset/data/genomic.fna --db ~/kraken2_db/human_viral
-kraken2-build --build --db ~/kraken2_db/human_viral --threads 16
-kraken2-inspect --db ~/kraken2_db/human_viral > ~/kraken2_db/human_viral/inspect.txt
-```
-
-#### Verify database setup
-
-```bash
-# Check database files exist
-ls -la ~/kraken2_db/viral/
-# Should contain: hash.k2d, opts.k2d, taxo.k2d, inspect.txt
-
-# Test with a small query
-echo ">test" > test.fa
-echo "ATCGATCGATCGATCG" >> test.fa
-kraken2 --db ~/kraken2_db/viral test.fa
-rm test.fa
-```
-
 ## Quick Start
 
 ### For new users (with their own FASTQ files)
@@ -159,16 +82,17 @@ ClusterCatcher sample-information \
     --output samples.pkl
 
 # Step 2: Generate pipeline configuration
-ClusterCatcher create-config \
-    --samples samples.pkl \
-    --output config.yaml \
-    --transcriptome /path/to/refdata-gex-GRCh38-2020-A \
+python snakemake_wrapper/create_config.py \
+    --output-dir ./results \
+    --sample-pickle samples.pkl \
     --reference-fasta /path/to/GRCh38.fa \
+    --cellranger-reference /path/to/refdata-gex-GRCh38-2020-A \
     --threads 16 \
-    --memory 64
+    --memory-gb 64
 
 # Step 3: Run the pipeline
-ClusterCatcher run-config config.yaml --cores 32
+cd snakemake_wrapper
+snakemake --configfile ../results/config.yaml --cores 32 --use-conda
 ```
 
 ### For SRAscraper users
@@ -176,14 +100,34 @@ ClusterCatcher run-config config.yaml --cores 32
 If you used SRAscraper to download data, you can use its pickle file directly:
 
 ```bash
-# Use SRAscraper's dictionary_file.pkl directly
-ClusterCatcher create-config \
-    --samples /path/to/SRAscraper_output/metadata/dictionary_file.pkl \
-    --output config.yaml \
-    --transcriptome /path/to/refdata-gex-GRCh38-2020-A \
-    --reference-fasta /path/to/GRCh38.fa
+python snakemake_wrapper/create_config.py \
+    --output-dir ./results \
+    --sample-pickle /path/to/SRAscraper_output/metadata/dictionary_file.pkl \
+    --reference-fasta /path/to/GRCh38.fa \
+    --cellranger-reference /path/to/refdata-gex-GRCh38-2020-A
 
-ClusterCatcher run-config config.yaml --cores 32
+snakemake --configfile results/config.yaml --cores 32 --use-conda
+```
+
+### Enable all modules (mutations + signatures)
+
+```bash
+python snakemake_wrapper/create_config.py \
+    --output-dir ./results \
+    --sample-pickle samples.pkl \
+    --reference-fasta /path/to/GRCh38.fa \
+    --cellranger-reference /path/to/refdata-gex-GRCh38-2020-A \
+    --enable-viral \
+        --kraken-db /path/to/kraken2_db \
+    --enable-scomatic \
+        --scomatic-scripts-dir /path/to/SComatic/scripts \
+        --scomatic-editing-sites /path/to/RNA_editing_sites.txt \
+        --scomatic-pon-file /path/to/PoN.tsv \
+        --scomatic-bed-file /path/to/mappable_regions.bed \
+    --enable-signatures \
+        --cosmic-file /path/to/COSMIC_v3.4_SBS_GRCh38.txt \
+        --core-signatures SBS2 SBS13 SBS5 \
+        --use-scree-plot
 ```
 
 ## Sample CSV Format
@@ -198,216 +142,177 @@ For the `sample-information` command, prepare a CSV file with the following form
 For multi-lane samples, use comma-separated paths:
 ```
 sample_id,fastq_r1,fastq_r2
-S1,/path/S1_L1_R1.fq.gz,/path/S1_L2_R1.fq.gz,/path/S1_L1_R2.fq.gz,/path/S1_L2_R2.fq.gz
+S1,/path/S1_L1_R1.fq.gz;/path/S1_L2_R1.fq.gz,/path/S1_L1_R2.fq.gz;/path/S1_L2_R2.fq.gz
 ```
 
-## CLI Commands
+## Pipeline Modules
 
-### `ClusterCatcher sample-information`
+### Module Overview
 
-Convert a sample CSV file to a pickle dictionary.
+| Module | Required | Description |
+|--------|----------|-------------|
+| Cell Ranger | Yes | Alignment and counting |
+| QC & Annotation | Yes | Quality control and cell typing |
+| Dysregulation | Yes (default) | Cancer cell detection |
+| Viral Detection | Optional | Kraken2-based pathogen detection |
+| SComatic | Optional | Somatic mutation calling |
+| Signatures | Optional | Mutational signature analysis |
+
+### Enabling/Disabling Modules
 
 ```bash
-ClusterCatcher sample-information --input samples.csv --output samples.pkl
+# Enable viral detection
+--enable-viral --kraken-db /path/to/db
+
+# Enable mutation calling
+--enable-scomatic --scomatic-scripts-dir /path/to/SComatic/scripts ...
+
+# Enable signature analysis (requires SComatic)
+--enable-signatures --cosmic-file /path/to/COSMIC_signatures.txt
 ```
 
-Options:
-- `--input, -i`: Path to CSV file (required)
-- `--output, -o`: Path for output pickle (required)
-- `--skip-validation, -s`: Skip FASTQ file existence checks
-- `--verbose, -v`: Print verbose output
+## SComatic Setup
 
-### `ClusterCatcher create-config`
+SComatic is required for somatic mutation calling. The pipeline uses a custom wrapper around SComatic scripts.
 
-Generate the master configuration YAML file.
+### 1. Clone SComatic
 
 ```bash
-ClusterCatcher create-config \
-    --samples samples.pkl \
-    --output config.yaml \
-    --transcriptome /path/to/reference \
-    [options]
+git clone https://github.com/cortes-ciriano-lab/SComatic.git
+cd SComatic
 ```
 
-Key options:
-- `--samples, -s`: Path to sample pickle (required)
-- `--output, -o`: Path for config YAML (required)
-- `--transcriptome`: Path to Cell Ranger reference (required)
-- `--reference-fasta`: Path to genome FASTA (for mutation calling)
-- `--chemistry`: 10X chemistry (default: auto)
-- `--threads, -t`: Threads per job (default: 8)
-- `--memory, -m`: Memory in GB (default: 32)
-- `--no-viral-detection`: Disable viral detection
-- `--no-scomatic`: Disable mutation calling
-- `--no-signatures`: Disable signature analysis
+### 2. Required Files
 
-### `ClusterCatcher run-config`
+SComatic requires several reference files:
 
-Execute the Snakemake pipeline.
+| File | Description | Source |
+|------|-------------|--------|
+| RNA editing sites | Known RNA editing positions | SComatic repository or RADAR database |
+| Panel of Normals (PoN) | Common germline variants | Generate from matched normals or use provided |
+| BED file | Mappable genomic regions | Generate or download for your genome build |
+
+### 3. Generate reference files (if needed)
 
 ```bash
-ClusterCatcher run-config config.yaml --cores 32
+# Example: Generate mappable regions BED
+# (Use appropriate tool like mappability or download pre-computed)
+wget https://example.com/GRCh38_mappable_regions.bed.gz
+gunzip GRCh38_mappable_regions.bed.gz
 ```
 
-Options:
-- `--cores, -c`: Total cores for Snakemake (default: 1)
-- `--jobs, -j`: Concurrent jobs (default: 1)
-- `--dryrun, -n`: Show what would be done
-- `--profile`: Path to Snakemake profile for cluster execution
-- `--cluster`: Cluster submission command
-
-## Cluster Execution
-
-### SLURM example
+### 4. Pipeline configuration
 
 ```bash
-ClusterCatcher run-config config.yaml \
-    --cores 100 \
-    --jobs 10 \
-    --cluster "sbatch --partition=normal --nodes=1 --ntasks-per-node {threads} --time 04:00:00"
+python snakemake_wrapper/create_config.py \
+    --enable-scomatic \
+    --scomatic-scripts-dir /path/to/SComatic/scripts \
+    --scomatic-editing-sites /path/to/RNA_editing_sites.txt \
+    --scomatic-pon-file /path/to/PoN.tsv \
+    --scomatic-bed-file /path/to/mappable_regions.bed \
+    --scomatic-min-cov 5 \
+    --scomatic-min-cells 5
 ```
 
-### Using a Snakemake profile
+### SComatic Pipeline Steps
+
+The ClusterCatcher SComatic module performs a comprehensive 10-phase workflow:
+
+1. **BAM Filtering** - Filter to annotated cells with valid barcodes
+2. **Cell Type Splitting** - Split BAMs by cell type annotation
+3. **Base Counting** - Count bases per cell (parallel processing)
+4. **Count Merging** - Merge counts across cell types
+5. **Variant Calling Step 1** - Initial variant detection
+6. **Variant Calling Step 2** - Filter with PoN and editing sites
+7. **BED Filtering** - Filter to mappable regions
+8. **Callable Sites (Cell Type)** - Compute callable sites per cell type
+9. **Callable Sites (Per Cell)** - Compute callable sites per individual cell
+10. **Single-Cell Genotypes** - Generate filtered mutations with trinucleotide context
+
+### SComatic Outputs
+
+```
+results/mutations/
+├── all_samples.single_cell_genotype.filtered.tsv  # Final filtered mutations
+├── CombinedCallableSites/
+│   └── complete_callable_sites.tsv                # Per-cell callable sites
+├── cell_annotations.tsv                           # Cell barcode to type mapping
+├── trinucleotide_background.tsv                   # Background trinucleotide frequencies
+└── {sample}/                                      # Per-sample intermediate files
+    ├── SplitBams/
+    ├── BaseCellCounts/
+    └── VariantCalling/
+```
+
+## Signature Analysis
+
+The signature analysis module uses semi-supervised Non-Negative Least Squares (NNLS) to decompose single-cell mutations into COSMIC mutational signatures.
+
+### COSMIC Signatures
+
+Download COSMIC signatures (v3.4 recommended):
 
 ```bash
-ClusterCatcher run-config config.yaml --profile /path/to/slurm_profile
-```
+# From COSMIC website (requires registration)
+# https://cancer.sanger.ac.uk/signatures/downloads/
 
-## Output Structure
-
-```
-results/
-├── cellranger/           # Cell Ranger output per sample
-│   └── {sample}/
-│       └── outs/
-│           ├── filtered_feature_bc_matrix.h5
-│           ├── possorted_genome_bam.bam
-│           └── web_summary.html
-├── qc/                   # Quality control results
-│   ├── qc_filtered.h5ad
-│   ├── qc_metrics.tsv
-│   ├── plots/
-│   └── multiqc_report.html
-├── annotation/           # Cell type annotations
-│   ├── cell_annotations.h5ad
-│   └── annotation_summary.tsv
-├── dysregulation/        # Dysregulation scores
-│   ├── cytotrace2_scores.tsv
-│   ├── infercnv_scores.tsv
-│   └── dysregulation_summary.tsv
-├── viral/                # Viral detection results
-│   └── viral_detection_summary.tsv
-├── mutations/            # Somatic mutations
-│   └── somatic_mutations.vcf.gz
-├── signatures/           # Mutational signatures
-│   └── signature_weights.tsv
-└── master_summary.yaml   # Pipeline summary
-```
-
-## Chemistry Options
-
-Cell Ranger will attempt automatic chemistry detection. If needed, you can specify:
-
-- `auto` (default): Automatic detection
-- `threeprime`: 3' gene expression
-- `fiveprime`: 5' gene expression
-- `SC3Pv2`, `SC3Pv3`, `SC3Pv3HT`, `SC3Pv4`: Specific 3' versions
-- `SC5P-PE`, `SC5P-R2`: 5' paired-end or R2-only
-
-The pipeline will automatically try multiple chemistry options if the specified one fails.
-
-## Cancer Cell Detection
-
-The pipeline uses a dual-model approach combining CytoTRACE2 (stemness scoring) and inferCNV (copy number variation) to identify cancer cells with high confidence.
-
-### How it works
-
-1. **CytoTRACE2**: Scores each cell's developmental potential/stemness (0-1 scale)
-2. **Threshold Detection**: Automatically detects the bimodal threshold separating normal and cancer populations
-3. **InferCNV**: Uses normal cells as reference to detect copy number variations
-4. **Agreement Scoring**: Calculates weighted agreement between both models
-5. **Final Classification**: Cells are classified as cancer only if both models agree
-
-### CytoTRACE2 Setup
-
-CytoTRACE2 requires manual installation from GitHub:
-
-```bash
-# Clone the repository
-git clone https://github.com/digitalcytometry/cytotrace2.git
-cd cytotrace2/cytotrace2_python
-
-# Install in your conda environment
-conda activate ClusterCatcher
-pip install .
-```
-
-### GTF File Requirement
-
-InferCNV requires a GTF annotation file to map genes to chromosomal positions. You should provide the same GTF file used for Cell Ranger reference:
-
-```bash
-# For Cell Ranger GRCh38 reference
-gunzip refdata-gex-GRCh38-2020-A/genes/genes.gtf.gz
-
-# Then specify in config
-ClusterCatcher create-config \
-    --samples samples.pkl \
-    --gtf /path/to/genes.gtf \
-    ...
+# Or use the GRCh38 version
+wget https://cancer.sanger.ac.uk/signatures/documents/2123/COSMIC_v3.4_SBS_GRCh38.txt
 ```
 
 ### Configuration Options
 
-```yaml
-dysregulation:
-  enabled: true
-  cytotrace2:
-    species: human          # human or mouse
-    max_cells_per_chunk: 200000  # Reduce for memory issues
-    seed: 42
-  infercnv:
-    window_size: 250        # Genomic window size
-  agreement:
-    alpha: 0.5              # 0.5 = equal weight to rank and value agreement
-    min_correlation: 0.5    # Minimum Spearman rho for quartile selection
+```bash
+python snakemake_wrapper/create_config.py \
+    --enable-signatures \
+    --cosmic-file /path/to/COSMIC_v3.4_SBS_GRCh38.txt \
+    --core-signatures SBS2 SBS13 SBS5 \      # Always include these
+    --candidate-order SBS1 SBS18 SBS40 \     # Try these in order
+    --use-scree-plot \                        # Use elbow detection
+    --mutation-threshold 0 \                  # Min mutations per cell
+    --max-signatures 15 \                     # Max signatures to test
+    --hnscc-only                              # Use HNSCC-specific signature set
 ```
 
-### Outputs
+### Signature Selection Methods
 
-The cancer detection step produces:
-- `adata_cancer_detected.h5ad`: AnnData with all scores and classifications
-- `cancer_detection_summary.tsv`: Summary statistics
-- `figures/`: Comprehensive visualization plots including:
-  - Score distribution histograms
-  - Threshold detection plots
-  - Chromosome heatmaps
-  - Agreement analysis
-  - Final UMAP visualizations
+1. **All signatures** (default): Fit all COSMIC signatures
+2. **HNSCC-specific** (`--hnscc-only`): Use curated set of 110 HNSCC-relevant signatures
+3. **Scree plot** (`--use-scree-plot`): Automatic selection using elbow detection
 
-## Viral Detection
+### Signature Outputs
 
-The viral detection module uses Kraken2 to identify viral/microbial sequences in unmapped reads from Cell Ranger. This creates a sparse matrix similar to Cell Ranger's gene expression matrix, but with organisms instead of genes.
+```
+results/signatures/
+├── signature_weights_per_cell.txt      # Per-cell signature weights matrix
+├── adata_final.h5ad                    # Final AnnData with all annotations
+├── mutation_matrix_96contexts.txt      # 96-trinucleotide context matrix
+├── cosmic_signatures_used.txt          # Signatures used for fitting
+├── reconstruction_evaluation.txt       # Quality metrics
+├── per_cell_quality_metrics.txt        # Per-cell reconstruction quality
+├── signature_weight_summary.txt        # Summary statistics
+└── figures/
+    ├── signature_analysis_summary.png
+    ├── reconstruction_quality.png
+    └── signature_UMAPs/                # Individual signature UMAPs
+        ├── UMAP_SBS2.png
+        ├── UMAP_SBS13.png
+        └── ...
+```
 
-### How it works
+## Kraken2 Viral Detection Setup
 
-1. **Extract unmapped reads**: Reads that didn't map to the human genome are extracted from Cell Ranger's BAM file
-2. **Kraken2 classification**: Unmapped reads are classified against a Kraken2 database
-3. **Single-cell assignment**: Using cell barcodes and UMIs from the original BAM, each organism detection is linked back to specific cells
-4. **Matrix generation**: A sparse matrix (cells × organisms) is created for integration with downstream analysis
-5. **Viral integration**: Optionally filter to human-specific viruses and integrate with gene expression
-
-### Two Kraken2 Databases
-
-The pipeline can use two Kraken2 databases:
-
-1. **Primary Database** (`--kraken2-db`): Used for classification. Can be broad (all viruses) or specific.
-2. **Human Viral Database** (`--human-viral-db`): Optional. Filters results to human-associated viruses only.
-
-### Setting up the Human Viral Database
+### Option A: Download pre-built database
 
 ```bash
-# Create human-specific viral database
+mkdir -p ~/kraken2_db
+wget https://genome-idx.s3.amazonaws.com/kraken/k2_viral_20231009.tar.gz
+tar -xzf k2_viral_20231009.tar.gz -C ~/kraken2_db/viral
+```
+
+### Option B: Build custom human viral database
+
+```bash
 mkdir -p ~/kraken2_db/human_viral
 kraken2-build --download-taxonomy --db ~/kraken2_db/human_viral
 
@@ -415,93 +320,181 @@ kraken2-build --download-taxonomy --db ~/kraken2_db/human_viral
 datasets download virus genome taxon "human virus" --filename human_viruses.zip
 unzip human_viruses.zip
 
-# Build database
 kraken2-build --add-to-library ncbi_dataset/data/genomic.fna --db ~/kraken2_db/human_viral
 kraken2-build --build --db ~/kraken2_db/human_viral --threads 16
-
-# Generate inspect file (REQUIRED for viral integration)
 kraken2-inspect --db ~/kraken2_db/human_viral > ~/kraken2_db/human_viral/inspect.txt
 ```
 
-### Configuration options
+### Configuration
 
-```yaml
-viral_detection:
-  enabled: true
-  kraken2_db: /path/to/kraken2_db          # Primary database
-  human_viral_db: /path/to/inspect.txt     # For human virus filtering
-  confidence: 0.0                           # Kraken2 confidence (0.0-1.0)
-  include_organisms:                        # Only include these (optional)
-    - "Human papillomavirus"
-    - "Epstein-Barr"
-  exclude_organisms:                        # Exclude these (optional)
-    - "Bacteriophage"
-  organisms_of_interest:                    # Highlight in reports
-    - "Human papillomavirus"
-    - "Epstein-Barr virus"
-```
-
-### Filtering organisms
-
-You can filter the results in two ways:
-
-1. **At detection time**: Use `--include-organisms` or `--exclude-organisms` to filter during Kraken2 processing
-2. **At integration time**: Provide `--human-viral-db` to filter to human-specific viruses
-
-Example:
 ```bash
-ClusterCatcher create-config \
-    --samples samples.pkl \
-    --kraken2-db ~/kraken2_db/viral \
-    --human-viral-db ~/kraken2_db/human_viral/inspect.txt \
-    --output config.yaml
+python snakemake_wrapper/create_config.py \
+    --enable-viral \
+    --kraken-db ~/kraken2_db/viral \
+    --viral-db ~/kraken2_db/human_viral/inspect.txt \
+    --viral-confidence 0.1
 ```
 
-### Viral Integration Outputs
+## Cancer Cell Detection
 
-- `adata_with_virus.h5ad`: Expression data with top virus counts added
-- `adata_viral_integrated.h5ad`: Full integrated data (genes + viruses)
-- `viral_integration_summary.tsv`: Summary statistics
-- `virus_scores.tsv`: Aggregated scores by cell type
-- `figures/`: Matrix plots, UMAPs, violin plots
+The pipeline uses a dual-model approach combining CytoTRACE2 (stemness scoring) and inferCNV (copy number variation).
+
+### How it works
+
+1. **CytoTRACE2**: Scores each cell's developmental potential/stemness (0-1 scale)
+2. **Threshold Detection**: Automatically detects bimodal threshold
+3. **InferCNV**: Uses normal cells as reference to detect CNVs
+4. **Agreement Scoring**: Weighted agreement between models
+5. **Final Classification**: Cells classified as cancer only if both models agree
+
+### CytoTRACE2 Installation
+
+```bash
+git clone https://github.com/digitalcytometry/cytotrace2.git
+cd cytotrace2/cytotrace2_python
+pip install .
+```
+
+### Configuration
+
+```bash
+python snakemake_wrapper/create_config.py \
+    --enable-dysregulation \
+    --cytotrace2-enabled \
+    --infercnv-enabled \
+    --infercnv-reference-groups "T cells" "B cells" "Fibroblasts"
+```
+
+## Output Structure
+
+```
+results/
+├── cellranger/                    # Cell Ranger output per sample
+│   └── {sample}/outs/
+│       ├── filtered_feature_bc_matrix.h5
+│       ├── possorted_genome_bam.bam
+│       └── web_summary.html
+├── qc/                            # Quality control
+│   ├── qc_metrics.tsv
+│   └── multiqc_report.html
+├── annotation/                    # Cell type annotations
+│   ├── adata_annotated.h5ad
+│   └── annotation_summary.tsv
+├── dysregulation/                 # Cancer detection
+│   ├── adata_cancer_detected.h5ad
+│   ├── cancer_detection_summary.tsv
+│   ├── dysregulation_summary.tsv
+│   └── figures/
+├── viral/                         # Viral detection (if enabled)
+│   ├── viral_detection_summary.tsv
+│   └── viral_counts.h5ad
+├── viral_integration/             # Viral integration (if enabled)
+│   ├── adata_with_virus.h5ad
+│   └── viral_integration_summary.tsv
+├── mutations/                     # SComatic output (if enabled)
+│   ├── all_samples.single_cell_genotype.filtered.tsv
+│   ├── CombinedCallableSites/
+│   │   └── complete_callable_sites.tsv
+│   └── cell_annotations.tsv
+├── signatures/                    # Signature analysis (if enabled)
+│   ├── signature_weights_per_cell.txt
+│   ├── adata_final.h5ad
+│   └── figures/
+├── figures/                       # All visualization outputs
+├── logs/                          # Pipeline logs
+├── adata_final.h5ad              # Final annotated AnnData (copied from signatures/)
+└── master_summary.yaml            # Pipeline summary
+```
+
+## Cluster Execution
+
+### SLURM example
+
+```bash
+snakemake --configfile results/config.yaml \
+    --cores 100 \
+    --jobs 10 \
+    --use-conda \
+    --cluster "sbatch --partition=normal --nodes=1 --ntasks-per-node={threads} --time=04:00:00"
+```
+
+### Using a Snakemake profile
+
+```bash
+snakemake --configfile results/config.yaml --profile slurm_profile --use-conda
+```
 
 ## Configuration Reference
 
-See the generated `config.yaml` for all available parameters. Key sections:
+### create_config.py Options
 
-- `cellranger`: Cell Ranger settings (chemistry, expect_cells, etc.)
-- `qc`: Filtering thresholds (min_genes, max_pct_mito, etc.)
-- `annotation`: Cell type annotation settings
-- `dysregulation`: CytoTRACE2 and inferCNV settings
-- `viral_detection`: Kraken2 settings
-- `scomatic`: Mutation calling settings
-- `signatures`: Signature deconvolution settings
+| Category | Option | Default | Description |
+|----------|--------|---------|-------------|
+| **Required** | `--output-dir` | - | Output directory |
+| | `--reference-fasta` | - | Reference genome FASTA |
+| | `--cellranger-reference` | - | Cell Ranger reference |
+| **Samples** | `--sample-pickle` | - | Sample info pickle file |
+| | `--sample-ids` | - | List of sample IDs |
+| **Resources** | `--threads` | 8 | Threads per job |
+| | `--memory-gb` | 64 | Memory in GB |
+| **Cell Ranger** | `--chemistry` | auto | 10X chemistry |
+| | `--expect-cells` | 10000 | Expected cells |
+| **QC** | `--min-genes` | 200 | Min genes per cell |
+| | `--min-counts` | 500 | Min counts per cell |
+| | `--max-mito-pct` | 20 | Max mitochondrial % |
+| **Viral** | `--enable-viral` | False | Enable viral detection |
+| | `--kraken-db` | - | Kraken2 database path |
+| **SComatic** | `--enable-scomatic` | False | Enable mutation calling |
+| | `--scomatic-scripts-dir` | - | SComatic scripts path |
+| | `--scomatic-editing-sites` | - | RNA editing sites file |
+| | `--scomatic-pon-file` | - | Panel of Normals |
+| | `--scomatic-bed-file` | - | Mappable regions BED |
+| **Signatures** | `--enable-signatures` | False | Enable signature analysis |
+| | `--cosmic-file` | - | COSMIC signatures file |
+| | `--core-signatures` | SBS2,SBS13,SBS5 | Core signatures |
+| | `--use-scree-plot` | False | Use elbow detection |
+| | `--hnscc-only` | False | HNSCC signature set |
 
 ## Troubleshooting
 
 ### Cell Ranger not found
-Ensure Cell Ranger is installed and in your PATH:
 ```bash
 export PATH=/path/to/cellranger:$PATH
 ```
 
 ### Chemistry detection fails
-Try specifying a chemistry explicitly:
 ```bash
-ClusterCatcher create-config ... --chemistry SC3Pv3
+python create_config.py ... --chemistry SC3Pv3
 ```
 
 ### Memory issues
-Increase memory allocation:
 ```bash
-ClusterCatcher create-config ... --memory 128
+python create_config.py ... --memory-gb 128
 ```
+
+### SComatic script errors
+Ensure SComatic is properly installed:
+```bash
+ls /path/to/SComatic/scripts/
+# Should contain: SplitBamCellTypes.py, BaseCellCounter.py, etc.
+```
+
+### Signature analysis - no mutations detected
+- Check mutation filtering thresholds
+- Verify BAM files contain cell barcodes (CB tag)
+- Check callable sites output
 
 ## Citation
 
 Please cite ClusterCatcher if you use it in your research:
 
 > Lehle, J. (2025). ClusterCatcher: Single-cell sequencing analysis pipeline for mutation signature detection. GitHub. https://github.com/JakeLehle/ClusterCatcher
+
+If you use specific modules, please also cite:
+- **Cell Ranger**: 10x Genomics
+- **CytoTRACE2**: Gulati et al., Science 2020
+- **SComatic**: Muyas et al., Nature Biotechnology 2024
+- **COSMIC Signatures**: Alexandrov et al., Nature 2020
 
 ## License
 

@@ -1,0 +1,23 @@
+name: signatures
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - python>=3.8
+  - anndata
+  - scanpy
+  - pandas
+  - numpy
+  - scipy
+  - matplotlib-base
+  - seaborn
+  - adjusttext
+  - tqdm
+  - h5py
+  - python-igraph
+  - leidenalg
+  # For signature analysis
+  - scikit-learn
+  # For statistics
+  - statsmodels

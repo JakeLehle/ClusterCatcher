@@ -12,44 +12,67 @@ Single-cell sequencing analysis pipeline for:
 7. Mutational signature deconvolution (semi-supervised NMF)
 
 Configuration is loaded from the YAML file specified at runtime.
+
+Usage:
+    snakemake --configfile config.yaml --cores 8
 """
 
 import os
+import pickle
 from pathlib import Path
 
-# ============================================================================
+# =============================================================================
 # Configuration
-# ============================================================================
+# =============================================================================
 
 configfile: "config.yaml"
 
 # Extract configuration values
 OUTPUT_DIR = config.get("output_dir", "results")
 TEMP_DIR = config.get("temp_dir", "tmp")
-LOG_DIR = config.get("log_dir", "logs")
+LOG_DIR = config.get("log_dir", os.path.join(OUTPUT_DIR, "logs"))
 THREADS = config.get("threads", 8)
+MEMORY_GB = config.get("memory_gb", 64)
 
-# Sample information
-SAMPLES = config.get("samples", {})
-SAMPLE_IDS = list(SAMPLES.keys())
+# Create log directory
+os.makedirs(LOG_DIR, exist_ok=True)
+
+# Sample information - support both direct config and pickle file
+SAMPLE_INFO_PATH = config.get("sample_info")
+if SAMPLE_INFO_PATH and os.path.exists(SAMPLE_INFO_PATH):
+    with open(SAMPLE_INFO_PATH, 'rb') as f:
+        SAMPLES = pickle.load(f)
+    SAMPLE_IDS = list(SAMPLES.keys())
+else:
+    SAMPLES = config.get("samples", {})
+    SAMPLE_IDS = config.get("sample_ids", list(SAMPLES.keys()))
+
+if not SAMPLE_IDS:
+    raise ValueError("No sample IDs found. Provide either 'sample_info' pickle or 'sample_ids' list in config.")
 
 # Reference paths
-TRANSCRIPTOME_REF = config.get("reference", {}).get("transcriptome")
-GENOME_BUILD = config.get("reference", {}).get("genome", "GRCh38")
+TRANSCRIPTOME_REF = config.get("reference", {}).get("cellranger")
 REFERENCE_FASTA = config.get("reference", {}).get("fasta")
-KRAKEN2_DB = config.get("viral_detection", {}).get("kraken2_db")
+GENOME_BUILD = config.get("reference", {}).get("genome", "GRCh38")
+GTF_PATH = config.get("reference", {}).get("gtf")
 
-# Feature flags
-VIRAL_DETECTION_ENABLED = config.get("viral_detection", {}).get("enabled", False)
-SCOMATIC_ENABLED = config.get("scomatic", {}).get("enabled", False)
-SIGNATURES_ENABLED = config.get("signatures", {}).get("enabled", False)
+# Database paths
+KRAKEN2_DB = config.get("viral", {}).get("kraken_db")
+HUMAN_VIRAL_DB = config.get("viral", {}).get("viral_db")
+
+# Feature flags - support both nested 'modules' dict and flat 'enabled' keys
+MODULES = config.get("modules", {})
+VIRAL_DETECTION_ENABLED = MODULES.get("viral", config.get("viral_detection", {}).get("enabled", False))
+DYSREGULATION_ENABLED = MODULES.get("dysregulation", config.get("dysregulation", {}).get("enabled", True))
+SCOMATIC_ENABLED = MODULES.get("scomatic", config.get("scomatic", {}).get("enabled", False))
+SIGNATURES_ENABLED = MODULES.get("signatures", config.get("signatures", {}).get("enabled", False))
 
 # Scripts directory
 SCRIPTS_DIR = Path(workflow.basedir) / "scripts"
 
-# ============================================================================
+# =============================================================================
 # Helper Functions
-# ============================================================================
+# =============================================================================
 
 def get_fastq_r1(wildcards):
     """Get R1 FASTQ files for a sample."""
@@ -72,52 +95,59 @@ def get_final_targets():
     """Generate list of final target files based on configuration."""
     targets = []
     
-    # Cell Ranger outputs
+    # Cell Ranger outputs (always required)
     targets.extend(expand(
         f"{OUTPUT_DIR}/cellranger/{{sample}}/outs/filtered_feature_bc_matrix.h5",
         sample=SAMPLE_IDS
     ))
     
-    # QC and annotation outputs
+    # QC and annotation outputs (always required)
     targets.append(f"{OUTPUT_DIR}/qc/multiqc_report.html")
     targets.append(f"{OUTPUT_DIR}/annotation/adata_annotated.h5ad")
     targets.append(f"{OUTPUT_DIR}/annotation/annotation_summary.tsv")
     
     # Dysregulation outputs (cancer cell detection)
-    targets.append(f"{OUTPUT_DIR}/dysregulation/dysregulation_summary.tsv")
-    targets.append(f"{OUTPUT_DIR}/dysregulation/adata_cancer_detected.h5ad")
+    if DYSREGULATION_ENABLED:
+        targets.append(f"{OUTPUT_DIR}/dysregulation/dysregulation_summary.tsv")
+        targets.append(f"{OUTPUT_DIR}/dysregulation/adata_cancer_detected.h5ad")
     
-    # Conditional targets
+    # Viral detection outputs
     if VIRAL_DETECTION_ENABLED:
         targets.append(f"{OUTPUT_DIR}/viral/viral_detection_summary.tsv")
         # Viral integration (if human viral db provided)
-        if config.get("viral_detection", {}).get("human_viral_db"):
+        if HUMAN_VIRAL_DB:
             targets.append(f"{OUTPUT_DIR}/viral_integration/adata_with_virus.h5ad")
             targets.append(f"{OUTPUT_DIR}/viral_integration/viral_integration_summary.tsv")
-        
+    
+    # SComatic mutation calling outputs
     if SCOMATIC_ENABLED:
-        targets.append(f"{OUTPUT_DIR}/mutations/somatic_mutations.vcf.gz")
-        
+        targets.append(f"{OUTPUT_DIR}/mutations/all_samples.single_cell_genotype.filtered.tsv")
+        targets.append(f"{OUTPUT_DIR}/mutations/CombinedCallableSites/complete_callable_sites.tsv")
+    
+    # Signature analysis outputs
     if SIGNATURES_ENABLED:
-        targets.append(f"{OUTPUT_DIR}/signatures/signature_weights.tsv")
-        
-    # Master summary
+        targets.append(f"{OUTPUT_DIR}/signatures/signature_weights_per_cell.txt")
+        targets.append(f"{OUTPUT_DIR}/signatures/adata_final.h5ad")
+        # Also copy to main output dir
+        targets.append(f"{OUTPUT_DIR}/adata_final.h5ad")
+    
+    # Master summary (always)
     targets.append(f"{OUTPUT_DIR}/master_summary.yaml")
     
     return targets
 
-# ============================================================================
-# Rules
-# ============================================================================
+# =============================================================================
+# Target Rule
+# =============================================================================
 
 rule all:
     """Target rule specifying all final outputs."""
     input:
         get_final_targets()
 
-# ----------------------------------------------------------------------------
+# =============================================================================
 # Cell Ranger Rules
-# ----------------------------------------------------------------------------
+# =============================================================================
 
 rule cellranger_count:
     """
@@ -136,6 +166,7 @@ rule cellranger_count:
         bai=f"{OUTPUT_DIR}/cellranger/{{sample}}/outs/possorted_genome_bam.bam.bai",
         summary=f"{OUTPUT_DIR}/cellranger/{{sample}}/outs/web_summary.html",
     params:
+        sample_id="{sample}",
         transcriptome=TRANSCRIPTOME_REF,
         chemistry=config.get("cellranger", {}).get("chemistry", "auto"),
         expect_cells=config.get("cellranger", {}).get("expect_cells"),
@@ -143,6 +174,8 @@ rule cellranger_count:
         localcores=config.get("cellranger", {}).get("localcores", THREADS),
         localmem=config.get("cellranger", {}).get("localmem", 32),
         create_bam=config.get("cellranger", {}).get("create_bam", True),
+        samples_dict=SAMPLES,
+        output_dir=OUTPUT_DIR,
     log:
         f"{LOG_DIR}/cellranger/{{sample}}.log"
     threads: THREADS
@@ -151,9 +184,9 @@ rule cellranger_count:
     script:
         "scripts/cellranger_count.py"
 
-# ----------------------------------------------------------------------------
-# QC and Annotation Rules (Combined)
-# ----------------------------------------------------------------------------
+# =============================================================================
+# QC and Annotation Rules
+# =============================================================================
 
 rule qc_and_annotation:
     """
@@ -169,16 +202,18 @@ rule qc_and_annotation:
     7. Cell type annotation (popV)
     """
     input:
-        cellranger_dirs=expand(
-            f"{OUTPUT_DIR}/cellranger/{{sample}}",
+        matrices=expand(
+            f"{OUTPUT_DIR}/cellranger/{{sample}}/outs/filtered_feature_bc_matrix.h5",
             sample=SAMPLE_IDS
         ),
     output:
         adata=f"{OUTPUT_DIR}/annotation/adata_annotated.h5ad",
         qc_metrics=f"{OUTPUT_DIR}/qc/qc_metrics.tsv",
         annotation_summary=f"{OUTPUT_DIR}/annotation/annotation_summary.tsv",
-        figures=directory(f"{OUTPUT_DIR}/figures"),
+        figures=directory(f"{OUTPUT_DIR}/figures/qc"),
     params:
+        sample_ids=SAMPLE_IDS,
+        cellranger_dir=f"{OUTPUT_DIR}/cellranger",
         qc_params=config.get("qc", {}),
         preprocessing_params=config.get("preprocessing", {}),
         annotation_params=config.get("annotation", {}),
@@ -211,9 +246,9 @@ rule multiqc:
         multiqc {params.outdir} -o {params.outdir} -n multiqc_report.html 2>&1 | tee {log}
         """
 
-# ----------------------------------------------------------------------------
+# =============================================================================
 # Cancer Cell Detection Rules (CytoTRACE2 + InferCNV)
-# ----------------------------------------------------------------------------
+# =============================================================================
 
 rule cancer_cell_detection:
     """
@@ -235,10 +270,11 @@ rule cancer_cell_detection:
         summary=f"{OUTPUT_DIR}/dysregulation/cancer_detection_summary.tsv",
         figures=directory(f"{OUTPUT_DIR}/dysregulation/figures"),
     params:
-        gtf_path=config.get("reference", {}).get("gtf"),
+        gtf_path=GTF_PATH,
         species=config.get("dysregulation", {}).get("cytotrace2", {}).get("species", "human"),
         max_cells_chunk=config.get("dysregulation", {}).get("cytotrace2", {}).get("max_cells_per_chunk", 200000),
         infercnv_window=config.get("dysregulation", {}).get("infercnv", {}).get("window_size", 250),
+        infercnv_reference_groups=config.get("dysregulation", {}).get("infercnv_reference_groups"),
         agreement_alpha=config.get("dysregulation", {}).get("agreement", {}).get("alpha", 0.5),
         min_correlation=config.get("dysregulation", {}).get("agreement", {}).get("min_correlation", 0.5),
     log:
@@ -273,47 +309,40 @@ rule dysregulation_summary:
         # Create comprehensive summary
         summary_data = {
             'total_cells': adata.n_obs,
-            'cancer_cells': (adata.obs['Final_cancer_cell_status'] == 'Cancer cell').sum(),
-            'normal_cells': (adata.obs['Final_cancer_cell_status'] == 'Normal cell').sum(),
-            'mean_cytotrace_score': adata.obs['CytoTRACE2_Score'].mean(),
-            'mean_cnv_score': adata.obs['cnv_score'].mean(),
-            'mean_agreement_score': adata.obs['agreement_score'].mean(),
-            'cytotrace_threshold': cancer_summary['cytotrace_threshold'].iloc[0],
-            'agreement_threshold': cancer_summary['agreement_threshold'].iloc[0],
-            'spearman_correlation': cancer_summary['spearman_correlation'].iloc[0],
+            'total_genes': adata.n_vars,
+            'n_samples': len(SAMPLE_IDS),
         }
         
-        # Add cell type breakdown
-        if 'final_annotation' in adata.obs.columns:
-            cancer_by_type = adata.obs[adata.obs['Final_cancer_cell_status'] == 'Cancer cell']['final_annotation'].value_counts()
+        # Add cancer cell counts if available
+        if 'Final_cancer_cell_status' in adata.obs.columns:
+            summary_data['cancer_cells'] = (adata.obs['Final_cancer_cell_status'] == 'Cancer cell').sum()
+            summary_data['normal_cells'] = (adata.obs['Final_cancer_cell_status'] == 'Normal cell').sum()
+        
+        # Add scoring metrics if available
+        if 'CytoTRACE2_Score' in adata.obs.columns:
+            summary_data['mean_cytotrace_score'] = adata.obs['CytoTRACE2_Score'].mean()
+        if 'cnv_score' in adata.obs.columns:
+            summary_data['mean_cnv_score'] = adata.obs['cnv_score'].mean()
+        if 'agreement_score' in adata.obs.columns:
+            summary_data['mean_agreement_score'] = adata.obs['agreement_score'].mean()
+        
+        # Add thresholds from cancer_summary if available
+        for col in ['cytotrace_threshold', 'agreement_threshold', 'spearman_correlation']:
+            if col in cancer_summary.columns:
+                summary_data[col] = cancer_summary[col].iloc[0]
+        
+        # Add cell type breakdown for cancer cells
+        if 'final_annotation' in adata.obs.columns and 'Final_cancer_cell_status' in adata.obs.columns:
+            cancer_mask = adata.obs['Final_cancer_cell_status'] == 'Cancer cell'
+            cancer_by_type = adata.obs.loc[cancer_mask, 'final_annotation'].value_counts()
             for ct, count in cancer_by_type.items():
                 summary_data[f'cancer_cells_{ct}'] = count
         
         pd.DataFrame([summary_data]).to_csv(output.summary, sep='\t', index=False)
 
-rule combine_dysregulation:
-    """
-    Combine CytoTRACE2 and inferCNV results to identify dysregulated cells.
-    
-    Cells with both high stemness and chromosomal instability are flagged.
-    """
-    input:
-        cytotrace=f"{OUTPUT_DIR}/dysregulation/cytotrace2_scores.tsv",
-        infercnv=f"{OUTPUT_DIR}/dysregulation/infercnv_scores.tsv",
-        adata=f"{OUTPUT_DIR}/annotation/cell_annotations.h5ad",
-    output:
-        summary=f"{OUTPUT_DIR}/dysregulation/dysregulation_summary.tsv",
-        adata=f"{OUTPUT_DIR}/dysregulation/dysregulation_annotated.h5ad",
-    log:
-        f"{LOG_DIR}/dysregulation/combine.log"
-    conda:
-        "envs/scanpy.yaml"
-    script:
-        "scripts/combine_dysregulation.py"
-
-# ----------------------------------------------------------------------------
+# =============================================================================
 # Viral Detection Rules (Kraken2)
-# ----------------------------------------------------------------------------
+# =============================================================================
 
 rule kraken2_detect:
     """
@@ -333,10 +362,12 @@ rule kraken2_detect:
         summary=f"{OUTPUT_DIR}/viral/{{sample}}/{{sample}}_organism_summary.tsv",
         matrix_dir=directory(f"{OUTPUT_DIR}/viral/{{sample}}/kraken2_filtered_feature_bc_matrix"),
     params:
+        sample_id="{sample}",
         db_path=KRAKEN2_DB,
-        confidence=config.get("viral_detection", {}).get("confidence", 0.0),
-        include_organisms=config.get("viral_detection", {}).get("include_organisms"),
-        exclude_organisms=config.get("viral_detection", {}).get("exclude_organisms"),
+        confidence=config.get("viral", {}).get("confidence", 0.0),
+        include_organisms=config.get("viral", {}).get("include_organisms"),
+        exclude_organisms=config.get("viral", {}).get("exclude_organisms"),
+        output_dir=f"{OUTPUT_DIR}/viral",
     log:
         f"{LOG_DIR}/viral/{{sample}}_kraken2.log"
     threads: THREADS
@@ -362,7 +393,8 @@ rule summarize_viral:
         adata=f"{OUTPUT_DIR}/viral/viral_counts.h5ad",
     params:
         sample_ids=SAMPLE_IDS,
-        organisms_of_interest=config.get("viral_detection", {}).get("organisms_of_interest", []),
+        organisms_of_interest=config.get("viral", {}).get("organisms_of_interest", []),
+        viral_base_dir=f"{OUTPUT_DIR}/viral",
     log:
         f"{LOG_DIR}/viral/summarize.log"
     conda:
@@ -386,6 +418,7 @@ rule viral_integration:
     input:
         adata_pp=f"{OUTPUT_DIR}/dysregulation/adata_cancer_detected.h5ad",
         viral_summary=f"{OUTPUT_DIR}/viral/viral_detection_summary.tsv",
+        viral_adata=f"{OUTPUT_DIR}/viral/viral_counts.h5ad",
     output:
         adata=f"{OUTPUT_DIR}/viral_integration/adata_with_virus.h5ad",
         integrated=f"{OUTPUT_DIR}/viral_integration/adata_viral_integrated.h5ad",
@@ -393,7 +426,7 @@ rule viral_integration:
         figures=directory(f"{OUTPUT_DIR}/viral_integration/figures"),
     params:
         sample_ids=SAMPLE_IDS,
-        human_viral_db=config.get("viral_detection", {}).get("human_viral_db"),
+        human_viral_db=HUMAN_VIRAL_DB,
         viral_base_dir=f"{OUTPUT_DIR}/viral",
     log:
         f"{LOG_DIR}/viral_integration/integration.log"
@@ -403,140 +436,198 @@ rule viral_integration:
     script:
         "scripts/viral_integration.py"
 
-# ----------------------------------------------------------------------------
+# =============================================================================
 # Somatic Mutation Rules (SComatic)
-# ----------------------------------------------------------------------------
+# =============================================================================
 
-rule scomatic_basecalling:
+rule scomatic_mutation_calling:
     """
-    Run SComatic Step 1: Base calling at single-cell level.
+    Run SComatic pipeline for somatic mutation detection.
+    
+    This comprehensive rule handles the complete SComatic workflow:
+    1. Filters BAMs to annotated cells
+    2. Splits BAMs by cell type
+    3. Counts bases per cell (parallel processing)
+    4. Merges counts across cell types
+    5. Calls variants (step1 and step2)
+    6. Filters with Panel of Normals and RNA editing sites
+    7. Applies BED file filtering for mappable regions
+    8. Computes callable sites per cell type and per cell
+    9. Generates single-cell genotypes
+    10. Filters and annotates with trinucleotide context
+    
+    Requires:
+    - SComatic installed and scripts accessible
+    - Reference genome FASTA
+    - RNA editing sites file
+    - Panel of Normals (PoN) file
+    - BED file for mappable regions
+    
+    Outputs:
+    - Filtered mutations with trinucleotide context
+    - Callable sites per cell
+    - Cell type annotations
     """
     input:
-        bam=f"{OUTPUT_DIR}/cellranger/{{sample}}/outs/possorted_genome_bam.bam",
-        bai=f"{OUTPUT_DIR}/cellranger/{{sample}}/outs/possorted_genome_bam.bam.bai",
-        barcodes=f"{OUTPUT_DIR}/cellranger/{{sample}}/outs/filtered_feature_bc_matrix/barcodes.tsv.gz",
-    output:
-        basecalls=directory(f"{OUTPUT_DIR}/mutations/scomatic/{{sample}}/BaseCellCounts"),
-    params:
-        reference=REFERENCE_FASTA,
-        min_cov=config.get("scomatic", {}).get("min_cov", 5),
-    log:
-        f"{LOG_DIR}/mutations/{{sample}}_basecalling.log"
-    threads: THREADS
-    conda:
-        "envs/scomatic.yaml"
-    script:
-        "scripts/scomatic_basecalling.py"
-
-rule scomatic_merging:
-    """
-    Run SComatic Step 2: Merge base calling results.
-    """
-    input:
-        basecalls=expand(
-            f"{OUTPUT_DIR}/mutations/scomatic/{{sample}}/BaseCellCounts",
+        adata=f"{OUTPUT_DIR}/dysregulation/adata_cancer_detected.h5ad",
+        bams=expand(
+            f"{OUTPUT_DIR}/cellranger/{{sample}}/outs/possorted_genome_bam.bam",
             sample=SAMPLE_IDS
         ),
     output:
-        merged=f"{OUTPUT_DIR}/mutations/scomatic/merged_basecalls.tsv.gz",
-    log:
-        f"{LOG_DIR}/mutations/merging.log"
-    conda:
-        "envs/scomatic.yaml"
-    script:
-        "scripts/scomatic_merge.py"
-
-rule scomatic_calling:
-    """
-    Run SComatic Step 3: Somatic mutation calling.
-    """
-    input:
-        merged=f"{OUTPUT_DIR}/mutations/scomatic/merged_basecalls.tsv.gz",
-        annotations=f"{OUTPUT_DIR}/annotation/cell_annotations.h5ad",
-    output:
-        mutations=f"{OUTPUT_DIR}/mutations/somatic_mutations.vcf.gz",
-        mutation_matrix=f"{OUTPUT_DIR}/mutations/mutation_matrix.tsv",
+        mutations=f"{OUTPUT_DIR}/mutations/all_samples.single_cell_genotype.filtered.tsv",
+        callable_sites=f"{OUTPUT_DIR}/mutations/CombinedCallableSites/complete_callable_sites.tsv",
+        annotations=f"{OUTPUT_DIR}/mutations/cell_annotations.tsv",
+        trinuc=f"{OUTPUT_DIR}/mutations/trinucleotide_background.tsv",
     params:
+        output_dir=OUTPUT_DIR,
+        sample_ids=SAMPLE_IDS,
+        scomatic_scripts_dir=config.get("scomatic", {}).get("scripts_dir"),
+        ref_genome=REFERENCE_FASTA,
+        editing_sites=config.get("scomatic", {}).get("editing_sites"),
+        pon_file=config.get("scomatic", {}).get("pon_file"),
+        bed_file=config.get("scomatic", {}).get("bed_file"),
+        cellranger_dir=f"{OUTPUT_DIR}/cellranger",
+        custom_genotype_script=workflow.source_path("scripts/SingleCellGenotype.py"),
+        min_cov=config.get("scomatic", {}).get("min_cov", 5),
         min_cells=config.get("scomatic", {}).get("min_cells", 5),
-        min_cc=config.get("scomatic", {}).get("min_cc", 5),
-        min_ar=config.get("scomatic", {}).get("min_ar", 0.1),
     log:
-        f"{LOG_DIR}/mutations/calling.log"
+        f"{LOG_DIR}/mutations/scomatic.log"
     threads: THREADS
     conda:
         "envs/scomatic.yaml"
     script:
-        "scripts/scomatic_calling.py"
+        "scripts/scomatic_mutation_calling.py"
 
-# ----------------------------------------------------------------------------
+# Simplified callable sites path alias
+rule callable_sites_link:
+    """Create simplified link to callable sites file."""
+    input:
+        f"{OUTPUT_DIR}/mutations/CombinedCallableSites/complete_callable_sites.tsv"
+    output:
+        f"{OUTPUT_DIR}/mutations/callable_sites.tsv"
+    shell:
+        "ln -sf CombinedCallableSites/complete_callable_sites.tsv {output}"
+
+# =============================================================================
 # Mutational Signature Rules
-# ----------------------------------------------------------------------------
+# =============================================================================
 
-rule prepare_mutation_contexts:
+rule signature_analysis:
     """
-    Extract trinucleotide contexts for each mutation.
-    """
-    input:
-        mutations=f"{OUTPUT_DIR}/mutations/somatic_mutations.vcf.gz",
-        reference=REFERENCE_FASTA,
-    output:
-        contexts=f"{OUTPUT_DIR}/signatures/trinucleotide_contexts.tsv",
-        counts=f"{OUTPUT_DIR}/signatures/mutation_counts_per_cell.tsv",
-    log:
-        f"{LOG_DIR}/signatures/contexts.log"
-    conda:
-        "envs/signatures.yaml"
-    script:
-        "scripts/extract_contexts.py"
-
-rule signature_deconvolution:
-    """
-    Run semi-supervised NMF for mutational signature deconvolution.
+    Run semi-supervised COSMIC signature analysis.
     
-    Uses COSMIC signatures as seeds for the NMF decomposition.
+    This rule performs complete signature analysis:
+    1. Converts mutations to 96-trinucleotide context matrix
+    2. Extracts relevant COSMIC signatures (all or HNSCC-specific)
+    3. Uses scree plot elbow detection for signature selection (optional)
+    4. Fits signatures using Non-Negative Least Squares (NNLS)
+    5. Evaluates reconstruction quality (Frobenius norm, correlations)
+    6. Adds signature weights to AnnData
+    7. Generates comprehensive visualizations (UMAPs, heatmaps, etc.)
+    
+    Requires:
+    - COSMIC signature database (v3.4 recommended)
+    - Filtered mutations from SComatic
+    - Callable sites for normalization
     """
     input:
-        contexts=f"{OUTPUT_DIR}/signatures/trinucleotide_contexts.tsv",
-        counts=f"{OUTPUT_DIR}/signatures/mutation_counts_per_cell.tsv",
+        mutations=f"{OUTPUT_DIR}/mutations/all_samples.single_cell_genotype.filtered.tsv",
+        adata=f"{OUTPUT_DIR}/dysregulation/adata_cancer_detected.h5ad",
+        callable_sites=f"{OUTPUT_DIR}/mutations/CombinedCallableSites/complete_callable_sites.tsv",
     output:
-        weights=f"{OUTPUT_DIR}/signatures/signature_weights.tsv",
-        plots=directory(f"{OUTPUT_DIR}/signatures/plots"),
-        quality=f"{OUTPUT_DIR}/signatures/quality_metrics.tsv",
+        weights=f"{OUTPUT_DIR}/signatures/signature_weights_per_cell.txt",
+        adata_final=f"{OUTPUT_DIR}/signatures/adata_final.h5ad",
     params:
-        cosmic_version=config.get("signatures", {}).get("cosmic_version", "3.4"),
-        signatures=config.get("signatures", {}).get("relevant_signatures", []),
-        min_mutations=config.get("signatures", {}).get("min_mutations", 10),
-        metrics=config.get("signatures", {}).get("similarity_metrics", ["cosine"]),
+        output_dir=f"{OUTPUT_DIR}/signatures",
+        cosmic_file=config.get("signatures", {}).get("cosmic_file"),
+        use_scree_plot=config.get("signatures", {}).get("use_scree_plot", False),
+        core_signatures=config.get("signatures", {}).get("core_signatures", ["SBS2", "SBS13", "SBS5"]),
+        candidate_order=config.get("signatures", {}).get("candidate_order"),
+        mutation_threshold=config.get("signatures", {}).get("mutation_threshold", 0),
+        max_signatures=config.get("signatures", {}).get("max_signatures", 15),
+        hnscc_only=config.get("signatures", {}).get("hnscc_only", False),
     log:
-        f"{LOG_DIR}/signatures/deconvolution.log"
+        f"{LOG_DIR}/signatures/signature_analysis.log"
     threads: THREADS
     conda:
         "envs/signatures.yaml"
     script:
-        "scripts/signature_deconvolution.py"
+        "scripts/signature_analysis.py"
 
-# ----------------------------------------------------------------------------
+# Copy final AnnData to main output directory
+rule copy_final_adata:
+    """Copy final annotated AnnData to main output directory."""
+    input:
+        f"{OUTPUT_DIR}/signatures/adata_final.h5ad"
+    output:
+        f"{OUTPUT_DIR}/adata_final.h5ad"
+    shell:
+        "cp {input} {output}"
+
+# =============================================================================
 # Summary Rules
-# ----------------------------------------------------------------------------
+# =============================================================================
 
 rule master_summary:
     """
     Generate master summary YAML combining all pipeline results.
+    
+    Aggregates metrics from all pipeline steps into a single summary file.
     """
     input:
         qc=f"{OUTPUT_DIR}/qc/qc_metrics.tsv",
         annotation=f"{OUTPUT_DIR}/annotation/annotation_summary.tsv",
-        dysregulation=f"{OUTPUT_DIR}/dysregulation/dysregulation_summary.tsv",
+        dysregulation=f"{OUTPUT_DIR}/dysregulation/dysregulation_summary.tsv" if DYSREGULATION_ENABLED else [],
         viral=f"{OUTPUT_DIR}/viral/viral_detection_summary.tsv" if VIRAL_DETECTION_ENABLED else [],
-        mutations=f"{OUTPUT_DIR}/mutations/somatic_mutations.vcf.gz" if SCOMATIC_ENABLED else [],
-        signatures=f"{OUTPUT_DIR}/signatures/signature_weights.tsv" if SIGNATURES_ENABLED else [],
+        mutations=f"{OUTPUT_DIR}/mutations/all_samples.single_cell_genotype.filtered.tsv" if SCOMATIC_ENABLED else [],
+        signatures=f"{OUTPUT_DIR}/signatures/signature_weights_per_cell.txt" if SIGNATURES_ENABLED else [],
     output:
         summary=f"{OUTPUT_DIR}/master_summary.yaml",
     params:
         config=config,
         sample_ids=SAMPLE_IDS,
+        output_dir=OUTPUT_DIR,
     log:
         f"{LOG_DIR}/master_summary.log"
     script:
         "scripts/generate_summary.py"
+
+# =============================================================================
+# Cleanup and Utility Rules
+# =============================================================================
+
+rule clean_temp:
+    """Remove temporary files to save disk space."""
+    shell:
+        f"rm -rf {TEMP_DIR}/*"
+
+# =============================================================================
+# Workflow Hooks
+# =============================================================================
+
+onsuccess:
+    print("\n" + "="*70)
+    print("ClusterCatcher pipeline completed successfully!")
+    print("="*70)
+    print(f"\nResults directory: {OUTPUT_DIR}")
+    print(f"Samples processed: {len(SAMPLE_IDS)}")
+    print(f"\nFinal outputs:")
+    print(f"  - Master summary: {OUTPUT_DIR}/master_summary.yaml")
+    if SIGNATURES_ENABLED:
+        print(f"  - Final AnnData: {OUTPUT_DIR}/adata_final.h5ad")
+    elif DYSREGULATION_ENABLED:
+        print(f"  - Cancer detected AnnData: {OUTPUT_DIR}/dysregulation/adata_cancer_detected.h5ad")
+    else:
+        print(f"  - Annotated AnnData: {OUTPUT_DIR}/annotation/adata_annotated.h5ad")
+    print("="*70 + "\n")
+
+onerror:
+    print("\n" + "="*70)
+    print("ClusterCatcher pipeline failed!")
+    print("="*70)
+    print(f"\nCheck logs in: {LOG_DIR}")
+    print("\nTo resume from failed step, run the same command again.")
+    print("To unlock if needed: snakemake --unlock")
+    print("="*70 + "\n")
 
