@@ -1,5 +1,4 @@
-"""
-ClusterCatcher CLI module
-"""
+"""ClusterCatcher Snakemake wrapper module."""
 
-__version__ = '0.1.0'
+__version__ = "1.0.0"
+

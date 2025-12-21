@@ -1,0 +1,83 @@
+[build-system]
+requires = ["setuptools>=45", "wheel", "setuptools-scm[toml]>=6.2"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ClusterCatcher"
+version = "1.0.2"
+description = "Single-cell sequencing analysis pipeline for mutation signature detection and cell annotation"
+readme = "README.md"
+license = {text = "GPL-3.0"}
+requires-python = ">=3.8,<3.12"
+authors = [
+    {name = "Jake Lehle"}
+]
+keywords = [
+    "single-cell",
+    "sequencing", 
+    "mutational-signatures",
+    "cancer",
+    "bioinformatics",
+    "scRNA-seq",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+dependencies = [
+    "click>=8.0",
+    "pyyaml>=5.4",
+    "pandas>=1.3",
+    "numpy>=1.20",
+    "rich>=10.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=6.0",
+    "pytest-cov",
+    "black",
+    "flake8",
+    "mypy",
+]
+full = [
+    "snakemake>=7.0",
+    "scanpy>=1.9",
+    "anndata>=0.8",
+    "scipy>=1.7",
+    "scikit-learn>=1.0",
+    "matplotlib>=3.5",
+    "seaborn>=0.11",
+]
+
+[project.scripts]
+ClusterCatcher = "cli.cli:main"
+clustercatcher = "cli.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/JakeLehle/ClusterCatcher"
+Repository = "https://github.com/JakeLehle/ClusterCatcher"
+Issues = "https://github.com/JakeLehle/ClusterCatcher/issues"
+
+[tool.setuptools]
+packages = ["cli", "snakemake_wrapper"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+"*" = ["*.yaml", "*.yml", "*.smk"]
+snakemake_wrapper = ["Snakefile", "scripts/*.py", "envs/*.yaml", "rules/*.smk"]
+
+[tool.black]
+line-length = 100
+target-version = ['py38', 'py39', 'py310', 'py311']
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]

@@ -1,0 +1,29 @@
+# Include documentation
+include README.md
+include LICENSE
+include CHANGELOG.md
+
+# Include configuration files
+include environment.yml
+include pyproject.toml
+include setup.py
+include setup.cfg
+
+# Include Snakemake pipeline files
+include snakemake_wrapper/Snakefile
+recursive-include snakemake_wrapper/scripts *.py
+recursive-include snakemake_wrapper/envs *.yaml *.yml
+recursive-include snakemake_wrapper/rules *.smk
+
+# Include CLI
+recursive-include cli *.py
+
+# Exclude development files
+exclude .gitignore
+exclude .pre-commit-config.yaml
+recursive-exclude * __pycache__
+recursive-exclude * *.py[co]
+recursive-exclude * .git*
+recursive-exclude tests *
+recursive-exclude docs *
+

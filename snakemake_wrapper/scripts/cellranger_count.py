@@ -17,7 +17,7 @@ Usage:
     Called via Snakemake rule with snakemake.input/output/params
     
     Or standalone:
-    python cellranger_count.py --config config.yaml --sample SAMPLE_ID
+    python cellranger_count.py --sample SAMPLE_ID --fastq-dir /path/to/fastqs ...
 
 Requirements:
     - Cell Ranger must be installed and available in PATH
@@ -73,7 +73,7 @@ CHEMISTRY_OPTIONS = [
 # Helper Functions
 # =============================================================================
 
-def detect_sample_pattern(directory):
+def detect_sample_pattern(directory, sample_id):
     """
     Dynamically detect sample pattern from FASTQ files.
     
@@ -81,6 +81,8 @@ def detect_sample_pattern(directory):
     ----------
     directory : str
         Path to directory containing FASTQ files
+    sample_id : str
+        Sample identifier to search for
         
     Returns
     -------
@@ -92,8 +94,14 @@ def detect_sample_pattern(directory):
         if not fastq_files:
             return "_S1_L001_"  # Default fallback
         
+        # Look for files matching sample_id
+        sample_files = [f for f in fastq_files if f.startswith(sample_id)]
+        if sample_files:
+            first_file = sample_files[0]
+        else:
+            first_file = fastq_files[0]
+        
         # Extract sample pattern from first file
-        first_file = fastq_files[0]
         parts = first_file.split('_')
         if len(parts) >= 4:
             # Reconstruct pattern like _S1_L001_
@@ -240,11 +248,19 @@ def get_fastq_dir_for_sample(sample_info):
         Path to FASTQ directory
     """
     # Handle both list and string formats for fastq paths
-    fastq_r1 = sample_info.get('fastq_r1', [])
+    fastq_r1 = sample_info.get('fastq_r1', sample_info.get('R1', []))
     if isinstance(fastq_r1, list) and len(fastq_r1) > 0:
         return os.path.dirname(fastq_r1[0])
     elif isinstance(fastq_r1, str):
         return os.path.dirname(fastq_r1)
+    
+    # Try 'fastqs' key
+    fastqs = sample_info.get('fastqs', sample_info.get('fastq_dir'))
+    if fastqs:
+        if isinstance(fastqs, list):
+            return fastqs[0]
+        return fastqs
+    
     return None
 
 
@@ -323,18 +339,12 @@ def run_cellranger_count(
         logger.error(f"Transcriptome reference not found: {transcriptome_ref}")
         return {'success': False, 'error': f'Reference not found: {transcriptome_ref}'}
     
-    # Create output directory
-    os.makedirs(output_dir, exist_ok=True)
+    # Create output directory structure
+    # Cell Ranger creates output in: {output_dir}/{sample_id}/outs/
+    cellranger_base = os.path.join(output_dir, 'cellranger')
+    os.makedirs(cellranger_base, exist_ok=True)
     original_dir = os.getcwd()
-    os.chdir(output_dir)
-    
-    # Detect sample pattern
-    sample_pattern = detect_sample_pattern(fastq_dir)
-    logger.info(f"Detected sample pattern for {sample_id}: {sample_pattern}")
-    
-    # Check if multiplexed
-    if check_if_multiplexed(fastq_dir):
-        logger.info(f"Sample {sample_id} has index files (I1/I2). May require special handling.")
+    os.chdir(cellranger_base)
     
     # Determine chemistries to try
     if chemistry == 'auto':
@@ -351,8 +361,8 @@ def run_cellranger_count(
     result_paths = {}
     
     for chem in trial_chemistries:
-        run_id = f"{sample_id}{sample_pattern}"
-        run_dir = os.path.join(output_dir, run_id)
+        # Cell Ranger output directory is named after sample_id
+        run_dir = os.path.join(cellranger_base, sample_id)
         
         # Clean up any previous attempts
         if not cleanup_directory(run_dir):
@@ -366,7 +376,7 @@ def run_cellranger_count(
             # Build command
             cmd = [
                 "cellranger", "count",
-                f"--id={run_id}",
+                f"--id={sample_id}",
                 f"--fastqs={fastq_dir}",
                 f"--sample={sample_id}",
                 f"--transcriptome={transcriptome_ref}",
@@ -460,41 +470,54 @@ def run_from_snakemake():
     """Run Cell Ranger from Snakemake rule."""
     
     # Get Snakemake variables
-    sample_id = snakemake.wildcards.sample
-    output_matrix = snakemake.output.matrix
-    output_bam = snakemake.output.bam
-    output_summary = snakemake.output.summary
-    log_file = snakemake.log[0]
+    sample_id = snakemake.params.sample_id  # Use params.sample_id instead of wildcards
+    log_file = snakemake.log[0] if snakemake.log else None
     
+    # Get parameters from Snakemake
     params = snakemake.params
     transcriptome_ref = params.transcriptome
     chemistry = params.chemistry
     localcores = params.localcores
     localmem = params.localmem
-    expect_cells = params.get('expect_cells')
-    include_introns = params.get('include_introns', True)
+    expect_cells = params.expect_cells
+    include_introns = params.include_introns
+    create_bam = params.create_bam
+    output_dir = params.output_dir
     
-    # Get FASTQ directory from sample info
-    samples = snakemake.config.get('samples', {})
-    sample_info = samples.get(sample_id, {})
+    # Get sample information from params
+    samples_dict = params.samples_dict
+    sample_info = samples_dict.get(sample_id, {})
+    
+    # Determine FASTQ directory
     fastq_dir = get_fastq_dir_for_sample(sample_info)
     
     if not fastq_dir:
-        logger.error(f"Could not determine FASTQ directory for sample {sample_id}")
-        sys.exit(1)
-    
-    # Determine output directory (parent of where outputs should go)
-    output_dir = os.path.dirname(os.path.dirname(output_matrix))
+        # Fallback: try to find FASTQs based on sample structure
+        # Check if sample_info contains direct path information
+        if 'fastq_dir' in sample_info:
+            fastq_dir = sample_info['fastq_dir']
+        elif 'path' in sample_info:
+            fastq_dir = sample_info['path']
+        else:
+            logger.error(f"Could not determine FASTQ directory for sample {sample_id}")
+            logger.error(f"Sample info: {sample_info}")
+            sys.exit(1)
     
     # Set up file logging
-    file_handler = logging.FileHandler(log_file)
-    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-    logger.addHandler(file_handler)
+    if log_file:
+        os.makedirs(os.path.dirname(log_file), exist_ok=True)
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        logger.addHandler(file_handler)
     
-    logger.info(f"Starting Cell Ranger count for sample: {sample_id}")
+    logger.info("="*60)
+    logger.info(f"CELL RANGER COUNT - Sample: {sample_id}")
+    logger.info("="*60)
     logger.info(f"FASTQ directory: {fastq_dir}")
     logger.info(f"Transcriptome reference: {transcriptome_ref}")
     logger.info(f"Output directory: {output_dir}")
+    logger.info(f"Chemistry: {chemistry}")
+    logger.info(f"Cores: {localcores}, Memory: {localmem}GB")
     
     # Run Cell Ranger
     result = run_cellranger_count(
@@ -506,15 +529,35 @@ def run_from_snakemake():
         localcores=localcores,
         localmem=localmem,
         expect_cells=expect_cells,
-        include_introns=include_introns
+        include_introns=include_introns,
+        create_bam=create_bam
     )
     
     if not result['success']:
         logger.error(f"Cell Ranger failed for sample {sample_id}")
+        if 'errors' in result:
+            logger.error("Errors encountered:")
+            for chem, error in result['errors'].items():
+                logger.error(f"  {chem}: {error[:200]}...")
         sys.exit(1)
     
+    # Verify expected outputs exist
+    expected_outputs = [
+        snakemake.output.matrix,
+        snakemake.output.bam,
+        snakemake.output.bai,
+        snakemake.output.summary,
+    ]
+    
+    for output_path in expected_outputs:
+        if not os.path.exists(output_path):
+            logger.error(f"Expected output not found: {output_path}")
+            sys.exit(1)
+    
+    logger.info("="*60)
     logger.info(f"Cell Ranger completed successfully for sample {sample_id}")
     logger.info(f"Chemistry used: {result['chemistry']}")
+    logger.info("="*60)
 
 
 # =============================================================================
@@ -527,66 +570,39 @@ def main():
     parser = argparse.ArgumentParser(
         description='Run Cell Ranger count with automatic chemistry detection'
     )
-    parser.add_argument('--config', required=True, help='Path to config YAML file')
-    parser.add_argument('--sample', help='Specific sample ID to process (optional)')
-    parser.add_argument('--output-dir', required=True, help='Output directory')
+    parser.add_argument('--sample', required=True, help='Sample ID')
+    parser.add_argument('--fastq-dir', required=True, help='Path to FASTQ directory')
     parser.add_argument('--transcriptome', required=True, help='Path to transcriptome reference')
+    parser.add_argument('--output-dir', required=True, help='Output directory')
     parser.add_argument('--chemistry', default='auto', help='Chemistry type (default: auto)')
     parser.add_argument('--cores', type=int, default=None, help='Number of cores')
     parser.add_argument('--memory', type=int, default=64, help='Memory in GB')
+    parser.add_argument('--expect-cells', type=int, default=None, help='Expected number of cells')
+    parser.add_argument('--include-introns', action='store_true', default=True, help='Include intronic reads')
+    parser.add_argument('--no-bam', action='store_true', help='Skip BAM generation')
     
     args = parser.parse_args()
     
-    # Load config
-    with open(args.config, 'r') as f:
-        config = yaml.safe_load(f)
+    result = run_cellranger_count(
+        sample_id=args.sample,
+        fastq_dir=args.fastq_dir,
+        transcriptome_ref=args.transcriptome,
+        output_dir=args.output_dir,
+        chemistry=args.chemistry,
+        localcores=args.cores,
+        localmem=args.memory,
+        expect_cells=args.expect_cells,
+        include_introns=args.include_introns,
+        no_bam=args.no_bam
+    )
     
-    samples = config.get('samples', {})
-    
-    if args.sample:
-        # Process single sample
-        sample_ids = [args.sample]
-    else:
-        # Process all samples
-        sample_ids = list(samples.keys())
-    
-    results = {}
-    for sample_id in sample_ids:
-        sample_info = samples.get(sample_id, {})
-        fastq_dir = get_fastq_dir_for_sample(sample_info)
-        
-        if not fastq_dir:
-            logger.error(f"Could not determine FASTQ directory for sample {sample_id}")
-            continue
-        
-        result = run_cellranger_count(
-            sample_id=sample_id,
-            fastq_dir=fastq_dir,
-            transcriptome_ref=args.transcriptome,
-            output_dir=args.output_dir,
-            chemistry=args.chemistry,
-            localcores=args.cores,
-            localmem=args.memory
-        )
-        results[sample_id] = result
-    
-    # Summary
-    successful = sum(1 for r in results.values() if r.get('success'))
-    logger.info(f"\n=== Processing Summary ===")
-    logger.info(f"Successful: {successful}/{len(results)}")
-    
-    for sample_id, result in results.items():
-        status = "SUCCESS" if result.get('success') else "FAILED"
-        chem = result.get('chemistry', 'N/A')
-        logger.info(f"  {sample_id}: {status} (chemistry: {chem})")
-    
-    # Return exit code based on results
-    if successful == len(results):
+    if result['success']:
+        logger.info(f"SUCCESS - Chemistry: {result['chemistry']}")
+        logger.info(f"Output: {result['paths']['outs_dir']}")
         sys.exit(0)
-    elif successful > 0:
-        sys.exit(1)  # Partial success
     else:
-        sys.exit(2)  # Complete failure
+        logger.error("FAILED")
+        sys.exit(1)
 
 
 # =============================================================================
