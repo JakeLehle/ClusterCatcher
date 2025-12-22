@@ -29,21 +29,32 @@ def find_snakefile():
     dev_snakefile = cli_dir.parent / 'snakemake_wrapper' / 'Snakefile'
     if dev_snakefile.exists():
         return str(dev_snakefile)
-        
+    
     # Check in installed package location
-    import ClusterCatcher
-    pkg_dir = Path(ClusterCatcher.__file__).parent
-    installed_snakefile = pkg_dir / 'snakemake_wrapper' / 'Snakefile'
-    if installed_snakefile.exists():
-        return str(installed_snakefile)
-        
+    try:
+        import ClusterCatcher
+        pkg_dir = Path(ClusterCatcher.__file__).parent
+        installed_snakefile = pkg_dir / 'snakemake_wrapper' / 'Snakefile'
+        if installed_snakefile.exists():
+            return str(installed_snakefile)
+    except ImportError:
+        pass
+    
     # Try site-packages
-    import site
-    for sp in site.getsitepackages():
-        sp_snakefile = Path(sp) / 'snakemake_wrapper' / 'Snakefile'
-        if sp_snakefile.exists():
-            return str(sp_snakefile)
-            
+    try:
+        import site
+        for sp in site.getsitepackages():
+            sp_snakefile = Path(sp) / 'ClusterCatcher' / 'snakemake_wrapper' / 'Snakefile'
+            if sp_snakefile.exists():
+                return str(sp_snakefile)
+    except Exception:
+        pass
+    
+    # Try current directory
+    cwd_snakefile = Path.cwd() / 'snakemake_wrapper' / 'Snakefile'
+    if cwd_snakefile.exists():
+        return str(cwd_snakefile)
+    
     return None
 
 
@@ -68,13 +79,30 @@ def validate_config_file(config_path):
             config = yaml.safe_load(f)
     except Exception as e:
         return None, [f"Failed to load config: {e}"]
-        
+    
     # Basic validation
-    required_keys = ['samples', 'output_dir', 'reference']
-    for key in required_keys:
-        if key not in config:
-            errors.append(f"Missing required key: {key}")
-            
+    if config is None:
+        return None, ["Config file is empty"]
+    
+    # Check for samples - can be either 'samples' dict or 'sample_info' pickle path
+    has_samples = 'samples' in config and config['samples']
+    has_sample_info = 'sample_info' in config and config['sample_info']
+    has_sample_ids = 'sample_ids' in config and config['sample_ids']
+    
+    if not (has_samples or has_sample_info or has_sample_ids):
+        errors.append("Missing sample information: need 'samples', 'sample_info', or 'sample_ids'")
+    
+    # Check output_dir
+    if 'output_dir' not in config:
+        errors.append("Missing required key: output_dir")
+    
+    # Check reference
+    if 'reference' not in config:
+        errors.append("Missing required key: reference")
+    elif config['reference']:
+        if not config['reference'].get('cellranger'):
+            errors.append("Missing reference.cellranger (Cell Ranger reference path)")
+    
     return config, errors
 
 
@@ -82,9 +110,9 @@ def validate_config_file(config_path):
 @click.argument('config_yaml', type=click.Path(exists=True))
 @click.option(
     '--cores', '-c',
-    default=1,
+    default=8,
     type=int,
-    help='Total number of cores for Snakemake (default: 1)'
+    help='Total number of cores for Snakemake (default: 8)'
 )
 @click.option(
     '--jobs', '-j',
@@ -117,8 +145,7 @@ def validate_config_file(config_path):
     help='Keep going with independent jobs after error'
 )
 @click.option(
-    '--use-conda',
-    is_flag=True,
+    '--use-conda/--no-conda',
     default=True,
     help='Use conda environments for rules (default: True)'
 )
@@ -176,10 +203,15 @@ def validate_config_file(config_path):
     default=False,
     help='Quiet Snakemake output'
 )
+@click.option(
+    '--snakefile', '-s',
+    type=click.Path(),
+    help='Path to Snakefile (auto-detected if not provided)'
+)
 def run_config(config_yaml, cores, jobs, dryrun, unlock, rerun_incomplete,
                keep_going, use_conda, conda_frontend, profile, cluster,
                cluster_config, latency_wait, targets, until, forcerun,
-               verbose, quiet):
+               verbose, quiet, snakefile):
     """
     Run the ClusterCatcher pipeline from a config file.
     
@@ -196,7 +228,7 @@ def run_config(config_yaml, cores, jobs, dryrun, unlock, rerun_incomplete,
       ClusterCatcher run-config config.yaml \\
         --cores 100 \\
         --jobs 10 \\
-        --cluster "sbatch --partition=normal --nodes=1 --ntasks-per-node {threads} --time 04:00:00"
+        --cluster "sbatch --partition=normal --nodes=1 --ntasks-per-node={threads} --time=04:00:00"
     
     \b
     Using a Snakemake profile:
@@ -205,6 +237,10 @@ def run_config(config_yaml, cores, jobs, dryrun, unlock, rerun_incomplete,
     \b
     Dry run to check pipeline:
       ClusterCatcher run-config config.yaml --dryrun
+    
+    \b
+    Run specific rules:
+      ClusterCatcher run-config config.yaml --until qc_and_annotation
     """
     
     click.echo(f"\n{'='*60}")
@@ -212,12 +248,20 @@ def run_config(config_yaml, cores, jobs, dryrun, unlock, rerun_incomplete,
     click.echo(f"{'='*60}\n")
     
     # Find Snakefile
-    snakefile = find_snakefile()
-    if snakefile is None:
-        click.echo("ERROR: Could not find Snakefile", err=True)
-        click.echo("Please ensure ClusterCatcher is properly installed", err=True)
-        sys.exit(1)
-        
+    if snakefile:
+        if not os.path.exists(snakefile):
+            click.echo(f"ERROR: Snakefile not found: {snakefile}", err=True)
+            sys.exit(1)
+    else:
+        snakefile = find_snakefile()
+        if snakefile is None:
+            click.echo("ERROR: Could not find Snakefile", err=True)
+            click.echo("Please provide --snakefile or ensure ClusterCatcher is properly installed", err=True)
+            click.echo("\nTry one of these:", err=True)
+            click.echo("  1. Run from the ClusterCatcher directory", err=True)
+            click.echo("  2. Provide --snakefile /path/to/Snakefile", err=True)
+            sys.exit(1)
+    
     click.echo(f"Snakefile: {snakefile}")
     
     # Validate config
@@ -228,16 +272,29 @@ def run_config(config_yaml, cores, jobs, dryrun, unlock, rerun_incomplete,
         for e in errors:
             click.echo(f"  - {e}", err=True)
         sys.exit(1)
-        
-    click.echo(f"Samples: {len(config.get('samples', {}))}")
+    
+    # Display config summary
+    n_samples = 0
+    if 'samples' in config and config['samples']:
+        n_samples = len(config['samples'])
+    elif 'sample_ids' in config and config['sample_ids']:
+        n_samples = len(config['sample_ids'])
+    
+    click.echo(f"Samples: {n_samples}")
     click.echo(f"Output directory: {config.get('output_dir', 'N/A')}")
+    
+    # Show enabled modules
+    modules = config.get('modules', {})
+    enabled = [k for k, v in modules.items() if v]
+    if enabled:
+        click.echo(f"Enabled modules: {', '.join(enabled)}")
     
     # Build Snakemake command
     cmd = ['snakemake']
     
     # Core options
     cmd.extend(['--snakefile', snakefile])
-    cmd.extend(['--configfile', config_yaml])
+    cmd.extend(['--configfile', os.path.abspath(config_yaml)])
     cmd.extend(['--cores', str(cores)])
     cmd.extend(['--jobs', str(jobs)])
     cmd.extend(['--latency-wait', str(latency_wait)])
@@ -246,7 +303,7 @@ def run_config(config_yaml, cores, jobs, dryrun, unlock, rerun_incomplete,
     if use_conda:
         cmd.append('--use-conda')
         cmd.extend(['--conda-frontend', conda_frontend])
-        
+    
     # Execution modifiers
     if dryrun:
         cmd.append('--dryrun')
@@ -256,7 +313,7 @@ def run_config(config_yaml, cores, jobs, dryrun, unlock, rerun_incomplete,
         cmd.append('--rerun-incomplete')
     if keep_going:
         cmd.append('--keep-going')
-        
+    
     # Cluster options
     if profile:
         cmd.extend(['--profile', profile])
@@ -264,7 +321,7 @@ def run_config(config_yaml, cores, jobs, dryrun, unlock, rerun_incomplete,
         cmd.extend(['--cluster', cluster])
     if cluster_config:
         cmd.extend(['--cluster-config', cluster_config])
-        
+    
     # Target options
     if targets:
         cmd.extend(targets.split(','))
@@ -272,26 +329,31 @@ def run_config(config_yaml, cores, jobs, dryrun, unlock, rerun_incomplete,
         cmd.extend(['--until', until])
     if forcerun:
         for rule in forcerun.split(','):
-            cmd.extend(['--forcerun', rule])
-            
+            cmd.extend(['--forcerun', rule.strip()])
+    
     # Verbosity
     if verbose:
         cmd.append('--verbose')
     if quiet:
         cmd.append('--quiet')
-        
+    
     # Print command
     click.echo(f"\n{'='*60}")
     click.echo("Snakemake command:")
     click.echo(f"{'='*60}")
-    click.echo(' '.join(cmd))
+    click.echo(' \\\n  '.join(cmd[:6]) + ' \\')
+    click.echo('  ' + ' '.join(cmd[6:]))
     click.echo("")
     
     if dryrun:
         click.echo("DRY RUN - showing what would be executed\n")
     else:
         click.echo("Starting pipeline execution...\n")
-        
+    
+    # Change to snakefile directory for proper relative paths
+    original_dir = os.getcwd()
+    snakefile_dir = os.path.dirname(snakefile)
+    
     # Execute Snakemake
     try:
         result = subprocess.run(cmd, check=False)
@@ -301,21 +363,45 @@ def run_config(config_yaml, cores, jobs, dryrun, unlock, rerun_incomplete,
             click.echo("Pipeline completed successfully!")
             click.echo(f"{'='*60}")
             click.echo(f"\nResults in: {config.get('output_dir', 'results')}")
+            
+            # Show key output files
+            output_dir = config.get('output_dir', 'results')
+            click.echo("\nKey output files:")
+            key_files = [
+                'annotation/adata_annotated.h5ad',
+                'dysregulation/adata_cancer_detected.h5ad',
+                'mutations/all_samples.single_cell_genotype.filtered.tsv',
+                'signatures/adata_final.h5ad',
+                'master_summary.yaml'
+            ]
+            for f in key_files:
+                fpath = os.path.join(output_dir, f)
+                if os.path.exists(fpath):
+                    click.echo(f"  ✓ {f}")
         else:
             click.echo(f"\n{'='*60}")
             click.echo(f"Pipeline failed with exit code: {result.returncode}")
             click.echo(f"{'='*60}")
+            click.echo("\nTroubleshooting:")
+            click.echo("  1. Check the log files in logs/ directory")
+            click.echo("  2. Run with --verbose for more details")
+            click.echo("  3. Run with --dryrun to check workflow")
             sys.exit(result.returncode)
             
     except FileNotFoundError:
         click.echo("ERROR: Snakemake not found in PATH", err=True)
-        click.echo("Please ensure Snakemake is installed and activated", err=True)
+        click.echo("Please ensure Snakemake is installed:", err=True)
+        click.echo("  conda install -c bioconda snakemake", err=True)
+        click.echo("  # or", err=True)
+        click.echo("  pip install snakemake", err=True)
         sys.exit(1)
     except KeyboardInterrupt:
         click.echo("\n\nPipeline interrupted by user")
         click.echo("To resume, run the same command again")
         click.echo("To unlock if needed: ClusterCatcher run-config config.yaml --unlock")
         sys.exit(130)
+    finally:
+        os.chdir(original_dir)
 
 
 if __name__ == '__main__':
