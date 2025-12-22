@@ -38,12 +38,17 @@ import collections.abc
 from pathlib import Path
 
 import pysam
-import regex as re
 import pandas as pd
 import numpy as np
 from scipy.sparse import csr_matrix
 from scipy.io import mmwrite
 import csv
+
+# Try to import regex, fall back to re
+try:
+    import regex as re
+except ImportError:
+    import re
 
 # Set up logging
 logging.basicConfig(
@@ -78,6 +83,9 @@ def extract_unmapped_reads(bam_path, output_bam, output_fastq, threads=8):
         Number of unmapped reads extracted
     """
     logger.info(f"Extracting unmapped reads from {bam_path}")
+    
+    # Create output directory if needed
+    os.makedirs(os.path.dirname(output_bam), exist_ok=True)
     
     # Extract unmapped reads to BAM
     cmd1 = [
@@ -238,7 +246,12 @@ def extract_ids(bamfile, krakenfile):
                         kread_taxid = match.group(1)
                     else:
                         # Try to extract just numbers
-                        kread_taxid = re.search(r'(\d+)', kread_taxid).group(1)
+                        match = re.search(r'(\d+)', kread_taxid)
+                        if match:
+                            kread_taxid = match.group(1)
+                        else:
+                            skipped += 1
+                            continue
                 except:
                     logger.debug(f"Could not parse taxonomy ID: {kread_taxid}")
                     skipped += 1
@@ -459,8 +472,8 @@ def build_sparse_matrix(bamfile, krakenfile, dbpath, outdir,
     """
     logger.info("Building single-cell sparse matrix...")
     
-    # Create output directory
-    matrix_dir = os.path.join(outdir, 'kraken2_filtered_feature_bc_matrix')
+    # Create output directory - this is the matrix_dir output
+    matrix_dir = outdir
     os.makedirs(matrix_dir, exist_ok=True)
     
     # Output file paths
@@ -476,6 +489,20 @@ def build_sparse_matrix(bamfile, krakenfile, dbpath, outdir,
     
     if not mg_dict:
         logger.warning("No valid cell-taxonomy associations found!")
+        # Create empty files
+        with open(matrixfile, 'w') as f:
+            f.write("%%MatrixMarket matrix coordinate integer general\n%\n0 0 0\n")
+        with open(cellfile, 'w') as f:
+            pass
+        with open(taxfile, 'w') as f:
+            pass
+        # Gzip empty files
+        for filename in ['matrix.mtx', 'barcodes.tsv', 'features.tsv']:
+            filepath = os.path.join(matrix_dir, filename)
+            with open(filepath, 'rb') as f_in:
+                with gzip.open(filepath + '.gz', 'wb') as f_out:
+                    shutil.copyfileobj(f_in, f_out)
+            os.remove(filepath)
         return {'cells': 0, 'organisms': 0, 'total_counts': 0}
     
     # Find most frequent taxonomy for each transcript (UMI deduplication)
@@ -596,6 +623,7 @@ def generate_summary_report(kraken_report, taxdict, output_file, top_n=50):
     
     # Save summary
     df = pd.DataFrame(top_organisms)
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
     df.to_csv(output_file, sep='\t', index=False)
     
     logger.info(f"  Summary saved to {output_file}")
@@ -608,6 +636,8 @@ def process_sample(
     bam_path,
     db_path,
     output_dir,
+    matrix_dir,
+    summary_file,
     sample_id,
     threads=8,
     confidence=0.0,
@@ -624,7 +654,11 @@ def process_sample(
     db_path : str
         Path to Kraken2 database
     output_dir : str
-        Output directory for this sample
+        Base output directory for this sample
+    matrix_dir : str
+        Output directory for matrix files (Snakemake output)
+    summary_file : str
+        Path for summary TSV file (Snakemake output)
     sample_id : str
         Sample identifier
     threads : int
@@ -647,12 +681,11 @@ def process_sample(
     
     os.makedirs(output_dir, exist_ok=True)
     
-    # Define output paths
+    # Define intermediate file paths
     unmapped_bam = os.path.join(output_dir, f"{sample_id}_unmapped.bam")
     unmapped_fq = os.path.join(output_dir, f"{sample_id}_unmapped.fq")
     kraken_output = os.path.join(output_dir, f"{sample_id}_kraken.out")
     kraken_report = os.path.join(output_dir, f"{sample_id}_kraken_report.txt")
-    summary_file = os.path.join(output_dir, f"{sample_id}_organism_summary.tsv")
     
     results = {
         'sample_id': sample_id,
@@ -666,6 +699,20 @@ def process_sample(
         
         if n_unmapped == 0:
             logger.warning(f"No unmapped reads found for {sample_id}")
+            # Create empty outputs
+            os.makedirs(matrix_dir, exist_ok=True)
+            with open(os.path.join(matrix_dir, 'matrix.mtx'), 'w') as f:
+                f.write("%%MatrixMarket matrix coordinate integer general\n%\n0 0 0\n")
+            for filename in ['barcodes.tsv', 'features.tsv']:
+                with open(os.path.join(matrix_dir, filename), 'w') as f:
+                    pass
+            for filename in ['matrix.mtx', 'barcodes.tsv', 'features.tsv']:
+                filepath = os.path.join(matrix_dir, filename)
+                with open(filepath, 'rb') as f_in:
+                    with gzip.open(filepath + '.gz', 'wb') as f_out:
+                        shutil.copyfileobj(f_in, f_out)
+                os.remove(filepath)
+            pd.DataFrame().to_csv(summary_file, sep='\t', index=False)
             results['success'] = True
             results['cells'] = 0
             results['organisms'] = 0
@@ -676,9 +723,9 @@ def process_sample(
                                     threads, confidence)
         results.update(kraken_stats)
         
-        # Step 3: Build sparse matrix
+        # Step 3: Build sparse matrix (output to matrix_dir)
         matrix_stats = build_sparse_matrix(
-            unmapped_bam, kraken_output, db_path, output_dir,
+            unmapped_bam, kraken_output, db_path, matrix_dir,
             include_organisms, exclude_organisms
         )
         results.update(matrix_stats)
@@ -697,6 +744,8 @@ def process_sample(
         
     except Exception as e:
         logger.error(f"Error processing {sample_id}: {e}")
+        import traceback
+        traceback.print_exc()
         results['error'] = str(e)
     
     return results
@@ -712,19 +761,25 @@ def run_from_snakemake():
     # Get inputs
     bam_path = snakemake.input.bam
     
-    # Get outputs
-    output_dir = os.path.dirname(snakemake.output.summary)
+    # Get outputs - these are the required Snakemake outputs
+    summary_file = snakemake.output.summary
+    matrix_dir = snakemake.output.matrix_dir
     
     # Get params
-    sample_id = snakemake.wildcards.sample
+    sample_id = snakemake.params.sample_id
     db_path = snakemake.params.db_path
+    output_dir = snakemake.params.output_dir
     threads = snakemake.threads
     confidence = snakemake.params.get('confidence', 0.0)
     include_organisms = snakemake.params.get('include_organisms')
     exclude_organisms = snakemake.params.get('exclude_organisms')
     
+    # Build sample-specific output directory
+    sample_output_dir = os.path.join(output_dir, sample_id)
+    
     # Set up logging
     if snakemake.log:
+        os.makedirs(os.path.dirname(snakemake.log[0]), exist_ok=True)
         file_handler = logging.FileHandler(snakemake.log[0])
         file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
         logger.addHandler(file_handler)
@@ -733,7 +788,9 @@ def run_from_snakemake():
     results = process_sample(
         bam_path=bam_path,
         db_path=db_path,
-        output_dir=output_dir,
+        output_dir=sample_output_dir,
+        matrix_dir=matrix_dir,
+        summary_file=summary_file,
         sample_id=sample_id,
         threads=threads,
         confidence=confidence,
@@ -765,10 +822,16 @@ def main():
     
     args = parser.parse_args()
     
+    # For CLI, create standard output structure
+    matrix_dir = os.path.join(args.output, 'kraken2_filtered_feature_bc_matrix')
+    summary_file = os.path.join(args.output, f'{args.sample_id}_organism_summary.tsv')
+    
     results = process_sample(
         bam_path=args.bam,
         db_path=args.db,
         output_dir=args.output,
+        matrix_dir=matrix_dir,
+        summary_file=summary_file,
         sample_id=args.sample_id,
         threads=args.threads,
         confidence=args.confidence,

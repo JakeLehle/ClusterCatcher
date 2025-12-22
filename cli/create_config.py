@@ -196,9 +196,20 @@ def create_config(args):
     
     if args.enable_dysregulation:
         config['dysregulation'] = {
-            'cytotrace2_enabled': args.cytotrace2_enabled,
-            'infercnv_enabled': args.infercnv_enabled,
+            'cytotrace2': {
+                'enabled': args.cytotrace2_enabled,
+                'species': args.species if hasattr(args, 'species') else 'human',
+                'max_cells_per_chunk': args.max_cells_chunk if hasattr(args, 'max_cells_chunk') else 200000,
+            },
+            'infercnv': {
+                'enabled': args.infercnv_enabled,
+                'window_size': args.infercnv_window if hasattr(args, 'infercnv_window') else 250,
+            },
             'infercnv_reference_groups': args.infercnv_reference_groups,
+            'agreement': {
+                'alpha': args.agreement_alpha if hasattr(args, 'agreement_alpha') else 0.5,
+                'min_correlation': args.min_correlation if hasattr(args, 'min_correlation') else 0.5,
+            },
         }
     
     # Write configuration file
@@ -295,10 +306,24 @@ Examples:
     
     # Dysregulation settings
     dysreg = parser.add_argument_group('Dysregulation Detection')
-    dysreg.add_argument('--enable-dysregulation', action='store_true', default=True, help='Enable dysregulation detection')
-    dysreg.add_argument('--cytotrace2-enabled', action='store_true', default=True, help='Enable CytoTRACE2')
-    dysreg.add_argument('--infercnv-enabled', action='store_true', default=True, help='Enable inferCNV')
-    dysreg.add_argument('--infercnv-reference-groups', nargs='+', help='Reference cell types for inferCNV')
+    dysreg.add_argument('--enable-dysregulation', action='store_true', default=True, 
+                        help='Enable dysregulation detection (default: True)')
+    dysreg.add_argument('--cytotrace2-enabled', action='store_true', default=True, 
+                        help='Enable CytoTRACE2')
+    dysreg.add_argument('--infercnv-enabled', action='store_true', default=True, 
+                        help='Enable inferCNV')
+    dysreg.add_argument('--infercnv-reference-groups', nargs='+', 
+                        help='Reference cell types for inferCNV')
+    dysreg.add_argument('--species', default='human', choices=['human', 'mouse'],
+                        help='Species for CytoTRACE2 (default: human)')
+    dysreg.add_argument('--max-cells-chunk', type=int, default=200000,
+                        help='Max cells per CytoTRACE2 chunk (default: 200000)')
+    dysreg.add_argument('--infercnv-window', type=int, default=250,
+                        help='InferCNV window size (default: 250)')
+    dysreg.add_argument('--agreement-alpha', type=float, default=0.5,
+                        help='Agreement weight between rank and value (default: 0.5)')
+    dysreg.add_argument('--min-correlation', type=float, default=0.5,
+                        help='Minimum Spearman correlation for quartile selection (default: 0.5)')
     
     # SComatic settings
     scomatic = parser.add_argument_group('SComatic Mutation Calling')

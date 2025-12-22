@@ -1,4 +1,18 @@
-"""ClusterCatcher Snakemake wrapper module."""
+"""
+ClusterCatcher CLI Package
+==========================
 
-__version__ = "1.0.0"
+Command-line interface for the ClusterCatcher single-cell analysis pipeline.
 
+Commands:
+- sample-information: Process sample CSV and create sample dictionary pickle
+- create-config: Generate master config YAML for pipeline  
+- run-config: Execute the Snakemake pipeline
+"""
+
+__version__ = '1.0.3'
+
+from cli.sample_information import sample_information
+from cli.run_config import run_config
+
+__all__ = ['sample_information', 'run_config']

@@ -55,7 +55,6 @@ from matplotlib.text import Text
 import seaborn as sns
 from scipy.stats import spearmanr, pearsonr, norm
 from scipy.signal import convolve, find_peaks
-from adjustText import adjust_text
 
 # Suppress warnings
 warnings.filterwarnings('ignore')
@@ -70,7 +69,7 @@ logger = logging.getLogger(__name__)
 
 
 # =============================================================================
-# Configuration
+# Configuration Defaults
 # =============================================================================
 
 DEFAULT_CONFIG = {
@@ -98,6 +97,12 @@ DEFAULT_CONFIG = {
 def gen_mpl_labels(adata, groupby, exclude=(), ax=None, adjust_kwargs=None, 
                    text_kwargs=None, color_by_group=False):
     """Generate non-overlapping labels for UMAP plots."""
+    try:
+        from adjustText import adjust_text
+    except ImportError:
+        logger.warning("adjustText not installed, skipping label adjustment")
+        return
+    
     if adjust_kwargs is None:
         adjust_kwargs = {"text_from_points": False}
     if text_kwargs is None:
@@ -383,6 +388,9 @@ def detect_cytotrace_threshold(scores, figures_dir=None, sigma=3):
     """
     logger.info("Detecting CytoTRACE2 threshold...")
     
+    scores = np.array(scores)
+    scores = scores[~np.isnan(scores)]
+    
     counts, edges = np.histogram(scores, bins=100, density=False)
     counts_data = np.asarray(counts)
     kernel_size = int(2 * np.ceil(3 * sigma) + 0.1)
@@ -409,6 +417,8 @@ def detect_cytotrace_threshold(scores, figures_dir=None, sigma=3):
     
     # Generate plot if directory provided
     if figures_dir:
+        os.makedirs(figures_dir, exist_ok=True)
+        
         plt.figure(figsize=(14, 4))
         
         # Original data
@@ -442,6 +452,8 @@ def detect_cytotrace_threshold(scores, figures_dir=None, sigma=3):
         plt.tight_layout()
         plt.savefig(os.path.join(figures_dir, 'cytotrace_threshold_detection.pdf'), 
                     bbox_inches='tight')
+        plt.savefig(os.path.join(figures_dir, 'cytotrace_threshold_detection.png'), 
+                    dpi=150, bbox_inches='tight')
         plt.close()
     
     return threshold
@@ -469,9 +481,17 @@ def add_chromosomal_info(adata, gtf_path, working_dir):
     AnnData
         AnnData with chromosomal info in var
     """
-    import gffutils
-    
     logger.info("Adding chromosomal information from GTF...")
+    
+    if gtf_path is None or not os.path.exists(gtf_path):
+        logger.warning(f"GTF file not found at {gtf_path}. Skipping chromosomal info.")
+        return adata
+    
+    try:
+        import gffutils
+    except ImportError:
+        logger.warning("gffutils not installed. Skipping chromosomal info.")
+        return adata
     
     db_path = os.path.join(working_dir, "genes.db")
     
@@ -550,9 +570,27 @@ def run_infercnv(adata, reference_key, reference_cat, config, figures_dir=None):
     AnnData
         AnnData with CNV scores
     """
-    import infercnvpy as cnv
+    try:
+        import infercnvpy as cnv
+    except ImportError:
+        logger.warning("infercnvpy not installed. Skipping CNV analysis.")
+        adata.obs['cnv_score'] = 0.0
+        return adata
     
     logger.info("Running inferCNV analysis...")
+    
+    # Ensure we have chromosomal info
+    if 'chromosome' not in adata.var.columns:
+        logger.warning("No chromosomal info found. Skipping inferCNV.")
+        adata.obs['cnv_score'] = 0.0
+        return adata
+    
+    # Check for valid chromosome data
+    n_valid = adata.var['chromosome'].notna().sum()
+    if n_valid < 100:
+        logger.warning(f"Only {n_valid} genes have chromosomal info. Skipping inferCNV.")
+        adata.obs['cnv_score'] = 0.0
+        return adata
     
     # Ensure gene_ids is the index for inferCNV
     if 'gene_ids' in adata.var.columns:
@@ -568,30 +606,46 @@ def run_infercnv(adata, reference_key, reference_cat, config, figures_dir=None):
     
     # Generate heatmaps
     if figures_dir:
-        cnv.pl.chromosome_heatmap(adata, groupby=reference_key, show=False)
-        plt.savefig(os.path.join(figures_dir, 'chromosome_heatmap_reference.pdf'), 
-                    bbox_inches='tight')
-        plt.close()
+        os.makedirs(figures_dir, exist_ok=True)
         
-        if 'final_annotation' in adata.obs.columns:
-            cnv.pl.chromosome_heatmap(adata, groupby="final_annotation", show=False)
-            plt.savefig(os.path.join(figures_dir, 'chromosome_heatmap_celltypes.pdf'), 
+        try:
+            cnv.pl.chromosome_heatmap(adata, groupby=reference_key, show=False)
+            plt.savefig(os.path.join(figures_dir, 'chromosome_heatmap_reference.pdf'), 
                         bbox_inches='tight')
             plt.close()
+        except Exception as e:
+            logger.warning(f"Could not generate reference heatmap: {e}")
+        
+        if 'final_annotation' in adata.obs.columns:
+            try:
+                cnv.pl.chromosome_heatmap(adata, groupby="final_annotation", show=False)
+                plt.savefig(os.path.join(figures_dir, 'chromosome_heatmap_celltypes.pdf'), 
+                            bbox_inches='tight')
+                plt.close()
+            except Exception as e:
+                logger.warning(f"Could not generate celltype heatmap: {e}")
     
     # CNV-based clustering
     logger.info("Performing CNV-based clustering...")
-    cnv.tl.pca(adata)
-    cnv.pp.neighbors(adata)
-    cnv.tl.leiden(adata)
-    cnv.tl.umap(adata)
-    cnv.tl.cnv_score(adata)
+    try:
+        cnv.tl.pca(adata)
+        cnv.pp.neighbors(adata)
+        cnv.tl.leiden(adata)
+        cnv.tl.umap(adata)
+        cnv.tl.cnv_score(adata)
+    except Exception as e:
+        logger.warning(f"CNV clustering failed: {e}")
+        if 'cnv_score' not in adata.obs.columns:
+            adata.obs['cnv_score'] = 0.0
     
-    if figures_dir:
-        cnv.pl.chromosome_heatmap(adata, groupby="cnv_leiden", dendrogram=True, show=False)
-        plt.savefig(os.path.join(figures_dir, 'chromosome_heatmap_cnv_clusters.pdf'), 
-                    bbox_inches='tight')
-        plt.close()
+    if figures_dir and 'cnv_leiden' in adata.obs.columns:
+        try:
+            cnv.pl.chromosome_heatmap(adata, groupby="cnv_leiden", dendrogram=True, show=False)
+            plt.savefig(os.path.join(figures_dir, 'chromosome_heatmap_cnv_clusters.pdf'), 
+                        bbox_inches='tight')
+            plt.close()
+        except Exception as e:
+            logger.warning(f"Could not generate CNV cluster heatmap: {e}")
     
     logger.info(f"InferCNV completed. CNV scores range: {adata.obs['cnv_score'].min():.3f} - {adata.obs['cnv_score'].max():.3f}")
     
@@ -623,20 +677,35 @@ def calculate_agreement_score(cytotrace_scores, cnv_scores, alpha=0.5):
     array1 = np.array(cytotrace_scores)
     array2 = np.array(cnv_scores)
     
+    # Handle NaN values
+    valid_mask = ~np.isnan(array1) & ~np.isnan(array2)
+    if not np.any(valid_mask):
+        return np.zeros(len(array1))
+    
     # Rank-based agreement
-    rank1 = np.argsort(np.argsort(array1))
-    rank2 = np.argsort(np.argsort(array2))
-    normalized_rank1 = rank1 / len(array1)
-    normalized_rank2 = rank2 / len(array2)
+    rank1 = np.zeros(len(array1))
+    rank2 = np.zeros(len(array2))
+    rank1[valid_mask] = np.argsort(np.argsort(array1[valid_mask]))
+    rank2[valid_mask] = np.argsort(np.argsort(array2[valid_mask]))
+    
+    n_valid = valid_mask.sum()
+    normalized_rank1 = rank1 / max(n_valid, 1)
+    normalized_rank2 = rank2 / max(n_valid, 1)
     rank_agreement = 1 - np.abs(normalized_rank1 - normalized_rank2)
     
     # Value-based agreement (normalize to 0-1)
-    norm_array1 = (array1 - np.min(array1)) / (np.max(array1) - np.min(array1) + 1e-10)
-    norm_array2 = (array2 - np.min(array2)) / (np.max(array2) - np.min(array2) + 1e-10)
+    min1, max1 = np.nanmin(array1), np.nanmax(array1)
+    min2, max2 = np.nanmin(array2), np.nanmax(array2)
+    
+    norm_array1 = (array1 - min1) / (max1 - min1 + 1e-10)
+    norm_array2 = (array2 - min2) / (max2 - min2 + 1e-10)
     value_agreement = 1 - np.abs(norm_array1 - norm_array2)
     
     # Combined agreement
     agreement_score = (alpha * rank_agreement) + ((1 - alpha) * value_agreement)
+    
+    # Set invalid cells to 0
+    agreement_score[~valid_mask] = 0
     
     return agreement_score
 
@@ -666,7 +735,16 @@ def find_agreement_threshold(agreement_scores, cytotrace_scores, cnv_scores,
     """
     logger.info("Finding optimal agreement threshold...")
     
-    quartiles = np.percentile(agreement_scores, [25, 50, 75])
+    # Remove NaN values
+    valid_mask = (~np.isnan(agreement_scores) & 
+                  ~np.isnan(cytotrace_scores) & 
+                  ~np.isnan(cnv_scores))
+    
+    agreement_valid = agreement_scores[valid_mask]
+    cytotrace_valid = cytotrace_scores[valid_mask]
+    cnv_valid = cnv_scores[valid_mask]
+    
+    quartiles = np.percentile(agreement_valid, [25, 50, 75])
     q1, q2, q3 = quartiles
     
     quartile_ranges = [(0, q1), (q1, q2), (q2, q3), (q3, 1)]
@@ -677,9 +755,9 @@ def find_agreement_threshold(agreement_scores, cytotrace_scores, cnv_scores,
     quartile_info = []
     
     for q_range, q_name in zip(quartile_ranges, quartile_names):
-        mask = (agreement_scores >= q_range[0]) & (agreement_scores < q_range[1])
-        cyto_q = cytotrace_scores[mask]
-        cnv_q = cnv_scores[mask]
+        mask = (agreement_valid >= q_range[0]) & (agreement_valid < q_range[1])
+        cyto_q = cytotrace_valid[mask]
+        cnv_q = cnv_valid[mask]
         
         if len(cyto_q) > 1:
             rho, _ = spearmanr(cyto_q, cnv_q)
@@ -704,24 +782,31 @@ def find_agreement_threshold(agreement_scores, cytotrace_scores, cnv_scores,
     
     # Generate plots
     if figures_dir:
+        os.makedirs(figures_dir, exist_ok=True)
+        
         # Quartile correlation bar plot
-        plt.figure(figsize=(4, 6))
-        for i, info in enumerate(quartile_info):
-            plt.bar(i, info['spearman_rho'], label=f"{info['quartile']} (n={info['n_cells']})")
-        plt.xticks(range(4), ['Q1\n(25%)', 'Q2\n(50%)', 'Q3\n(75%)', 'Q4\n(100%)'], fontsize=12)
-        plt.ylabel('Spearman Correlation (ρ)', fontsize=14)
-        plt.axhline(y=min_correlation, color='r', linestyle='--', label=f'Threshold: {min_correlation}')
-        plt.tight_layout()
-        plt.savefig(os.path.join(figures_dir, 'quartile_correlation_analysis.pdf'), 
-                    bbox_inches='tight')
-        plt.close()
+        if len(quartile_info) > 0:
+            plt.figure(figsize=(4, 6))
+            for i, info in enumerate(quartile_info):
+                plt.bar(i, info['spearman_rho'], label=f"{info['quartile']} (n={info['n_cells']})")
+            plt.xticks(range(len(quartile_info)), 
+                       [f"{info['quartile']}\n({int(info['range'][1]*100)}%)" for info in quartile_info], 
+                       fontsize=12)
+            plt.ylabel('Spearman Correlation (ρ)', fontsize=14)
+            plt.axhline(y=min_correlation, color='r', linestyle='--', label=f'Threshold: {min_correlation}')
+            plt.tight_layout()
+            plt.savefig(os.path.join(figures_dir, 'quartile_correlation_analysis.pdf'), 
+                        bbox_inches='tight')
+            plt.savefig(os.path.join(figures_dir, 'quartile_correlation_analysis.png'), 
+                        dpi=150, bbox_inches='tight')
+            plt.close()
         
         # Agreement histogram
         colors = ['#ff0000', '#ff9900', '#ffff00', '#00cc00']
         plt.figure(figsize=(8, 6))
         ax = plt.gca()
         
-        n, bins, patches = plt.hist(agreement_scores, bins=50, edgecolor='white', 
+        n, bins, patches = plt.hist(agreement_valid, bins=50, edgecolor='white', 
                                      alpha=0.8, range=(0.3, 1))
         
         for i in range(len(patches)):
@@ -753,6 +838,8 @@ def find_agreement_threshold(agreement_scores, cytotrace_scores, cnv_scores,
         plt.tight_layout()
         plt.savefig(os.path.join(figures_dir, 'agreement_score_distribution.pdf'), 
                     bbox_inches='tight')
+        plt.savefig(os.path.join(figures_dir, 'agreement_score_distribution.png'), 
+                    dpi=150, bbox_inches='tight')
         plt.close()
     
     return selected_threshold, quartile_info
@@ -816,66 +903,89 @@ def classify_cancer_cells(adata, cytotrace_threshold, agreement_threshold, figur
 def generate_final_plots(adata, figures_dir):
     """Generate comprehensive final visualization plots."""
     logger.info("Generating final visualization plots...")
+    os.makedirs(figures_dir, exist_ok=True)
     
     from matplotlib import rcParams
     rcParams['font.size'] = 14
     rcParams['axes.titlesize'] = 16
     
     # Multi-panel UMAP
-    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(14, 13),
-                                                   gridspec_kw={"wspace": 0.2, "hspace": 0.2})
+    fig, axes = plt.subplots(2, 2, figsize=(14, 13),
+                              gridspec_kw={"wspace": 0.2, "hspace": 0.2})
+    ax1, ax2, ax3, ax4 = axes.flatten()
     
     # CytoTRACE2 Score
-    sc.pl.umap(adata, color="CytoTRACE2_Score", ax=ax1, title="CytoTRACE2 Score",
-               show=False, frameon=False, color_map='plasma', size=5)
+    if 'CytoTRACE2_Score' in adata.obs.columns:
+        sc.pl.umap(adata, color="CytoTRACE2_Score", ax=ax1, title="CytoTRACE2 Score",
+                   show=False, frameon=False, color_map='plasma', size=5)
+    else:
+        ax1.set_title("CytoTRACE2 Score (not available)")
     
     # CNV Score
-    sc.pl.umap(adata, color="cnv_score", ax=ax2, title="CNV Score",
-               show=False, frameon=False, color_map='plasma', size=5)
+    if 'cnv_score' in adata.obs.columns:
+        sc.pl.umap(adata, color="cnv_score", ax=ax2, title="CNV Score",
+                   show=False, frameon=False, color_map='plasma', size=5)
+    else:
+        ax2.set_title("CNV Score (not available)")
     
     # Cancer Status
-    cancer_palette = {'Cancer cell': '#FF7F0E', 'Normal cell': '#1F77B4'}
-    sc.pl.umap(adata, color="Final_cancer_cell_status", ax=ax3, title="Cancer Cell Status",
-               show=False, frameon=False, palette=cancer_palette, size=5)
+    if 'Final_cancer_cell_status' in adata.obs.columns:
+        cancer_palette = {'Cancer cell': '#FF7F0E', 'Normal cell': '#1F77B4'}
+        sc.pl.umap(adata, color="Final_cancer_cell_status", ax=ax3, title="Cancer Cell Status",
+                   show=False, frameon=False, palette=cancer_palette, size=5)
     
     # Cell Types
-    sc.pl.umap(adata, color="final_annotation", ax=ax4, title="Cell Types",
-               show=False, frameon=False, size=5)
+    if 'final_annotation' in adata.obs.columns:
+        sc.pl.umap(adata, color="final_annotation", ax=ax4, title="Cell Types",
+                   show=False, frameon=False, size=5)
     
     plt.tight_layout()
     plt.savefig(os.path.join(figures_dir, 'cancer_detection_summary.pdf'), 
                 bbox_inches='tight', dpi=300)
+    plt.savefig(os.path.join(figures_dir, 'cancer_detection_summary.png'), 
+                dpi=150, bbox_inches='tight')
     plt.close()
     
     # Correlation plot
-    fig, ax = plt.subplots(figsize=(6, 6))
-    
-    sc = ax.scatter(
-        adata.obs['CytoTRACE2_Score'],
-        adata.obs['cnv_score'],
-        c=adata.obs['agreement_score'],
-        cmap="RdYlGn",
-        alpha=0.5,
-        s=5
-    )
-    
-    rho, p = spearmanr(adata.obs['CytoTRACE2_Score'], adata.obs['cnv_score'])
-    ax.text(0.05, 0.95, f"Spearman ρ = {rho:.2f}\n(p = {p:.2e})",
-            transform=ax.transAxes, fontsize=12, va='top')
-    
-    ax.set_xlabel("CytoTRACE2 Score", fontsize=14)
-    ax.set_ylabel("CNV Score", fontsize=14)
-    
-    cbar = plt.colorbar(sc)
-    cbar.set_label("Agreement Score", fontsize=12)
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(figures_dir, 'score_correlation.pdf'), 
-                bbox_inches='tight')
-    plt.close()
+    if 'CytoTRACE2_Score' in adata.obs.columns and 'cnv_score' in adata.obs.columns:
+        fig, ax = plt.subplots(figsize=(6, 6))
+        
+        scatter = ax.scatter(
+            adata.obs['CytoTRACE2_Score'],
+            adata.obs['cnv_score'],
+            c=adata.obs['agreement_score'] if 'agreement_score' in adata.obs.columns else 'blue',
+            cmap="RdYlGn",
+            alpha=0.5,
+            s=5
+        )
+        
+        # Calculate correlation
+        valid_mask = (~adata.obs['CytoTRACE2_Score'].isna() & 
+                      ~adata.obs['cnv_score'].isna())
+        if valid_mask.sum() > 1:
+            rho, p = spearmanr(
+                adata.obs.loc[valid_mask, 'CytoTRACE2_Score'], 
+                adata.obs.loc[valid_mask, 'cnv_score']
+            )
+            ax.text(0.05, 0.95, f"Spearman ρ = {rho:.2f}\n(p = {p:.2e})",
+                    transform=ax.transAxes, fontsize=12, va='top')
+        
+        ax.set_xlabel("CytoTRACE2 Score", fontsize=14)
+        ax.set_ylabel("CNV Score", fontsize=14)
+        
+        if 'agreement_score' in adata.obs.columns:
+            cbar = plt.colorbar(scatter)
+            cbar.set_label("Agreement Score", fontsize=12)
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(figures_dir, 'score_correlation.pdf'), 
+                    bbox_inches='tight')
+        plt.savefig(os.path.join(figures_dir, 'score_correlation.png'), 
+                    dpi=150, bbox_inches='tight')
+        plt.close()
     
     # Cancer cell type distribution
-    if 'final_annotation' in adata.obs.columns:
+    if 'final_annotation' in adata.obs.columns and 'Final_cancer_cell_status' in adata.obs.columns:
         cancer_cells = adata.obs[adata.obs['Final_cancer_cell_status'] == 'Cancer cell']
         if len(cancer_cells) > 0:
             celltype_counts = cancer_cells['final_annotation'].value_counts()
@@ -889,6 +999,8 @@ def generate_final_plots(adata, figures_dir):
             plt.tight_layout()
             plt.savefig(os.path.join(figures_dir, 'cancer_celltype_distribution.pdf'), 
                         bbox_inches='tight')
+            plt.savefig(os.path.join(figures_dir, 'cancer_celltype_distribution.png'), 
+                        dpi=150, bbox_inches='tight')
             plt.close()
 
 
@@ -900,6 +1012,8 @@ def run_cancer_detection_pipeline(
     adata_path,
     gtf_path,
     output_dir,
+    figures_dir,
+    summary_path,
     config=None,
 ):
     """
@@ -912,7 +1026,11 @@ def run_cancer_detection_pipeline(
     gtf_path : str
         Path to GTF annotation file
     output_dir : str
-        Output directory
+        Output directory for AnnData
+    figures_dir : str
+        Output directory for figures
+    summary_path : str
+        Path for summary TSV file
     config : dict, optional
         Configuration parameters
         
@@ -925,7 +1043,6 @@ def run_cancer_detection_pipeline(
         config = DEFAULT_CONFIG
     
     os.makedirs(output_dir, exist_ok=True)
-    figures_dir = os.path.join(output_dir, 'figures')
     os.makedirs(figures_dir, exist_ok=True)
     
     logger.info("="*60)
@@ -939,14 +1056,19 @@ def run_cancer_detection_pipeline(
     
     # Ensure required columns exist
     if 'final_annotation' not in adata.obs.columns:
-        raise ValueError("AnnData must have 'final_annotation' column in obs")
+        logger.warning("AnnData missing 'final_annotation' column. Using leiden clusters.")
+        if 'leiden' in adata.obs.columns:
+            adata.obs['final_annotation'] = 'Cluster_' + adata.obs['leiden'].astype(str)
+        else:
+            adata.obs['final_annotation'] = 'Unknown'
     
     # Step 1: Run CytoTRACE2
     logger.info("\n" + "="*60)
     logger.info("Step 1: CytoTRACE2 Analysis")
     logger.info("="*60)
     
-    cytotrace_results = run_cytotrace2(adata, output_dir, config.get('cytotrace2', {}))
+    cytotrace_config = config.get('cytotrace2', DEFAULT_CONFIG['cytotrace2'])
+    cytotrace_results = run_cytotrace2(adata, output_dir, cytotrace_config)
     
     # Merge results with adata
     cytotrace_txt = cytotrace_results[['cell_barcodes', 'CytoTRACE2_Score', 'CytoTRACE2_Potency']].copy()
@@ -957,18 +1079,17 @@ def run_cancer_detection_pipeline(
     adata.obs = adata.obs.join(cytotrace_txt, on='cell_barcodes', how='left')
     
     # Detect threshold
-    cytotrace_threshold = detect_cytotrace_threshold(
-        adata.obs['CytoTRACE2_Score'].dropna(),
-        figures_dir
-    )
+    valid_scores = adata.obs['CytoTRACE2_Score'].dropna()
+    if len(valid_scores) > 0:
+        cytotrace_threshold = detect_cytotrace_threshold(valid_scores, figures_dir)
+    else:
+        cytotrace_threshold = 0.5
+        logger.warning("No valid CytoTRACE2 scores. Using default threshold: 0.5")
     
     # Create initial cancer/normal labels for inferCNV reference
     adata.obs['infer_cnv_reference'] = np.where(
         adata.obs['CytoTRACE2_Score'] > cytotrace_threshold, 'Cancer', 'Normal'
     )
-    
-    # Save intermediate result
-    adata.write(os.path.join(output_dir, 'adata_cytotrace.h5ad'))
     
     # Step 2: Add chromosomal info and run inferCNV
     logger.info("\n" + "="*60)
@@ -977,16 +1098,14 @@ def run_cancer_detection_pipeline(
     
     adata = add_chromosomal_info(adata, gtf_path, output_dir)
     
+    infercnv_config = config.get('infercnv', DEFAULT_CONFIG['infercnv'])
     adata = run_infercnv(
         adata,
         reference_key='infer_cnv_reference',
         reference_cat=['Normal'],
-        config=config.get('infercnv', {}),
+        config=infercnv_config,
         figures_dir=figures_dir
     )
-    
-    # Save intermediate result
-    adata.write(os.path.join(output_dir, 'adata_infercnv.h5ad'))
     
     # Step 3: Calculate agreement and final classification
     logger.info("\n" + "="*60)
@@ -994,7 +1113,7 @@ def run_cancer_detection_pipeline(
     logger.info("="*60)
     
     # Calculate agreement
-    agreement_config = config.get('agreement', {})
+    agreement_config = config.get('agreement', DEFAULT_CONFIG['agreement'])
     adata.obs['agreement_score'] = calculate_agreement_score(
         adata.obs['CytoTRACE2_Score'].values,
         adata.obs['cnv_score'].values,
@@ -1016,23 +1135,34 @@ def run_cancer_detection_pipeline(
     )
     
     # Save final result
-    adata.write(os.path.join(output_dir, 'adata_cancer_detected.h5ad'))
+    output_adata_path = os.path.join(output_dir, 'adata_cancer_detected.h5ad')
+    adata.write(output_adata_path)
+    logger.info(f"Saved annotated data to {output_adata_path}")
+    
+    # Calculate correlation for summary
+    valid_mask = (~adata.obs['CytoTRACE2_Score'].isna() & 
+                  ~adata.obs['cnv_score'].isna())
+    if valid_mask.sum() > 1:
+        spearman_rho = spearmanr(
+            adata.obs.loc[valid_mask, 'CytoTRACE2_Score'], 
+            adata.obs.loc[valid_mask, 'cnv_score']
+        )[0]
+    else:
+        spearman_rho = 0.0
     
     # Save summary
     summary = {
         'total_cells': adata.n_obs,
-        'cancer_cells': (adata.obs['Final_cancer_cell_status'] == 'Cancer cell').sum(),
-        'normal_cells': (adata.obs['Final_cancer_cell_status'] == 'Normal cell').sum(),
+        'cancer_cells': int((adata.obs['Final_cancer_cell_status'] == 'Cancer cell').sum()),
+        'normal_cells': int((adata.obs['Final_cancer_cell_status'] == 'Normal cell').sum()),
         'cytotrace_threshold': float(cytotrace_threshold),
         'agreement_threshold': float(agreement_threshold),
-        'spearman_correlation': float(spearmanr(
-            adata.obs['CytoTRACE2_Score'], adata.obs['cnv_score']
-        )[0]),
+        'spearman_correlation': float(spearman_rho),
     }
     
     summary_df = pd.DataFrame([summary])
-    summary_df.to_csv(os.path.join(output_dir, 'cancer_detection_summary.tsv'), 
-                      sep='\t', index=False)
+    summary_df.to_csv(summary_path, sep='\t', index=False)
+    logger.info(f"Saved summary to {summary_path}")
     
     logger.info("\n" + "="*60)
     logger.info("Pipeline completed successfully!")
@@ -1053,29 +1183,50 @@ def run_from_snakemake():
     
     # Get inputs
     adata_path = snakemake.input.adata
-    gtf_path = snakemake.params.gtf_path
     
     # Get outputs
-    output_dir = os.path.dirname(snakemake.output.adata)
+    output_adata = snakemake.output.adata
+    output_summary = snakemake.output.summary
+    output_figures = snakemake.output.figures
     
-    # Get config
+    # Get params from Snakemake rule
+    params = snakemake.params
+    gtf_path = params.gtf_path
+    
+    # Build config from params
     config = {
-        'cytotrace2': snakemake.config.get('dysregulation', {}).get('cytotrace2', {}),
-        'infercnv': snakemake.config.get('dysregulation', {}).get('infercnv', {}),
-        'agreement': snakemake.config.get('dysregulation', {}).get('agreement', {}),
+        'cytotrace2': {
+            'species': params.species,
+            'max_cells_per_chunk': params.max_cells_chunk,
+            'seed': 42,
+        },
+        'infercnv': {
+            'window_size': params.infercnv_window,
+            'reference_groups': params.infercnv_reference_groups,
+        },
+        'agreement': {
+            'alpha': params.agreement_alpha,
+            'min_correlation': params.min_correlation,
+        },
     }
     
-    # Set up logging
+    # Set up logging to file
     if snakemake.log:
+        os.makedirs(os.path.dirname(snakemake.log[0]), exist_ok=True)
         file_handler = logging.FileHandler(snakemake.log[0])
         file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
         logger.addHandler(file_handler)
+    
+    # Output directory is parent of adata output
+    output_dir = os.path.dirname(output_adata)
     
     # Run pipeline
     run_cancer_detection_pipeline(
         adata_path=adata_path,
         gtf_path=gtf_path,
         output_dir=output_dir,
+        figures_dir=output_figures,
+        summary_path=output_summary,
         config=config,
     )
 
@@ -1095,6 +1246,12 @@ def main():
     parser.add_argument('--species', default='human', help='Species (default: human)')
     parser.add_argument('--max-cells-chunk', type=int, default=200000,
                         help='Max cells per CytoTRACE2 chunk')
+    parser.add_argument('--infercnv-window', type=int, default=250,
+                        help='InferCNV window size')
+    parser.add_argument('--agreement-alpha', type=float, default=0.5,
+                        help='Agreement weight (0-1)')
+    parser.add_argument('--min-correlation', type=float, default=0.5,
+                        help='Minimum correlation for quartile selection')
     
     args = parser.parse_args()
     
@@ -1103,14 +1260,26 @@ def main():
             'species': args.species,
             'max_cells_per_chunk': args.max_cells_chunk,
         },
-        'infercnv': {},
-        'agreement': {},
+        'infercnv': {
+            'window_size': args.infercnv_window,
+        },
+        'agreement': {
+            'alpha': args.agreement_alpha,
+            'min_correlation': args.min_correlation,
+        },
     }
+    
+    # Define output paths
+    output_dir = args.output
+    figures_dir = os.path.join(output_dir, 'figures')
+    summary_path = os.path.join(output_dir, 'cancer_detection_summary.tsv')
     
     run_cancer_detection_pipeline(
         adata_path=args.adata,
         gtf_path=args.gtf,
-        output_dir=args.output,
+        output_dir=output_dir,
+        figures_dir=figures_dir,
+        summary_path=summary_path,
         config=config,
     )
 

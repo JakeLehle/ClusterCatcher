@@ -38,19 +38,18 @@ import logging
 import argparse
 import warnings
 from pathlib import Path
-from tqdm import tqdm
 
 import numpy as np
 import pandas as pd
 import anndata as ad
 import scanpy as sc
 import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import seaborn as sns
 
 # Suppress warnings
 warnings.filterwarnings('ignore')
-matplotlib.use('Agg')
 
 # Set up logging
 logging.basicConfig(
@@ -80,7 +79,6 @@ def clean_column_names(df):
     pd.DataFrame
         DataFrame with cleaned column names
     """
-    logger.info("Cleaning column names for HDF5 compatibility...")
     rename_map = {}
     
     for col in df.columns:
@@ -100,13 +98,10 @@ def clean_column_names(df):
         
         if new_col != col:
             rename_map[col] = new_col
-            logger.debug(f"  Renamed: '{col}' -> '{new_col}'")
     
     if rename_map:
         df = df.rename(columns=rename_map)
-        logger.info(f"  Cleaned {len(rename_map)} column names")
-    else:
-        logger.info("  No problematic column names found")
+        logger.debug(f"Cleaned {len(rename_map)} column names")
     
     return df
 
@@ -115,7 +110,7 @@ def clean_obs_for_saving(adata):
     """
     Clean AnnData obs columns for HDF5 saving.
     
-    Converts all obs columns to strings to avoid serialization issues.
+    Converts problematic columns to strings to avoid serialization issues.
     
     Parameters
     ----------
@@ -127,11 +122,18 @@ def clean_obs_for_saving(adata):
     AnnData
         Cleaned AnnData
     """
+    adata.obs = clean_column_names(adata.obs)
+    
     for col in adata.obs.columns:
-        adata.obs[col] = [str(element) for element in adata.obs[col]]
+        try:
+            # Try to convert to string if it's a problematic type
+            if adata.obs[col].dtype == object:
+                adata.obs[col] = adata.obs[col].astype(str)
+        except:
+            pass
     
     if 'gene_ids' in adata.var.columns:
-        adata.var['gene_ids'] = [str(item) for item in adata.var['gene_ids']]
+        adata.var['gene_ids'] = adata.var['gene_ids'].astype(str)
     
     return adata
 
@@ -156,6 +158,10 @@ def parse_kraken_hierarchy(hierarchy_file):
     
     v_hierarchy = {}
     species_list = []
+    
+    if not os.path.exists(hierarchy_file):
+        logger.warning(f"Hierarchy file not found: {hierarchy_file}")
+        return v_hierarchy, species_list
     
     with open(hierarchy_file, 'rt') as f:
         lines = f.readlines()
@@ -207,207 +213,34 @@ def parse_kraken_hierarchy(hierarchy_file):
     return v_hierarchy, species_list
 
 
-def parse_sample_hierarchy(hierarchy_file):
-    """
-    Parse sample-level hierarchy file (simpler format).
-    
-    Parameters
-    ----------
-    hierarchy_file : str
-        Path to hierarchy.txt from sample Kraken2 output
-        
-    Returns
-    -------
-    dict
-        Dictionary mapping tax_id to virus name
-    """
-    v_hierarchy = {}
-    
-    with open(hierarchy_file, 'rt') as f:
-        lines = f.readlines()
-    
-    for line in lines:
-        if not line.strip() or line.startswith('#'):
-            continue
-        
-        parts = line.strip().split('\t')
-        if len(parts) >= 6:
-            tax_id = parts[4].strip()
-            # Extract just the name, removing leading spaces
-            name_match = re.search(r'.*?([a-zA-Z].*)', parts[5])
-            if name_match:
-                name = name_match.group(1).strip()
-            else:
-                name = parts[5].strip()
-            v_hierarchy[tax_id] = name
-    
-    return v_hierarchy
-
-
 # =============================================================================
 # Data Loading Functions
 # =============================================================================
 
-def load_viral_data_for_samples(sample_dirs, sample_ids, sample_hierarchy):
+def load_viral_adata(viral_adata_path):
     """
-    Load Kraken2 viral detection matrices for all samples.
+    Load the combined viral counts AnnData from summarize step.
     
     Parameters
     ----------
-    sample_dirs : list
-        List of sample viral detection output directories
-    sample_ids : list
-        List of sample identifiers
-    sample_hierarchy : dict
-        Virus name mapping from reference hierarchy
+    viral_adata_path : str
+        Path to viral_counts.h5ad from summarize_viral step
         
     Returns
     -------
     AnnData
-        Combined viral counts AnnData
+        Viral counts AnnData
     """
-    logger.info("Loading viral detection data for all samples...")
+    logger.info(f"Loading viral counts AnnData: {viral_adata_path}")
     
-    adata_v = None
-    
-    for sample_dir, sample_id in tqdm(zip(sample_dirs, sample_ids), 
-                                       total=len(sample_ids), 
-                                       desc="Loading samples"):
-        matrix_dir = os.path.join(sample_dir, 'kraken2_filtered_feature_bc_matrix')
-        
-        if not os.path.exists(matrix_dir):
-            logger.warning(f"  Skipping {sample_id}: matrix directory not found")
-            continue
-        
-        # Check required files
-        required_files = ['barcodes.tsv.gz', 'matrix.mtx.gz']
-        genes_file = 'features.tsv.gz' if os.path.exists(os.path.join(matrix_dir, 'features.tsv.gz')) else 'genes.tsv.gz'
-        required_files.append(genes_file)
-        
-        missing = [f for f in required_files if not os.path.exists(os.path.join(matrix_dir, f))]
-        if missing:
-            logger.warning(f"  Skipping {sample_id}: missing files {missing}")
-            continue
-        
-        try:
-            # Decompress files temporarily
-            temp_files = []
-            for gz_file in required_files:
-                gz_path = os.path.join(matrix_dir, gz_file)
-                out_path = os.path.join(matrix_dir, gz_file[:-3])
-                
-                with gzip.open(gz_path, 'rt') as f_in, open(out_path, 'wt') as f_out:
-                    f_out.writelines(f_in)
-                temp_files.append(out_path)
-            
-            # Read the 10X matrix
-            adata_sample = sc.read_10x_mtx(matrix_dir)
-            
-            # Add sample metadata
-            adata_sample.obs['sample_id'] = sample_id
-            
-            # Create unique cell barcodes
-            adata_sample.obs_names = [f"{bc}-{sample_id}" for bc in adata_sample.obs_names]
-            
-            # Add gene symbol column
-            adata_sample.var['gene_symbol'] = adata_sample.var_names
-            
-            # Concatenate
-            if adata_v is None:
-                adata_v = adata_sample
-            else:
-                adata_v = ad.concat([adata_v, adata_sample], join='outer', merge='same')
-            
-            # Cleanup temp files
-            for temp_file in temp_files:
-                if os.path.exists(temp_file):
-                    os.remove(temp_file)
-                    
-        except Exception as e:
-            logger.error(f"  Error processing {sample_id}: {e}")
-            continue
-    
-    if adata_v is None:
-        logger.warning("No viral data was loaded!")
+    if not os.path.exists(viral_adata_path):
+        logger.warning(f"Viral AnnData not found: {viral_adata_path}")
         return ad.AnnData()
     
-    logger.info(f"  Loaded viral data: {adata_v.n_obs} cells, {adata_v.n_vars} organisms")
+    adata_v = sc.read_h5ad(viral_adata_path)
+    logger.info(f"  Loaded: {adata_v.n_obs} cells, {adata_v.n_vars} organisms")
     
     return adata_v
-
-
-def ensure_all_viruses_present(sample_dirs, sample_ids, reference_hierarchy):
-    """
-    Ensure all samples have entries for all viruses in the reference.
-    
-    This is necessary for proper concatenation of sparse matrices.
-    
-    Parameters
-    ----------
-    sample_dirs : list
-        List of sample viral detection output directories
-    sample_ids : list
-        List of sample identifiers
-    reference_hierarchy : dict
-        Reference virus name mapping
-    """
-    logger.info("Ensuring consistent virus features across samples...")
-    
-    for sample_dir, sample_id in zip(sample_dirs, sample_ids):
-        matrix_dir = os.path.join(sample_dir, 'kraken2_filtered_feature_bc_matrix')
-        
-        if not os.path.exists(matrix_dir):
-            continue
-        
-        genes_file = os.path.join(matrix_dir, 'genes.tsv.gz')
-        if not os.path.exists(genes_file):
-            genes_file = os.path.join(matrix_dir, 'features.tsv.gz')
-            if not os.path.exists(genes_file):
-                continue
-        
-        try:
-            # Read current genes
-            existing_viruses = []
-            with gzip.open(genes_file, 'rt') as f:
-                reader = csv.reader(f, delimiter='\t')
-                for row in reader:
-                    if len(row) >= 2:
-                        existing_viruses.append(row[1])
-            
-            # Add missing viruses
-            viruses_to_add = []
-            for tax_id, virus_name in reference_hierarchy.items():
-                if virus_name not in existing_viruses:
-                    viruses_to_add.append((tax_id, virus_name))
-            
-            if viruses_to_add:
-                with gzip.open(genes_file, 'at') as f:
-                    writer = csv.writer(f, delimiter='\t', lineterminator='\n')
-                    for tax_id, virus_name in viruses_to_add:
-                        writer.writerow([tax_id, virus_name])
-                
-                # Update matrix header with new feature count
-                matrix_file = os.path.join(matrix_dir, 'matrix.mtx.gz')
-                new_feature_count = len(existing_viruses) + len(viruses_to_add)
-                
-                with gzip.open(matrix_file, 'rb') as f:
-                    lines = f.readlines()
-                
-                # Update the header line (line 3, 0-indexed as 2)
-                if len(lines) >= 3:
-                    header_parts = lines[2].decode().strip().split()
-                    if len(header_parts) >= 3:
-                        new_header = f"{new_feature_count} {header_parts[1]} {len(lines) - 3}\n"
-                        lines[2] = new_header.encode()
-                
-                with gzip.open(matrix_file, 'wb') as f:
-                    for line in lines:
-                        f.write(line)
-                
-                logger.debug(f"  Added {len(viruses_to_add)} viruses to {sample_id}")
-                
-        except Exception as e:
-            logger.warning(f"  Error updating {sample_id}: {e}")
 
 
 # =============================================================================
@@ -422,8 +255,8 @@ def filter_human_viruses(adata_v, human_species_names):
     ----------
     adata_v : AnnData
         Viral counts AnnData
-    human_species_names : tuple
-        Tuple of human virus species names
+    human_species_names : tuple or list
+        Human virus species names
         
     Returns
     -------
@@ -432,7 +265,15 @@ def filter_human_viruses(adata_v, human_species_names):
     """
     logger.info("Filtering for human-associated viruses...")
     
-    human_virus_names = tuple(name.strip() for name in human_species_names if name.strip())
+    if adata_v.n_vars == 0:
+        return adata_v
+    
+    human_virus_names = tuple(name.strip() for name in human_species_names if name and name.strip())
+    
+    if not human_virus_names:
+        logger.warning("No human virus names provided for filtering")
+        return adata_v
+    
     human_virus_mask = adata_v.var_names.isin(human_virus_names)
     
     n_before = adata_v.n_vars
@@ -462,6 +303,10 @@ def integrate_viral_with_expression(adata_pp, adata_v):
     """
     logger.info("Integrating viral counts with gene expression data...")
     
+    if adata_v.n_obs == 0 or adata_v.n_vars == 0:
+        logger.warning("No viral data to integrate")
+        return adata_pp.copy()
+    
     # Store original gene names for later filtering
     gene_names = list(adata_pp.var_names)
     
@@ -476,13 +321,19 @@ def integrate_viral_with_expression(adata_pp, adata_v):
     
     if len(common_cells) == 0:
         logger.warning("No common cells found between expression and viral data!")
-        return adata_pp
+        return adata_pp.copy()
     
     adata_v_filtered = adata_v[adata_v.obs_names.isin(common_cells)].copy()
     
     # Filter to cells with viral reads
-    sc.pp.filter_cells(adata_v_filtered, min_counts=1)
+    cell_sums = np.array(adata_v_filtered.X.sum(axis=1)).flatten()
+    cells_with_reads = cell_sums > 0
+    adata_v_filtered = adata_v_filtered[cells_with_reads].copy()
     logger.info(f"  Cells with viral reads: {adata_v_filtered.n_obs}")
+    
+    if adata_v_filtered.n_obs == 0:
+        logger.warning("No cells have viral reads")
+        return adata_pp.copy()
     
     # Filter expression data to cells with viral reads
     adata_pp_filtered = adata_pp_denorm[adata_pp_denorm.obs_names.isin(adata_v_filtered.obs_names)].copy()
@@ -490,6 +341,11 @@ def integrate_viral_with_expression(adata_pp, adata_v):
     # Clear varm to avoid concatenation issues
     adata_pp_filtered.varm = {}
     adata_v_filtered.varm = {}
+    
+    # Ensure obs columns are compatible
+    for col in adata_pp_filtered.obs.columns:
+        if col not in adata_v_filtered.obs.columns:
+            adata_v_filtered.obs[col] = adata_pp_filtered.obs.loc[adata_v_filtered.obs_names, col].values
     
     # Join the data
     adata_joined = ad.concat(
@@ -531,58 +387,73 @@ def calculate_viral_markers(adata_joined, human_virus_names, groupby='final_anno
     ----------
     adata_joined : AnnData
         Integrated AnnData with genes and viruses
-    human_virus_names : tuple
-        Tuple of human virus names
+    human_virus_names : tuple or list
+        Human virus names
     groupby : str
         Column in obs to group by
         
     Returns
     -------
-    pd.DataFrame
-        DataFrame with viral markers per cell type
+    tuple
+        (all_markers_df, virus_markers_df)
     """
     logger.info(f"Calculating viral markers by {groupby}...")
     
-    # Rank genes
-    sc.tl.rank_genes_groups(adata_joined, groupby=groupby, 
-                            key_added='rank_genes', method='wilcoxon')
+    if groupby not in adata_joined.obs.columns:
+        logger.warning(f"Column '{groupby}' not found in obs")
+        return pd.DataFrame(), pd.DataFrame()
     
-    results = adata_joined.uns['rank_genes']
+    # Check for sufficient groups
+    n_groups = adata_joined.obs[groupby].nunique()
+    if n_groups < 2:
+        logger.warning(f"Need at least 2 groups for marker analysis, found {n_groups}")
+        return pd.DataFrame(), pd.DataFrame()
     
-    # Get original gene names to filter out
-    remove_list = adata_joined.uns.get('original_gene_names', [])
-    
-    # Build markers dataframe
-    out = []
-    for group in results['names'].dtype.names:
-        for i in range(len(results['names'][group])):
-            out.append({
-                'virus': results['names'][group][i],
-                'scores': results['scores'][group][i],
-                'pval_adj': results['pvals_adj'][group][i],
-                'lfc': results['logfoldchanges'][group][i],
-                'cluster': group
-            })
-    
-    markers = pd.DataFrame(out)
-    
-    # Filter to significant markers
-    markers = markers[markers['scores'] > 0.0001]
-    
-    # Remove gene markers (keep only viruses)
-    if remove_list:
-        mask = markers['virus'].isin(remove_list)
-        markers = markers[~mask]
-    
-    # Format p-values
-    markers['pval_adj'] = markers['pval_adj'].apply(lambda x: f'{x:.2e}')
-    
-    # Filter to human viruses
-    virus_markers = markers[markers['virus'].isin(human_virus_names)]
-    
-    logger.info(f"  Found {len(virus_markers)} viral marker entries")
-    
-    return markers, virus_markers
+    try:
+        # Rank genes
+        sc.tl.rank_genes_groups(adata_joined, groupby=groupby, 
+                                key_added='rank_genes', method='wilcoxon')
+        
+        results = adata_joined.uns['rank_genes']
+        
+        # Get original gene names to filter out
+        remove_list = adata_joined.uns.get('original_gene_names', [])
+        
+        # Build markers dataframe
+        out = []
+        for group in results['names'].dtype.names:
+            for i in range(len(results['names'][group])):
+                out.append({
+                    'virus': results['names'][group][i],
+                    'scores': results['scores'][group][i],
+                    'pval_adj': results['pvals_adj'][group][i],
+                    'lfc': results['logfoldchanges'][group][i],
+                    'cluster': group
+                })
+        
+        markers = pd.DataFrame(out)
+        
+        # Filter to significant markers
+        markers = markers[markers['scores'] > 0.0001]
+        
+        # Remove gene markers (keep only viruses)
+        if remove_list:
+            mask = markers['virus'].isin(remove_list)
+            markers = markers[~mask]
+        
+        # Format p-values
+        markers['pval_adj'] = markers['pval_adj'].apply(lambda x: f'{x:.2e}')
+        
+        # Filter to human viruses
+        virus_markers = markers[markers['virus'].isin(human_virus_names)]
+        
+        logger.info(f"  Found {len(virus_markers)} viral marker entries")
+        
+        return markers, virus_markers
+        
+    except Exception as e:
+        logger.warning(f"Marker calculation failed: {e}")
+        return pd.DataFrame(), pd.DataFrame()
 
 
 def aggregate_virus_scores(virus_markers):
@@ -603,7 +474,7 @@ def aggregate_virus_scores(virus_markers):
         return pd.Series(dtype=float)
     
     subset = virus_markers[['virus', 'scores']].copy()
-    subset['scores'] = pd.to_numeric(subset['scores'])
+    subset['scores'] = pd.to_numeric(subset['scores'], errors='coerce')
     aggregated = subset.groupby('virus')['scores'].sum().sort_values(ascending=False)
     
     return aggregated
@@ -613,7 +484,7 @@ def aggregate_virus_scores(virus_markers):
 # Visualization Functions
 # =============================================================================
 
-def generate_viral_plots(adata_joined, adata_pp, virus_scores, figures_dir, top_n=10):
+def generate_viral_plots(adata_joined, virus_scores, figures_dir, top_n=10):
     """
     Generate comprehensive viral detection plots.
     
@@ -621,8 +492,6 @@ def generate_viral_plots(adata_joined, adata_pp, virus_scores, figures_dir, top_
     ----------
     adata_joined : AnnData
         Integrated AnnData
-    adata_pp : AnnData
-        Original expression AnnData
     virus_scores : pd.Series
         Aggregated virus scores
     figures_dir : str
@@ -643,35 +512,43 @@ def generate_viral_plots(adata_joined, adata_pp, virus_scores, figures_dir, top_
         adata_joined.var.index = adata_joined.var['gene_symbol']
     
     top_viruses = list(virus_scores.head(top_n).index)
+    top_viruses = [v for v in top_viruses if v in adata_joined.var_names]
+    
+    if not top_viruses:
+        logger.warning("No top viruses found in adata_joined")
+        return
     
     # 1. Matrix plot - Top viruses by cell type
-    logger.info("  Creating matrix plot...")
-    try:
-        plt.rcParams['figure.figsize'] = (10, 8)
-        sc.settings.set_figure_params(scanpy=True, fontsize=14)
-        
-        fig = sc.pl.matrixplot(
-            adata_joined,
-            top_viruses,
-            'final_annotation',
-            dendrogram=True,
-            var_group_rotation=30,
-            cmap='plasma',
-            log=True,
-            return_fig=True,
-            show=False
-        )
-        fig.savefig(os.path.join(figures_dir, 'virus_matrix_plot.pdf'), 
-                    bbox_inches='tight', dpi=300)
-        plt.close()
-    except Exception as e:
-        logger.warning(f"  Matrix plot failed: {e}")
+    if 'final_annotation' in adata_joined.obs.columns:
+        logger.info("  Creating matrix plot...")
+        try:
+            plt.rcParams['figure.figsize'] = (10, 8)
+            sc.settings.set_figure_params(scanpy=True, fontsize=14)
+            
+            fig = sc.pl.matrixplot(
+                adata_joined,
+                top_viruses,
+                'final_annotation',
+                dendrogram=True,
+                var_group_rotation=30,
+                cmap='plasma',
+                log=True,
+                return_fig=True,
+                show=False
+            )
+            fig.savefig(os.path.join(figures_dir, 'virus_matrix_plot.pdf'), 
+                        bbox_inches='tight', dpi=300)
+            fig.savefig(os.path.join(figures_dir, 'virus_matrix_plot.png'), 
+                        dpi=150, bbox_inches='tight')
+            plt.close()
+        except Exception as e:
+            logger.warning(f"  Matrix plot failed: {e}")
     
     # 2. UMAP colored by top virus
     logger.info("  Creating UMAP plots...")
     top_virus = top_viruses[0] if top_viruses else None
     
-    if top_virus and top_virus in adata_joined.var_names:
+    if top_virus and 'X_umap' in adata_joined.obsm:
         try:
             sc.set_figure_params(scanpy=True, fontsize=16)
             
@@ -686,8 +563,10 @@ def generate_viral_plots(adata_joined, adata_pp, virus_scores, figures_dir, top_
                 return_fig=True,
                 show=False
             )
-            fig.savefig(os.path.join(figures_dir, f'umap_top_virus.pdf'),
+            fig.savefig(os.path.join(figures_dir, 'umap_top_virus.pdf'),
                         bbox_inches='tight', dpi=300)
+            fig.savefig(os.path.join(figures_dir, 'umap_top_virus.png'),
+                        dpi=150, bbox_inches='tight')
             plt.close()
         except Exception as e:
             logger.warning(f"  UMAP plot failed: {e}")
@@ -703,29 +582,34 @@ def generate_viral_plots(adata_joined, adata_pp, virus_scores, figures_dir, top_
         plt.tight_layout()
         plt.savefig(os.path.join(figures_dir, 'virus_score_barplot.pdf'),
                     bbox_inches='tight', dpi=300)
+        plt.savefig(os.path.join(figures_dir, 'virus_score_barplot.png'),
+                    dpi=150, bbox_inches='tight')
         plt.close()
     except Exception as e:
         logger.warning(f"  Bar plot failed: {e}")
     
     # 4. Violin plot for top viruses
-    logger.info("  Creating violin plots...")
-    for virus in top_viruses[:3]:
-        if virus in adata_joined.var_names:
-            try:
-                fig = sc.pl.violin(
-                    adata_joined,
-                    virus,
-                    groupby='final_annotation',
-                    rotation=90,
-                    return_fig=True,
-                    show=False
-                )
-                safe_name = virus.replace(' ', '_').replace('/', '_')
-                fig.savefig(os.path.join(figures_dir, f'violin_{safe_name}.pdf'),
-                            bbox_inches='tight', dpi=300)
-                plt.close()
-            except Exception as e:
-                logger.warning(f"  Violin plot for {virus} failed: {e}")
+    if 'final_annotation' in adata_joined.obs.columns:
+        logger.info("  Creating violin plots...")
+        for virus in top_viruses[:3]:
+            if virus in adata_joined.var_names:
+                try:
+                    fig = sc.pl.violin(
+                        adata_joined,
+                        virus,
+                        groupby='final_annotation',
+                        rotation=90,
+                        return_fig=True,
+                        show=False
+                    )
+                    safe_name = virus.replace(' ', '_').replace('/', '_')
+                    fig.savefig(os.path.join(figures_dir, f'violin_{safe_name}.pdf'),
+                                bbox_inches='tight', dpi=300)
+                    fig.savefig(os.path.join(figures_dir, f'violin_{safe_name}.png'),
+                                dpi=150, bbox_inches='tight')
+                    plt.close()
+                except Exception as e:
+                    logger.warning(f"  Violin plot for {virus} failed: {e}")
     
     plt.rcdefaults()
     logger.info("  Plots saved successfully")
@@ -758,7 +642,12 @@ def add_top_virus_to_adata(adata_pp, adata_joined, virus_scores):
     
     if top_virus in adata_joined.var_names:
         # Get virus counts
-        virus_counts = adata_joined[:, top_virus].X.toarray().flatten()
+        virus_data = adata_joined[:, top_virus].X
+        if hasattr(virus_data, 'toarray'):
+            virus_counts = virus_data.toarray().flatten()
+        else:
+            virus_counts = np.array(virus_data).flatten()
+        
         virus_series = pd.Series(virus_counts, index=adata_joined.obs_names, name=top_virus)
         
         # Map to adata_pp
@@ -778,10 +667,12 @@ def add_top_virus_to_adata(adata_pp, adata_joined, virus_scores):
 
 def run_viral_integration(
     adata_pp_path,
-    viral_sample_dirs,
-    sample_ids,
+    viral_adata_path,
     human_viral_hierarchy_path,
-    output_dir,
+    output_adata_path,
+    output_integrated_path,
+    output_summary_path,
+    figures_dir,
 ):
     """
     Run the complete viral integration pipeline.
@@ -790,22 +681,25 @@ def run_viral_integration(
     ----------
     adata_pp_path : str
         Path to preprocessed expression H5AD
-    viral_sample_dirs : list
-        List of sample viral detection directories
-    sample_ids : list
-        List of sample identifiers
+    viral_adata_path : str
+        Path to viral_counts.h5ad from summarize step
     human_viral_hierarchy_path : str
         Path to human viral database inspect.txt file
-    output_dir : str
-        Output directory
+    output_adata_path : str
+        Path for output adata_with_virus.h5ad
+    output_integrated_path : str
+        Path for output adata_viral_integrated.h5ad
+    output_summary_path : str
+        Path for output summary TSV
+    figures_dir : str
+        Output directory for figures
         
     Returns
     -------
     tuple
         (adata_pp_with_virus, adata_joined, summary)
     """
-    os.makedirs(output_dir, exist_ok=True)
-    figures_dir = os.path.join(output_dir, 'figures')
+    os.makedirs(os.path.dirname(output_adata_path), exist_ok=True)
     os.makedirs(figures_dir, exist_ok=True)
     
     logger.info("="*60)
@@ -818,23 +712,16 @@ def run_viral_integration(
     logger.info(f"  Loaded: {adata_pp.n_obs} cells, {adata_pp.n_vars} genes")
     
     # Parse human viral hierarchy
-    v_hierarchy_human, species_list = parse_kraken_hierarchy(human_viral_hierarchy_path)
-    human_virus_names = tuple(entry['name'] for entry in species_list)
-    logger.info(f"  Human virus species: {len(human_virus_names)}")
-    
-    # Get reference hierarchy from first sample
-    first_sample_dir = viral_sample_dirs[0]
-    hierarchy_file = os.path.join(first_sample_dir, 'kraken2_filtered_feature_bc_matrix', 'hierarchy.txt')
-    
-    if os.path.exists(hierarchy_file):
-        sample_hierarchy = parse_sample_hierarchy(hierarchy_file)
-        # Ensure all samples have all viruses
-        ensure_all_viruses_present(viral_sample_dirs, sample_ids, sample_hierarchy)
+    human_virus_names = []
+    if human_viral_hierarchy_path and os.path.exists(human_viral_hierarchy_path):
+        v_hierarchy_human, species_list = parse_kraken_hierarchy(human_viral_hierarchy_path)
+        human_virus_names = [entry['name'] for entry in species_list]
+        logger.info(f"  Human virus species: {len(human_virus_names)}")
     else:
-        sample_hierarchy = {}
+        logger.warning("Human viral hierarchy not provided or not found")
     
-    # Load viral data
-    adata_v = load_viral_data_for_samples(viral_sample_dirs, sample_ids, sample_hierarchy)
+    # Load viral counts AnnData
+    adata_v = load_viral_adata(viral_adata_path)
     
     if adata_v.n_obs == 0:
         logger.warning("No viral data loaded - saving empty results")
@@ -844,20 +731,16 @@ def run_viral_integration(
             'cells_with_virus': 0,
             'viruses_detected': 0
         }
-        pd.DataFrame([summary]).to_csv(
-            os.path.join(output_dir, 'viral_integration_summary.tsv'),
-            sep='\t', index=False
-        )
+        pd.DataFrame([summary]).to_csv(output_summary_path, sep='\t', index=False)
         adata_pp = clean_obs_for_saving(adata_pp)
-        adata_pp.write(os.path.join(output_dir, 'adata_with_virus.h5ad'))
+        adata_pp.write(output_adata_path)
+        # Create empty integrated file
+        ad.AnnData().write(output_integrated_path)
         return adata_pp, None, summary
     
-    # Save raw viral data
-    adata_v = clean_obs_for_saving(adata_v)
-    adata_v.write(os.path.join(output_dir, 'adata_viral_raw.h5ad'))
-    
-    # Filter to human viruses
-    adata_v = filter_human_viruses(adata_v, human_virus_names)
+    # Filter to human viruses if we have the list
+    if human_virus_names:
+        adata_v = filter_human_viruses(adata_v, human_virus_names)
     
     if adata_v.n_vars == 0:
         logger.warning("No human viruses detected after filtering")
@@ -867,36 +750,32 @@ def run_viral_integration(
             'cells_with_virus': 0,
             'viruses_detected': 0
         }
-        pd.DataFrame([summary]).to_csv(
-            os.path.join(output_dir, 'viral_integration_summary.tsv'),
-            sep='\t', index=False
-        )
+        pd.DataFrame([summary]).to_csv(output_summary_path, sep='\t', index=False)
         adata_pp = clean_obs_for_saving(adata_pp)
-        adata_pp.write(os.path.join(output_dir, 'adata_with_virus.h5ad'))
+        adata_pp.write(output_adata_path)
+        ad.AnnData().write(output_integrated_path)
         return adata_pp, None, summary
     
     # Integrate viral with expression
     adata_joined = integrate_viral_with_expression(adata_pp, adata_v)
     
-    # Calculate neighborhood and clusters for integrated data
-    logger.info("Computing UMAP for integrated data...")
-    sc.pp.neighbors(adata_joined, n_pcs=min(50, adata_joined.n_obs - 1))
-    sc.tl.umap(adata_joined)
-    sc.tl.leiden(adata_joined, key_added='clusters', resolution=1, random_state=42)
-    
-    # Apply batch correction if sample_id exists
-    if 'sample_id' in adata_joined.obs.columns:
+    # Compute UMAP if not present
+    if 'X_umap' not in adata_joined.obsm:
+        logger.info("Computing UMAP for integrated data...")
         try:
-            sc.external.pp.bbknn(adata_joined, batch_key='sample_id')
+            n_pcs = min(50, adata_joined.n_obs - 1, adata_joined.n_vars - 1)
+            sc.pp.pca(adata_joined, n_comps=n_pcs)
+            sc.pp.neighbors(adata_joined, n_pcs=n_pcs)
             sc.tl.umap(adata_joined)
         except Exception as e:
-            logger.warning(f"BBKNN batch correction failed: {e}")
+            logger.warning(f"UMAP computation failed: {e}")
     
     # Calculate viral markers
     markers, virus_markers = calculate_viral_markers(
         adata_joined, human_virus_names, groupby='final_annotation'
     )
-    adata_joined.uns['markers'] = markers
+    if len(markers) > 0:
+        adata_joined.uns['markers'] = markers
     
     # Aggregate scores
     virus_scores = aggregate_virus_scores(virus_markers)
@@ -907,7 +786,7 @@ def run_viral_integration(
             logger.info(f"  {i}. {virus}: {score:.4f}")
     
     # Generate plots
-    generate_viral_plots(adata_joined, adata_pp, virus_scores, figures_dir)
+    generate_viral_plots(adata_joined, virus_scores, figures_dir)
     
     # Add top virus to adata_pp
     adata_pp = add_top_virus_to_adata(adata_pp, adata_joined, virus_scores)
@@ -915,10 +794,10 @@ def run_viral_integration(
     # Save results
     logger.info("\nSaving results...")
     adata_joined = clean_obs_for_saving(adata_joined)
-    adata_joined.write(os.path.join(output_dir, 'adata_viral_integrated.h5ad'))
+    adata_joined.write(output_integrated_path)
     
     adata_pp = clean_obs_for_saving(adata_pp)
-    adata_pp.write(os.path.join(output_dir, 'adata_with_virus.h5ad'))
+    adata_pp.write(output_adata_path)
     
     # Summary
     summary = {
@@ -927,25 +806,22 @@ def run_viral_integration(
         'cells_with_viral_data': adata_joined.n_obs,
         'human_viruses_detected': len(virus_scores),
         'top_virus': virus_scores.index[0] if len(virus_scores) > 0 else None,
-        'top_virus_score': virus_scores.iloc[0] if len(virus_scores) > 0 else 0,
+        'top_virus_score': float(virus_scores.iloc[0]) if len(virus_scores) > 0 else 0,
     }
     
-    pd.DataFrame([summary]).to_csv(
-        os.path.join(output_dir, 'viral_integration_summary.tsv'),
-        sep='\t', index=False
-    )
+    pd.DataFrame([summary]).to_csv(output_summary_path, sep='\t', index=False)
     
     # Save virus detection summary
     if len(virus_scores) > 0:
         virus_scores.to_csv(
-            os.path.join(output_dir, 'virus_scores.tsv'),
+            os.path.join(os.path.dirname(output_summary_path), 'virus_scores.tsv'),
             sep='\t', header=['score']
         )
     
     logger.info("\n" + "="*60)
     logger.info("Pipeline completed successfully!")
     logger.info("="*60)
-    logger.info(f"Output directory: {output_dir}")
+    logger.info(f"Output directory: {os.path.dirname(output_adata_path)}")
     logger.info(f"Cells with viral data: {adata_joined.n_obs}")
     logger.info(f"Human viruses detected: {len(virus_scores)}")
     
@@ -961,21 +837,20 @@ def run_from_snakemake():
     
     # Get inputs
     adata_pp_path = snakemake.input.adata_pp
-    viral_summary = snakemake.input.viral_summary  # This ensures viral detection completed
+    viral_adata_path = snakemake.input.viral_adata
     
     # Get outputs
-    output_dir = os.path.dirname(snakemake.output.adata)
+    output_adata = snakemake.output.adata
+    output_integrated = snakemake.output.integrated
+    output_summary = snakemake.output.summary
+    output_figures = snakemake.output.figures
     
     # Get params
-    sample_ids = snakemake.params.sample_ids
     human_viral_db = snakemake.params.human_viral_db
-    viral_base_dir = snakemake.params.viral_base_dir
-    
-    # Build sample directories
-    viral_sample_dirs = [os.path.join(viral_base_dir, sid) for sid in sample_ids]
     
     # Set up logging
     if snakemake.log:
+        os.makedirs(os.path.dirname(snakemake.log[0]), exist_ok=True)
         file_handler = logging.FileHandler(snakemake.log[0])
         file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
         logger.addHandler(file_handler)
@@ -983,10 +858,12 @@ def run_from_snakemake():
     # Run pipeline
     run_viral_integration(
         adata_pp_path=adata_pp_path,
-        viral_sample_dirs=viral_sample_dirs,
-        sample_ids=sample_ids,
+        viral_adata_path=viral_adata_path,
         human_viral_hierarchy_path=human_viral_db,
-        output_dir=output_dir,
+        output_adata_path=output_adata,
+        output_integrated_path=output_integrated,
+        output_summary_path=output_summary,
+        figures_dir=output_figures,
     )
 
 
@@ -1000,22 +877,22 @@ def main():
         description='Integrate viral detection with expression data'
     )
     parser.add_argument('--adata-pp', required=True, help='Preprocessed expression H5AD')
-    parser.add_argument('--viral-dir', required=True, help='Base directory with viral detection results')
-    parser.add_argument('--sample-ids', nargs='+', required=True, help='Sample identifiers')
-    parser.add_argument('--human-viral-db', required=True, 
-                        help='Path to human viral Kraken2 database inspect.txt')
+    parser.add_argument('--viral-adata', required=True, help='Viral counts H5AD from summarize step')
+    parser.add_argument('--human-viral-db', help='Path to human viral Kraken2 database inspect.txt')
     parser.add_argument('--output', required=True, help='Output directory')
     
     args = parser.parse_args()
     
-    viral_sample_dirs = [os.path.join(args.viral_dir, sid) for sid in args.sample_ids]
+    output_dir = args.output
     
     run_viral_integration(
         adata_pp_path=args.adata_pp,
-        viral_sample_dirs=viral_sample_dirs,
-        sample_ids=args.sample_ids,
+        viral_adata_path=args.viral_adata,
         human_viral_hierarchy_path=args.human_viral_db,
-        output_dir=args.output,
+        output_adata_path=os.path.join(output_dir, 'adata_with_virus.h5ad'),
+        output_integrated_path=os.path.join(output_dir, 'adata_viral_integrated.h5ad'),
+        output_summary_path=os.path.join(output_dir, 'viral_integration_summary.tsv'),
+        figures_dir=os.path.join(output_dir, 'figures'),
     )
 
 
