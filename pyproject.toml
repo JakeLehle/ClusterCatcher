@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ClusterCatcher"
-version = "1.0.0"
+version = "1.1.0"
 description = "Single-cell sequencing analysis pipeline for mutation signature detection and cell annotation"
 readme = "README.md"
 license = {text = "GPL-3.0"}
@@ -81,3 +81,4 @@ target-version = ['py38', 'py39', 'py310', 'py311']
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+

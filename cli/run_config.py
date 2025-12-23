@@ -406,3 +406,4 @@ def run_config(config_yaml, cores, jobs, dryrun, unlock, rerun_incomplete,
 
 if __name__ == '__main__':
     run_config()
+

@@ -1042,6 +1042,8 @@ def run_scomatic_pipeline(
     bed_file,
     cellranger_dir,
     custom_genotype_script=None,
+    min_cov=5,
+    min_cells=5,
     n_workers=None
 ):
     """
@@ -1069,6 +1071,10 @@ def run_scomatic_pipeline(
         Path to Cell Ranger output directory
     custom_genotype_script : str, optional
         Path to custom SingleCellGenotype.py script
+    min_cov : int, optional
+        Minimum coverage threshold (default: 5)
+    min_cells : int, optional
+        Minimum cells threshold (default: 5)
     n_workers : int, optional
         Number of workers for parallel processing
     
@@ -1337,8 +1343,12 @@ def run_scomatic_pipeline(
             final_combined.to_csv(final_output_path, sep='\t', index=False)
             logger.info(f"Combined mutations saved to: {final_output_path}")
         else:
-            final_output_path = None
-            logger.warning("No mutation data collected")
+            final_output_path = os.path.join(mutations_dir, 'all_samples.single_cell_genotype.filtered.tsv')
+            # Create empty file with header for Snakemake to find
+            pd.DataFrame(columns=['CHROM', 'POS', 'REF', 'ALT', 'Cell', 'Sample']).to_csv(
+                final_output_path, sep='\t', index=False
+            )
+            logger.warning("No mutation data collected - created empty output file")
         
         # Compute trinucleotide context
         trinuc_step1_files = []
@@ -1351,6 +1361,10 @@ def run_scomatic_pipeline(
         if trinuc_step1_files:
             trinuc_args = (trinuc_step1_files, output_trinuc, scomatic_scripts_dir)
             run_trinucleotide_context(trinuc_args)
+        else:
+            # Create empty trinucleotide file for Snakemake
+            pd.DataFrame(columns=['Context', 'Count']).to_csv(output_trinuc, sep='\t', index=False)
+            logger.warning("No trinucleotide data - created empty output file")
         
         # Generate callable sites
         cell_annotations = pd.read_csv(cell_annotations_path, sep='\t')
@@ -1403,7 +1417,9 @@ def run_from_snakemake():
         pon_file=snakemake.params.pon_file,
         bed_file=snakemake.params.bed_file,
         cellranger_dir=snakemake.params.cellranger_dir,
-        custom_genotype_script=snakemake.params.get('custom_genotype_script'),
+        custom_genotype_script=getattr(snakemake.params, 'custom_genotype_script', None),
+        min_cov=getattr(snakemake.params, 'min_cov', 5),
+        min_cells=getattr(snakemake.params, 'min_cells', 5),
         n_workers=snakemake.threads
     )
 
@@ -1423,6 +1439,8 @@ def main():
     parser.add_argument('--bed-file', required=True, help='Path to BED file for mappable regions')
     parser.add_argument('--cellranger-dir', required=True, help='Path to Cell Ranger output directory')
     parser.add_argument('--custom-genotype-script', help='Path to custom SingleCellGenotype.py')
+    parser.add_argument('--min-cov', type=int, default=5, help='Minimum coverage threshold')
+    parser.add_argument('--min-cells', type=int, default=5, help='Minimum cells threshold')
     parser.add_argument('--workers', type=int, default=None, help='Number of workers')
     
     args = parser.parse_args()
@@ -1438,6 +1456,8 @@ def main():
         bed_file=args.bed_file,
         cellranger_dir=args.cellranger_dir,
         custom_genotype_script=args.custom_genotype_script,
+        min_cov=args.min_cov,
+        min_cells=args.min_cells,
         n_workers=args.workers
     )
 
@@ -1448,3 +1468,4 @@ if __name__ == '__main__':
         run_from_snakemake()
     except NameError:
         main()
+

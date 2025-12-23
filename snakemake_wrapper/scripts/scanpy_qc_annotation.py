@@ -44,6 +44,10 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 import scanpy as sc
+
+# Set matplotlib backend for headless operation (must be before pyplot import)
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import seaborn as sns
 
@@ -993,3 +997,4 @@ if __name__ == '__main__':
         run_from_snakemake()
     except NameError:
         main()
+

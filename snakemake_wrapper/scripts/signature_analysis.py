@@ -24,6 +24,8 @@ import sys
 import pandas as pd
 import numpy as np
 import scanpy as sc
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import seaborn as sns
 import argparse
@@ -369,6 +371,28 @@ def run_signature_analysis(
     matrix_file = output_path / "mutation_matrix_96contexts.txt"
     mut_matrix = process_mutations(mutations_file, matrix_file)
     
+    # Handle empty mutations case
+    if mut_matrix.shape[1] == 0:
+        logger.warning("No mutations found in input file - creating empty output files")
+        # Create empty weights file
+        empty_weights = pd.DataFrame(columns=['Cell'])
+        empty_weights.to_csv(output_path / "signature_weights_per_cell.txt", sep='\t', index=True)
+        
+        # Load and save AnnData with empty signature columns
+        adata = sc.read_h5ad(adata_path)
+        adata.obs['total_mutations'] = 0
+        
+        # Handle column types for HDF5
+        for col in adata.obs.columns:
+            if adata.obs[col].dtype not in ['float64', 'float32', 'int64', 'int32', 'bool']:
+                adata.obs[col] = adata.obs[col].astype(str)
+        
+        final_path = output_path / "adata_final.h5ad"
+        adata.write(final_path)
+        logger.info(f"Saved: {final_path}")
+        
+        return {'weights': empty_weights, 'evaluation': None, 'adata_path': str(final_path)}
+    
     if mut_threshold > 0:
         cells_keep = mut_matrix.sum(axis=0) >= mut_threshold
         mut_matrix = mut_matrix.loc[:, cells_keep]
@@ -449,13 +473,13 @@ def run_from_snakemake():
         adata_path=snakemake.input.adata,
         cosmic_file=snakemake.params.cosmic_file,
         output_dir=snakemake.params.output_dir,
-        callable_sites_file=snakemake.input.get('callable_sites'),
-        use_scree=snakemake.params.get('use_scree_plot', False),
-        core_sigs=snakemake.params.get('core_signatures'),
-        candidate_order=snakemake.params.get('candidate_order'),
-        mut_threshold=snakemake.params.get('mutation_threshold', 0),
-        max_sigs=snakemake.params.get('max_signatures', 15),
-        hnscc_only=snakemake.params.get('hnscc_only', False)
+        callable_sites_file=snakemake.input.callable_sites,
+        use_scree=getattr(snakemake.params, 'use_scree_plot', False),
+        core_sigs=getattr(snakemake.params, 'core_signatures', None),
+        candidate_order=getattr(snakemake.params, 'candidate_order', None),
+        mut_threshold=getattr(snakemake.params, 'mutation_threshold', 0),
+        max_sigs=getattr(snakemake.params, 'max_signatures', 15),
+        hnscc_only=getattr(snakemake.params, 'hnscc_only', False)
     )
 
 
@@ -497,3 +521,4 @@ if __name__ == '__main__':
         run_from_snakemake()
     except NameError:
         main()
+

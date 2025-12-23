@@ -902,3 +902,4 @@ if __name__ == '__main__':
         run_from_snakemake()
     except NameError:
         main()
+

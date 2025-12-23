@@ -177,7 +177,15 @@ def safe_makedirs(dir_path):
 
 def process_cytotrace_chunk(adata_chunk, chunk_name, working_dir, species='human', seed=42):
     """Process a single chunk of cells through CytoTRACE2."""
-    from cytotrace2_py.cytotrace2_py import cytotrace2
+    try:
+        from cytotrace2_py.cytotrace2_py import cytotrace2
+    except ImportError:
+        raise ImportError(
+            "CytoTRACE2 is not installed. Please install with:\n"
+            "  git clone https://github.com/digitalcytometry/cytotrace2.git\n"
+            "  cd cytotrace2/cytotrace2_python\n"
+            "  pip install ."
+        )
     
     cytotrace2_results_dir = os.path.join(working_dir, "cytotrace2_results")
     
@@ -254,6 +262,18 @@ def run_cytotrace2(adata, working_dir, config):
         CytoTRACE2 results for all cells
     """
     logger.info("Running CytoTRACE2 analysis...")
+    
+    # Check CytoTRACE2 availability early
+    try:
+        from cytotrace2_py.cytotrace2_py import cytotrace2
+    except ImportError:
+        logger.error(
+            "CytoTRACE2 is not installed. Please install with:\n"
+            "  git clone https://github.com/digitalcytometry/cytotrace2.git\n"
+            "  cd cytotrace2/cytotrace2_python\n"
+            "  pip install ."
+        )
+        raise ImportError("CytoTRACE2 is required for cancer cell detection")
     
     # Ensure gene names are unique
     adata.var_names_make_unique()
@@ -1290,3 +1310,4 @@ if __name__ == '__main__':
         run_from_snakemake()
     except NameError:
         main()
+
