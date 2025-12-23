@@ -197,20 +197,21 @@ def run_from_snakemake():
     qc_file = snakemake.input.qc
     annotation_file = snakemake.input.annotation
     
-    # Optional inputs may be empty lists
-    dysregulation_file = snakemake.input.get('dysregulation')
+    # Optional inputs may be empty lists when disabled
+    # Use getattr for safe access
+    dysregulation_file = getattr(snakemake.input, 'dysregulation', None)
     if isinstance(dysregulation_file, list):
         dysregulation_file = dysregulation_file[0] if dysregulation_file else None
     
-    viral_file = snakemake.input.get('viral')
+    viral_file = getattr(snakemake.input, 'viral', None)
     if isinstance(viral_file, list):
         viral_file = viral_file[0] if viral_file else None
     
-    mutations_file = snakemake.input.get('mutations')
+    mutations_file = getattr(snakemake.input, 'mutations', None)
     if isinstance(mutations_file, list):
         mutations_file = mutations_file[0] if mutations_file else None
     
-    signatures_file = snakemake.input.get('signatures')
+    signatures_file = getattr(snakemake.input, 'signatures', None)
     if isinstance(signatures_file, list):
         signatures_file = signatures_file[0] if signatures_file else None
     
@@ -260,3 +261,4 @@ if __name__ == '__main__':
             output_dir=args.output_dir,
             output_file=args.output
         )
+

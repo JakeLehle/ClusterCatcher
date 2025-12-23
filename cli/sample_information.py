@@ -364,3 +364,4 @@ def sample_information(input_csv, output_pkl, skip_validation, srascraper_format
 
 if __name__ == '__main__':
     sample_information()
+

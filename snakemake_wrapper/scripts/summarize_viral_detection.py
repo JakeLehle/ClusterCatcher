@@ -470,7 +470,7 @@ def run_from_snakemake():
     
     # Get params
     sample_ids = snakemake.params.sample_ids
-    organisms_of_interest = snakemake.params.get('organisms_of_interest', [])
+    organisms_of_interest = getattr(snakemake.params, 'organisms_of_interest', [])
     viral_base_dir = snakemake.params.viral_base_dir
     
     # Build sample directories from base directory
@@ -534,3 +534,4 @@ if __name__ == '__main__':
         run_from_snakemake()
     except NameError:
         main()
+

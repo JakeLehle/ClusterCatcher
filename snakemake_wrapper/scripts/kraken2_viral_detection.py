@@ -770,9 +770,9 @@ def run_from_snakemake():
     db_path = snakemake.params.db_path
     output_dir = snakemake.params.output_dir
     threads = snakemake.threads
-    confidence = snakemake.params.get('confidence', 0.0)
-    include_organisms = snakemake.params.get('include_organisms')
-    exclude_organisms = snakemake.params.get('exclude_organisms')
+    confidence = getattr(snakemake.params, 'confidence', 0.0)
+    include_organisms = getattr(snakemake.params, 'include_organisms', None)
+    exclude_organisms = getattr(snakemake.params, 'exclude_organisms', None)
     
     # Build sample-specific output directory
     sample_output_dir = os.path.join(output_dir, sample_id)
@@ -854,3 +854,4 @@ if __name__ == '__main__':
         run_from_snakemake()
     except NameError:
         main()
+
