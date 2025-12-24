@@ -1,0 +1,219 @@
+# =============================================================================
+# ClusterCatcher .gitignore
+# =============================================================================
+# This file specifies which files and directories Git should ignore.
+# These are typically generated files, build artifacts, and user-specific
+# configuration that shouldn't be tracked in version control.
+# =============================================================================
+
+# =============================================================================
+# Python Build & Installation Artifacts
+# =============================================================================
+
+# Build directories (created by pip install -e . or python setup.py build)
+build/
+dist/
+
+# Egg info (created by pip install -e .)
+*.egg-info/
+*.egg
+
+# Compiled Python files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# =============================================================================
+# Virtual Environments
+# =============================================================================
+
+venv/
+env/
+ENV/
+.venv/
+.env/
+
+# Conda environments (if stored locally)
+conda-env/
+.conda/
+
+# =============================================================================
+# IDE & Editor Files
+# =============================================================================
+
+# VS Code
+.vscode/
+
+# PyCharm
+.idea/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Spyder
+.spyproject/
+.spyderproject/
+
+# Vim
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# =============================================================================
+# Pipeline Output Directories
+# =============================================================================
+# These are created when running the pipeline and should not be tracked.
+# Based on the output structure in README.md
+
+# Main results directories (user-specified output locations)
+results/
+output/
+outputs/
+
+# Cell Ranger outputs
+cellranger/
+
+# QC outputs
+qc/
+
+# Annotation outputs
+annotation/
+
+# Dysregulation detection outputs
+dysregulation/
+
+# Viral detection outputs
+viral/
+viral_integration/
+
+# Mutation calling outputs
+mutations/
+
+# Signature analysis outputs
+signatures/
+
+# Figures directory
+figures/
+
+# Log files
+logs/
+*.log
+
+# =============================================================================
+# Pipeline Working Files
+# =============================================================================
+
+# Snakemake working files
+.snakemake/
+
+# Sample pickle files (user data)
+*.pkl
+
+# Generated config files (user-specific)
+# Keep the template config.yaml but ignore user-generated ones
+# Note: snakemake_wrapper/config.yaml is the TEMPLATE and SHOULD be tracked
+# User configs in output directories are ignored by the results/ pattern above
+
+# =============================================================================
+# Data Files (Too Large for Git)
+# =============================================================================
+
+# FASTQ files
+*.fastq
+*.fastq.gz
+*.fq
+*.fq.gz
+
+# BAM/SAM files
+*.bam
+*.bam.bai
+*.sam
+
+# H5 files (expression matrices)
+*.h5
+*.h5ad
+
+# BED files
+*.bed
+*.bed.gz
+
+# VCF files
+*.vcf
+*.vcf.gz
+*.vcf.gz.tbi
+
+# Reference files
+*.fa
+*.fasta
+*.fa.fai
+*.fasta.fai
+*.gtf
+*.gtf.gz
+*.gff
+*.gff.gz
+
+# Kraken2 databases
+*_db/
+kraken2_db/
+
+# COSMIC signature files
+COSMIC*.txt
+
+# =============================================================================
+# Test & Temporary Files
+# =============================================================================
+
+# Test outputs
+test_output/
+test_results/
+tests/output/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+
+# Pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# =============================================================================
+# Documentation Build
+# =============================================================================
+
+docs/_build/
+site/
+
+# =============================================================================
+# Root-level config.yaml
+# =============================================================================
+# The config.yaml at the root level appears to be a user-generated config
+# The template in snakemake_wrapper/config.yaml should be tracked
+/config.yaml
+
+# =============================================================================
+# Notes
+# =============================================================================
+# Files that SHOULD be tracked (not in this .gitignore):
+# - cli/*.py (CLI source code)
+# - snakemake_wrapper/Snakefile
+# - snakemake_wrapper/config.yaml (TEMPLATE)
+# - snakemake_wrapper/scripts/*.py
+# - snakemake_wrapper/envs/*.yaml
+# - snakemake_wrapper/rules/*.smk
+# - environment.yml
+# - setup.py
+# - pyproject.toml
+# - MANIFEST.in
+# - README.md
+# - LICENSE
+# =============================================================================
