@@ -192,6 +192,21 @@ wget https://cf.10xgenomics.com/supp/cell-exp/refdata-gex-GRCh38-2020-A.tar.gz
 tar -xzf refdata-gex-GRCh38-2020-A.tar.gz
 ```
 
+**Reference directory structure** (standard 10x Genomics layout):
+
+```
+refdata-gex-GRCh38-2020-A/
+├── fasta/
+│   └── genome.fa          # Reference FASTA (auto-derived)
+├── genes/
+│   └── genes.gtf          # GTF annotation (auto-derived)
+├── star/
+│   └── ...                # STAR index
+└── reference.json
+```
+
+> **Note**: ClusterCatcher only requires you to specify the Cell Ranger reference directory (`--cellranger-reference`). The FASTA and GTF paths are **automatically derived** from this directory using the standard 10x layout. You can override them with `--reference-fasta` or `--gtf-file` if using a non-standard layout.
+
 ### 6. (Optional) Install CytoTRACE2
 
 Required for dysregulation detection:
@@ -234,12 +249,28 @@ ClusterCatcher sample-information \
 
 ### Step 2: Generate Configuration
 
+**Simplified usage** - only `--cellranger-reference` is required for references:
+
 ```bash
 python snakemake_wrapper/create_config.py \
     --output-dir ./results \
     --sample-pickle samples.pkl \
-    --reference-fasta /path/to/GRCh38/genome.fa \
     --cellranger-reference /path/to/refdata-gex-GRCh38-2020-A \
+    --threads 16 \
+    --memory-gb 64
+```
+
+The FASTA and GTF files are automatically derived from the Cell Ranger reference directory.
+
+**Override if needed** (for non-standard reference layouts):
+
+```bash
+python snakemake_wrapper/create_config.py \
+    --output-dir ./results \
+    --sample-pickle samples.pkl \
+    --cellranger-reference /path/to/refdata-gex-GRCh38-2020-A \
+    --reference-fasta /custom/path/to/genome.fa \
+    --gtf-file /custom/path/to/genes.gtf \
     --threads 16 \
     --memory-gb 64
 ```
@@ -265,7 +296,6 @@ If you used [SRAscraper](https://github.com/JakeLehle/SRAscraper) to download da
 python snakemake_wrapper/create_config.py \
     --output-dir ./results \
     --sample-pickle /path/to/SRAscraper_output/metadata/sample_dict.pkl \
-    --reference-fasta /path/to/GRCh38/genome.fa \
     --cellranger-reference /path/to/refdata-gex-GRCh38-2020-A
 ```
 
@@ -308,9 +338,7 @@ SAMPLE1,/path/L001_R1.fq.gz,/path/L002_R1.fq.gz,/path/L001_R2.fq.gz,/path/L002_R
 python snakemake_wrapper/create_config.py \
     --output-dir ./results \
     --sample-pickle samples.pkl \
-    --reference-fasta /path/to/GRCh38/genome.fa \
     --cellranger-reference /path/to/refdata-gex-GRCh38-2020-A \
-    --gtf-file /path/to/genes.gtf \
     \
     # Viral detection
     --enable-viral \
@@ -742,6 +770,35 @@ When `--hnscc-only` is enabled, these signatures are used:
 
 ## Configuration Reference
 
+### Reference Files (Simplified)
+
+The reference configuration has been **simplified** to reduce redundancy:
+
+```yaml
+reference:
+  # Cell Ranger reference directory - THE ONLY REQUIRED FIELD
+  # Must contain fasta/, genes/, star/ subdirectories
+  cellranger: "/path/to/refdata-gex-GRCh38-2020-A"
+  
+  # Auto-derived from cellranger: {cellranger}/fasta/genome.fa
+  # Override only if using non-standard layout
+  fasta: null
+  
+  # Auto-derived from cellranger: {cellranger}/genes/genes.gtf
+  # Override only if using non-standard layout
+  gtf: null
+  
+  # Genome build (GRCh38, GRCh37, mm10, mm39)
+  genome: "GRCh38"
+```
+
+**How it works**:
+1. You only need to specify `cellranger` (the Cell Ranger reference directory)
+2. The pipeline automatically derives:
+   - `fasta` from `{cellranger}/fasta/genome.fa`
+   - `gtf` from `{cellranger}/genes/genes.gtf`
+3. Override these only if your reference has a non-standard layout
+
 ### Complete `create_config.py` Options
 
 #### Required Arguments
@@ -749,8 +806,15 @@ When `--hnscc-only` is enabled, these signatures are used:
 | Option | Description |
 |--------|-------------|
 | `--output-dir` | Output directory for results |
-| `--reference-fasta` | Reference genome FASTA file |
 | `--cellranger-reference` | Cell Ranger reference directory |
+
+#### Reference Files (Optional - Auto-derived)
+
+| Option | Description |
+|--------|-------------|
+| `--reference-fasta` | Override auto-derived FASTA path |
+| `--gtf-file` | Override auto-derived GTF path |
+| `--genome` | Genome build (default: GRCh38) |
 
 #### Sample Specification (one required)
 
@@ -790,50 +854,14 @@ When `--hnscc-only` is enabled, these signatures are used:
 | `--annotation-method` | `popv` | Annotation method |
 | `--annotation-reference` | `null` | Reference dataset |
 
-#### Dysregulation Settings
+#### Module Enable/Disable
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--enable-dysregulation` | `true` | Enable module |
-| `--cytotrace2-enabled` | `true` | Enable CytoTRACE2 |
-| `--infercnv-enabled` | `true` | Enable inferCNV |
-| `--infercnv-reference-groups` | `null` | Normal cell types |
-| `--species` | `human` | Species for CytoTRACE2 |
-| `--agreement-alpha` | `0.5` | Agreement weight |
-| `--min-correlation` | `0.5` | Min Spearman rho |
-
-#### Viral Detection Settings
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--enable-viral` | `false` | Enable module |
-| `--kraken-db` | - | Kraken2 database path |
-| `--viral-db` | - | Human viral inspect.txt |
-| `--viral-confidence` | `0.1` | Confidence threshold |
-
-#### SComatic Settings
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--enable-scomatic` | `false` | Enable module |
-| `--scomatic-scripts-dir` | - | SComatic scripts path |
-| `--scomatic-editing-sites` | - | RNA editing sites |
-| `--scomatic-pon-file` | - | Panel of Normals |
-| `--scomatic-bed-file` | - | Mappable regions BED |
-| `--scomatic-min-cov` | `5` | Min coverage |
-| `--scomatic-min-cells` | `5` | Min cells |
-
-#### Signature Settings
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--enable-signatures` | `false` | Enable module |
-| `--cosmic-file` | - | COSMIC signatures |
-| `--core-signatures` | `SBS2,SBS13,SBS5` | Core signatures |
-| `--use-scree-plot` | `false` | Elbow detection |
-| `--mutation-threshold` | `0` | Min mutations/cell |
-| `--max-signatures` | `15` | Max signatures |
-| `--hnscc-only` | `false` | HNSCC signature set |
+| `--enable-viral` | `false` | Enable viral detection |
+| `--enable-dysregulation` | `true` | Enable dysregulation |
+| `--enable-scomatic` | `false` | Enable mutation calling |
+| `--enable-signatures` | `false` | Enable signature analysis |
 
 ---
 
@@ -876,66 +904,22 @@ results/
 ├── viral/                               # Viral detection (if enabled)
 │   ├── {sample}/
 │   │   ├── kraken2_filtered_feature_bc_matrix/
-│   │   │   ├── barcodes.tsv.gz
-│   │   │   ├── features.tsv.gz
-│   │   │   └── matrix.mtx.gz
 │   │   └── {sample}_organism_summary.tsv
 │   ├── viral_detection_summary.tsv
-│   ├── viral_counts.h5ad
-│   └── plots/
-│       ├── organism_heatmap.pdf
-│       └── sample_diversity.pdf
-│
-├── viral_integration/                   # Viral integration (if enabled)
-│   ├── adata_with_virus.h5ad
-│   ├── adata_viral_integrated.h5ad
-│   ├── viral_integration_summary.tsv
-│   ├── virus_scores.tsv
-│   └── figures/
-│       ├── virus_matrix_plot.pdf
-│       ├── umap_top_virus.pdf
-│       └── violin_*.pdf
+│   └── viral_counts.h5ad
 │
 ├── mutations/                           # SComatic output (if enabled)
 │   ├── all_samples.single_cell_genotype.filtered.tsv
-│   ├── CombinedCallableSites/
-│   │   └── complete_callable_sites.tsv
-│   ├── cell_annotations.tsv
-│   ├── trinucleotide_background.tsv
 │   └── {sample}/
-│       ├── SplitBams/
-│       ├── BaseCellCounts/
-│       └── VariantCalls/
 │
 ├── signatures/                          # Signature analysis (if enabled)
 │   ├── signature_weights_per_cell.txt
 │   ├── adata_final.h5ad
-│   ├── mutation_matrix_96contexts.txt
-│   ├── cosmic_signatures_used.txt
-│   ├── reconstruction_evaluation.txt
-│   ├── per_cell_quality_metrics.txt
-│   ├── signature_weight_summary.txt
 │   └── figures/
-│       ├── signature_analysis_summary.pdf
-│       ├── reconstruction_quality.pdf
-│       ├── signature_heatmap.pdf
-│       └── signature_UMAPs/
-│           ├── UMAP_SBS2.pdf
-│           ├── UMAP_SBS13.pdf
-│           └── ...
-│
-├── figures/                             # All figures (symbolic links)
 │
 ├── logs/                                # Pipeline logs
-│   ├── cellranger/
-│   ├── qc/
-│   ├── dysregulation/
-│   ├── viral/
-│   ├── mutations/
-│   └── signatures/
 │
 ├── config.yaml                          # Pipeline configuration
-├── adata_final.h5ad                     # Final AnnData (copied)
 └── master_summary.yaml                  # Pipeline summary
 ```
 
@@ -954,6 +938,16 @@ export PATH=/path/to/cellranger-7.2.0:$PATH
 # Verify
 which cellranger
 cellranger --version
+```
+
+#### Reference FASTA not found (auto-derivation failed)
+
+If using a non-standard Cell Ranger reference layout:
+
+```bash
+python create_config.py ... \
+    --reference-fasta /custom/path/to/genome.fa \
+    --gtf-file /custom/path/to/genes.gtf
 ```
 
 #### Chemistry detection fails
@@ -987,26 +981,6 @@ ls /path/to/SComatic/scripts/
 2. Verify reference files are correct
 3. Check callable sites output
 4. Lower `min_cov` and `min_cells` thresholds
-
-#### Signature analysis fails
-
-1. Ensure COSMIC file format is correct
-2. Check mutation file is not empty
-3. Verify core signatures exist in COSMIC file
-
-#### popV annotation fails
-
-Install popV properly:
-
-```bash
-pip install popv
-```
-
-Or use alternative method:
-
-```bash
-python create_config.py ... --annotation-method celltypist
-```
 
 ### Log Files
 
@@ -1073,4 +1047,3 @@ This project is licensed under the GNU General Public License v3.0 - see the [LI
 - **Issues**: [GitHub Issues](https://github.com/JakeLehle/ClusterCatcher/issues)
 
 For bug reports or feature requests, please open an issue on GitHub.
-

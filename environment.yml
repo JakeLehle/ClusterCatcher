@@ -2,7 +2,6 @@ name: ClusterCatcher
 channels:
   - conda-forge
   - bioconda
-  - defaults
 dependencies:
   # ===========================================
   # Core Python
@@ -107,7 +106,6 @@ dependencies:
     # InferCNV Python wrapper
     - infercnvpy
     # Additional scanpy plugins
-    - scanpy-gpu  # Optional: GPU acceleration
     - scvi-tools  # For advanced integration
 
 # ===========================================

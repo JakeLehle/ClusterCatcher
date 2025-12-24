@@ -38,6 +38,58 @@ def validate_path(path, name, must_exist=True, create_dir=False):
     return str(path)
 
 
+def auto_derive_reference_paths(cellranger_ref):
+    """
+    Auto-derive fasta and gtf paths from Cell Ranger reference directory.
+    
+    Standard 10x Genomics reference layout:
+        {cellranger}/
+        ├── fasta/
+        │   └── genome.fa
+        ├── genes/
+        │   └── genes.gtf
+        └── star/
+            └── ...
+    
+    Parameters
+    ----------
+    cellranger_ref : str
+        Path to Cell Ranger reference directory
+        
+    Returns
+    -------
+    tuple
+        (fasta_path, gtf_path) - paths if found, None if not
+    """
+    cellranger_path = Path(cellranger_ref)
+    
+    # Try to find FASTA
+    fasta_path = None
+    potential_fasta_files = [
+        cellranger_path / "fasta" / "genome.fa",
+        cellranger_path / "fasta" / "genome.fasta",
+        cellranger_path / "fasta" / "reference.fa",
+    ]
+    for fasta_candidate in potential_fasta_files:
+        if fasta_candidate.exists():
+            fasta_path = str(fasta_candidate)
+            break
+    
+    # Try to find GTF
+    gtf_path = None
+    potential_gtf_files = [
+        cellranger_path / "genes" / "genes.gtf",
+        cellranger_path / "genes" / "annotations.gtf",
+        cellranger_path / "genes" / "reference.gtf",
+    ]
+    for gtf_candidate in potential_gtf_files:
+        if gtf_candidate.exists():
+            gtf_path = str(gtf_candidate)
+            break
+    
+    return fasta_path, gtf_path
+
+
 def create_config(args):
     """Create the pipeline configuration file."""
     print("="*70)
@@ -67,20 +119,34 @@ def create_config(args):
     else:
         raise ValueError("Must provide either --sample-pickle or --sample-ids")
     
-    reference_fasta = validate_path(args.reference_fasta, "Reference FASTA")
-    reference_dir = str(Path(reference_fasta).parent)
+    # Cell Ranger reference (REQUIRED)
     cellranger_ref = validate_path(args.cellranger_reference, "Cell Ranger reference")
+    print(f"  Cell Ranger reference: {cellranger_ref}")
     
-    # GTF file - optional but needed for dysregulation analysis
-    gtf_file = None
+    # Auto-derive fasta and gtf from Cell Ranger reference
+    print("\nProcessing reference files...")
+    auto_fasta, auto_gtf = auto_derive_reference_paths(cellranger_ref)
+    
+    # Use provided paths or auto-derived
+    if args.reference_fasta:
+        reference_fasta = validate_path(args.reference_fasta, "Reference FASTA")
+        print(f"  Reference FASTA (provided): {reference_fasta}")
+    elif auto_fasta:
+        reference_fasta = auto_fasta
+        print(f"  Reference FASTA (auto-derived): {reference_fasta}")
+    else:
+        reference_fasta = None
+        print("  Reference FASTA: Not found (SComatic will not work without it)")
+    
     if args.gtf_file:
         gtf_file = validate_path(args.gtf_file, "GTF annotation file")
+        print(f"  GTF annotation (provided): {gtf_file}")
+    elif auto_gtf:
+        gtf_file = auto_gtf
+        print(f"  GTF annotation (auto-derived): {gtf_file}")
     else:
-        # Try to find GTF in cellranger reference
-        potential_gtf = Path(cellranger_ref) / "genes" / "genes.gtf"
-        if potential_gtf.exists():
-            gtf_file = str(potential_gtf)
-            print(f"  Found GTF file in Cell Ranger reference: {gtf_file}")
+        gtf_file = None
+        print("  GTF annotation: Not found (inferCNV may have issues)")
     
     # Optional modules
     print("\nConfiguring optional modules...")
@@ -95,6 +161,8 @@ def create_config(args):
     scomatic_enabled = args.enable_scomatic
     scomatic_config = {}
     if scomatic_enabled:
+        if reference_fasta is None:
+            print("  WARNING: SComatic requires reference FASTA - it was not found or provided")
         scomatic_config = {
             'scripts_dir': validate_path(args.scomatic_scripts_dir, "SComatic scripts directory"),
             'editing_sites': validate_path(args.scomatic_editing_sites, "SComatic RNA editing sites"),
@@ -141,11 +209,12 @@ def create_config(args):
         'sample_info': sample_info_path,
         'sample_ids': sample_ids,
         
+        # SIMPLIFIED REFERENCE SECTION
         'reference': {
-            'fasta': reference_fasta,
-            'dir': reference_dir,
             'cellranger': cellranger_ref,
+            'fasta': reference_fasta,
             'gtf': gtf_file,
+            'genome': args.genome if hasattr(args, 'genome') else 'GRCh38',
         },
         
         'cellranger': {
@@ -224,6 +293,10 @@ def create_config(args):
     print("="*70)
     print(f"\nConfiguration file: {config_path}")
     print(f"Samples: {len(sample_ids)}")
+    print(f"\nReference files:")
+    print(f"  Cell Ranger: {cellranger_ref}")
+    print(f"  FASTA: {reference_fasta or 'Not found'}")
+    print(f"  GTF: {gtf_file or 'Not found'}")
     print(f"\nTo run the pipeline:")
     print(f"  snakemake --configfile {config_path} --cores {args.threads}")
     
@@ -236,19 +309,25 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Basic usage with sample pickle
+  # Basic usage - only cellranger-reference is required for references
+  # FASTA and GTF are auto-derived from standard 10x reference layout
   python create_config.py \\
     --output-dir /path/to/output \\
     --sample-pickle samples.pkl \\
-    --reference-fasta /path/to/genome.fa \\
-    --cellranger-reference /path/to/cellranger_ref
+    --cellranger-reference /path/to/refdata-gex-GRCh38-2020-A
+
+  # Override auto-derived FASTA if using non-standard layout
+  python create_config.py \\
+    --output-dir /path/to/output \\
+    --sample-pickle samples.pkl \\
+    --cellranger-reference /path/to/cellranger_ref \\
+    --reference-fasta /custom/path/to/genome.fa
 
   # Enable all modules
   python create_config.py \\
     --output-dir /path/to/output \\
     --sample-ids SAMPLE1 SAMPLE2 SAMPLE3 \\
-    --reference-fasta /path/to/genome.fa \\
-    --cellranger-reference /path/to/cellranger_ref \\
+    --cellranger-reference /path/to/refdata-gex-GRCh38-2020-A \\
     --enable-viral --kraken-db /path/to/kraken_db \\
     --enable-scomatic \\
       --scomatic-scripts-dir /path/to/SComatic/scripts \\
@@ -264,9 +343,17 @@ Examples:
     # Required arguments
     required = parser.add_argument_group('Required Arguments')
     required.add_argument('--output-dir', required=True, help='Output directory')
-    required.add_argument('--reference-fasta', required=True, help='Reference genome FASTA')
-    required.add_argument('--cellranger-reference', required=True, help='Cell Ranger reference directory')
-    required.add_argument('--gtf-file', help='GTF annotation file (auto-detected from Cell Ranger ref if not provided)')
+    required.add_argument('--cellranger-reference', required=True, 
+                          help='Cell Ranger reference directory (contains fasta/, genes/, star/)')
+    
+    # Reference files (optional - auto-derived from cellranger-reference)
+    refs = parser.add_argument_group('Reference Files (Optional - Auto-derived from Cell Ranger reference)')
+    refs.add_argument('--reference-fasta', 
+                      help='Reference FASTA file (auto-derived as {cellranger}/fasta/genome.fa if not provided)')
+    refs.add_argument('--gtf-file', 
+                      help='GTF annotation file (auto-derived as {cellranger}/genes/genes.gtf if not provided)')
+    refs.add_argument('--genome', default='GRCh38', choices=['GRCh38', 'GRCh37', 'mm10', 'mm39'],
+                      help='Genome build (default: GRCh38)')
     
     # Sample specification
     samples = parser.add_argument_group('Sample Specification (one required)')
@@ -358,4 +445,3 @@ Examples:
 
 if __name__ == '__main__':
     main()
-
