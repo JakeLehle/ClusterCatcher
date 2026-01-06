@@ -10,7 +10,7 @@ Commands:
 - run-config: Execute the Snakemake pipeline
 """
 
-__version__ = '1.1.0'
+__version__ = '1.1.3'
 
 from cli.sample_information import sample_information
 from cli.run_config import run_config

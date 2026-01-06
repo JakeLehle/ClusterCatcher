@@ -170,6 +170,9 @@ def create_config(args):
             'bed_file': validate_path(args.scomatic_bed_file, "SComatic BED file"),
             'min_cov': args.scomatic_min_cov,
             'min_cells': args.scomatic_min_cells,
+            'cell_types': None,
+            'min_base_quality': args.scomatic_min_base_quality,
+            'min_map_quality': args.scomatic_min_map_quality,
         }
         print(f"  SComatic mutation calling: ENABLED")
     else:
@@ -190,6 +193,10 @@ def create_config(args):
             'mutation_threshold': args.mutation_threshold,
             'max_signatures': args.max_signatures,
             'hnscc_only': args.hnscc_only,
+            'hnscc_signatures': [
+                'SBS1', 'SBS2', 'SBS4', 'SBS5', 'SBS7a', 'SBS7b', 'SBS13',
+                'SBS16', 'SBS17a', 'SBS17b', 'SBS18', 'SBS29', 'SBS39', 'SBS40', 'SBS44'
+            ],
         }
         print(f"  Signature analysis: ENABLED")
         print(f"    Core signatures: {core_signatures}")
@@ -197,47 +204,78 @@ def create_config(args):
     else:
         print(f"  Signature analysis: DISABLED")
     
+    # popV annotation settings
+    print("\nConfiguring cell type annotation (popV)...")
+    print(f"  Hugging Face repo: {args.popv_huggingface_repo}")
+    print(f"  Prediction mode: {args.popv_prediction_mode}")
+    
     # Build configuration
     print("\nBuilding configuration...")
     
     config = {
+        # Output directories
         'output_dir': output_dir,
-        'log_dir': os.path.join(output_dir, 'logs'),
+        'log_dir': None,  # Defaults to {output_dir}/logs
+        
+        # Resource settings
         'threads': args.threads,
         'memory_gb': args.memory_gb,
         
+        # Sample specification
         'sample_info': sample_info_path,
         'sample_ids': sample_ids,
+        'samples': {},
         
-        # SIMPLIFIED REFERENCE SECTION
+        # Reference files (simplified)
         'reference': {
             'cellranger': cellranger_ref,
             'fasta': reference_fasta,
             'gtf': gtf_file,
-            'genome': args.genome if hasattr(args, 'genome') else 'GRCh38',
+            'genome': args.genome,
         },
         
+        # Cell Ranger settings
         'cellranger': {
             'chemistry': args.chemistry,
             'expect_cells': args.expect_cells,
             'include_introns': args.include_introns,
-            'localcores': args.threads,  # Use same as global threads
-            'localmem': args.memory_gb,  # Use same as global memory
-            'create_bam': True,  # Always create BAM for downstream analysis
+            'localcores': args.threads,
+            'localmem': args.memory_gb,
+            'create_bam': True,
         },
         
+        # QC settings (all parameters exposed)
         'qc': {
             'min_genes': args.min_genes,
+            'max_genes': args.max_genes,
             'min_counts': args.min_counts,
+            'max_counts': args.max_counts,
             'max_mito_pct': args.max_mito_pct,
+            'min_cells': args.min_cells,
+            'doublet_removal': args.doublet_removal,
             'doublet_rate': args.doublet_rate,
         },
         
-        'annotation': {
-            'method': args.annotation_method,
-            'reference': args.annotation_reference,
+        # Preprocessing settings (post-annotation)
+        'preprocessing': {
+            'target_sum': args.target_sum,
+            'n_pcs': args.n_pcs,
+            'n_neighbors': args.n_neighbors,
+            'leiden_resolution': args.leiden_resolution,
+            'run_bbknn': args.run_bbknn,
+            'bbknn_batch_key': args.bbknn_batch_key,
         },
         
+        # Annotation settings (popV only)
+        'annotation': {
+            'popv_huggingface_repo': args.popv_huggingface_repo,
+            'popv_prediction_mode': args.popv_prediction_mode,
+            'popv_gene_symbol_key': args.popv_gene_symbol_key,
+            'popv_cache_dir': args.popv_cache_dir,
+            'batch_key': args.batch_key,
+        },
+        
+        # Module enable/disable flags
         'modules': {
             'cellranger': True,
             'qc': True,
@@ -247,46 +285,93 @@ def create_config(args):
             'scomatic': scomatic_enabled,
             'signatures': signatures_enabled,
         },
-    }
-    
-    # Add module-specific configs
-    if viral_enabled:
-        config['viral'] = {
-            'kraken_db': kraken_db,
-            'viral_db': viral_db,
-            'confidence': args.viral_confidence,
-        }
-    
-    if scomatic_enabled:
-        config['scomatic'] = scomatic_config
-    
-    if signatures_enabled:
-        config['signatures'] = signatures_config
-    
-    if args.enable_dysregulation:
-        config['dysregulation'] = {
+        
+        # Dysregulation settings (order before viral to match workflow)
+        'dysregulation': {
             'cytotrace2': {
                 'enabled': args.cytotrace2_enabled,
-                'species': args.species if hasattr(args, 'species') else 'human',
-                'max_cells_per_chunk': args.max_cells_chunk if hasattr(args, 'max_cells_chunk') else 200000,
+                'species': args.species,
+                'max_cells_per_chunk': args.max_cells_chunk,
             },
             'infercnv': {
                 'enabled': args.infercnv_enabled,
-                'window_size': args.infercnv_window if hasattr(args, 'infercnv_window') else 250,
+                'window_size': args.infercnv_window,
             },
             'infercnv_reference_groups': args.infercnv_reference_groups,
             'agreement': {
-                'alpha': args.agreement_alpha if hasattr(args, 'agreement_alpha') else 0.5,
-                'min_correlation': args.min_correlation if hasattr(args, 'min_correlation') else 0.5,
+                'alpha': args.agreement_alpha,
+                'min_correlation': args.min_correlation,
             },
-        }
+        },
+        
+        # Viral detection settings
+        'viral': {
+            'kraken_db': kraken_db,
+            'viral_db': viral_db,
+            'confidence': args.viral_confidence,
+            'include_organisms': None,
+            'exclude_organisms': None,
+            'organisms_of_interest': [],
+        },
+        
+        # SComatic settings
+        'scomatic': scomatic_config if scomatic_enabled else {
+            'scripts_dir': None,
+            'editing_sites': None,
+            'pon_file': None,
+            'bed_file': None,
+            'min_cov': 5,
+            'min_cells': 5,
+            'cell_types': None,
+            'min_base_quality': 30,
+            'min_map_quality': 30,
+        },
+        
+        # Signature analysis settings
+        'signatures': signatures_config if signatures_enabled else {
+            'cosmic_file': None,
+            'core_signatures': ['SBS2', 'SBS13', 'SBS5'],
+            'use_scree_plot': True,
+            'candidate_order': None,
+            'mutation_threshold': 0,
+            'max_signatures': 15,
+            'hnscc_only': False,
+            'hnscc_signatures': [
+                'SBS1', 'SBS2', 'SBS4', 'SBS5', 'SBS7a', 'SBS7b', 'SBS13',
+                'SBS16', 'SBS17a', 'SBS17b', 'SBS18', 'SBS29', 'SBS39', 'SBS40', 'SBS44'
+            ],
+        },
+        
+        # Advanced settings
+        'random_seed': 42,
+        'keep_intermediate': False,
+        
+        'reports': {
+            'generate_html': True,
+            'generate_pdf': False,
+            'figure_format': 'png',
+            'figure_dpi': 150,
+        },
+    }
     
     # Write configuration file
     config_path = os.path.join(output_dir, 'config.yaml')
     print(f"\nWriting configuration to: {config_path}")
     
+    # Custom YAML representer to handle None values nicely
+    def represent_none(dumper, data):
+        return dumper.represent_scalar('tag:yaml.org,2002:null', 'null')
+    
+    yaml.add_representer(type(None), represent_none)
+    
     with open(config_path, 'w') as f:
-        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+        f.write("# =============================================================================\n")
+        f.write("# ClusterCatcher Pipeline Configuration\n")
+        f.write("# =============================================================================\n")
+        f.write("# Generated by: create_config.py\n")
+        f.write("# Documentation: https://github.com/JakeLehle/ClusterCatcher\n")
+        f.write("# =============================================================================\n\n")
+        yaml.dump(config, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
     
     print("\n" + "="*70)
     print("CONFIGURATION CREATED SUCCESSFULLY")
@@ -297,8 +382,10 @@ def create_config(args):
     print(f"  Cell Ranger: {cellranger_ref}")
     print(f"  FASTA: {reference_fasta or 'Not found'}")
     print(f"  GTF: {gtf_file or 'Not found'}")
+    print(f"\nAnnotation: popV ({args.popv_huggingface_repo})")
     print(f"\nTo run the pipeline:")
-    print(f"  snakemake --configfile {config_path} --cores {args.threads}")
+    print(f"  cd snakemake_wrapper")
+    print(f"  snakemake --configfile {config_path} --cores {args.threads} --use-conda")
     
     return config_path
 
@@ -323,11 +410,12 @@ Examples:
     --cellranger-reference /path/to/cellranger_ref \\
     --reference-fasta /custom/path/to/genome.fa
 
-  # Enable all modules
+  # Enable all modules with custom popV model
   python create_config.py \\
     --output-dir /path/to/output \\
     --sample-ids SAMPLE1 SAMPLE2 SAMPLE3 \\
     --cellranger-reference /path/to/refdata-gex-GRCh38-2020-A \\
+    --popv-huggingface-repo "popV/tabula_sapiens_immune" \\
     --enable-viral --kraken-db /path/to/kraken_db \\
     --enable-scomatic \\
       --scomatic-scripts-dir /path/to/SComatic/scripts \\
@@ -340,13 +428,17 @@ Examples:
       --use-scree-plot
         """)
     
+    # ==========================================================================
     # Required arguments
+    # ==========================================================================
     required = parser.add_argument_group('Required Arguments')
     required.add_argument('--output-dir', required=True, help='Output directory')
     required.add_argument('--cellranger-reference', required=True, 
                           help='Cell Ranger reference directory (contains fasta/, genes/, star/)')
     
+    # ==========================================================================
     # Reference files (optional - auto-derived from cellranger-reference)
+    # ==========================================================================
     refs = parser.add_argument_group('Reference Files (Optional - Auto-derived from Cell Ranger reference)')
     refs.add_argument('--reference-fasta', 
                       help='Reference FASTA file (auto-derived as {cellranger}/fasta/genome.fa if not provided)')
@@ -355,52 +447,92 @@ Examples:
     refs.add_argument('--genome', default='GRCh38', choices=['GRCh38', 'GRCh37', 'mm10', 'mm39'],
                       help='Genome build (default: GRCh38)')
     
+    # ==========================================================================
     # Sample specification
+    # ==========================================================================
     samples = parser.add_argument_group('Sample Specification (one required)')
     samples.add_argument('--sample-pickle', help='Pickle file with sample dictionary')
     samples.add_argument('--sample-ids', nargs='+', help='List of sample IDs')
     
+    # ==========================================================================
     # Resource settings
+    # ==========================================================================
     resources = parser.add_argument_group('Resource Settings')
     resources.add_argument('--threads', type=int, default=8, help='Number of threads (default: 8)')
     resources.add_argument('--memory-gb', type=int, default=64, help='Memory in GB (default: 64)')
     
+    # ==========================================================================
     # Cell Ranger settings
+    # ==========================================================================
     cellranger = parser.add_argument_group('Cell Ranger Settings')
     cellranger.add_argument('--chemistry', default='auto', help='Chemistry (default: auto)')
     cellranger.add_argument('--expect-cells', type=int, default=10000, help='Expected cells (default: 10000)')
     cellranger.add_argument('--include-introns', action='store_true', help='Include introns')
     
+    # ==========================================================================
     # QC settings
+    # ==========================================================================
     qc = parser.add_argument_group('QC Settings')
     qc.add_argument('--min-genes', type=int, default=200, help='Min genes per cell (default: 200)')
+    qc.add_argument('--max-genes', type=int, default=5000, help='Max genes per cell (default: 5000)')
     qc.add_argument('--min-counts', type=int, default=500, help='Min counts per cell (default: 500)')
+    qc.add_argument('--max-counts', type=int, default=50000, help='Max counts per cell (default: 50000)')
     qc.add_argument('--max-mito-pct', type=float, default=20, help='Max mitochondrial %% (default: 20)')
+    qc.add_argument('--min-cells', type=int, default=3, help='Min cells expressing a gene (default: 3)')
+    qc.add_argument('--doublet-removal', action='store_true', default=True, help='Enable doublet removal (default: True)')
+    qc.add_argument('--no-doublet-removal', action='store_false', dest='doublet_removal', help='Disable doublet removal')
     qc.add_argument('--doublet-rate', type=float, default=0.08, help='Expected doublet rate (default: 0.08)')
     
-    # Annotation settings
-    annotation = parser.add_argument_group('Annotation Settings')
-    annotation.add_argument('--annotation-method', default='popv', choices=['popv', 'celltypist', 'sctype'],
-                           help='Cell type annotation method (default: popv)')
-    annotation.add_argument('--annotation-reference', help='Reference for annotation')
+    # ==========================================================================
+    # Preprocessing settings (post-annotation)
+    # ==========================================================================
+    preproc = parser.add_argument_group('Preprocessing Settings (Post-Annotation)')
+    preproc.add_argument('--target-sum', type=int, default=1000000, 
+                         help='Normalization target sum (default: 1000000 for CPM)')
+    preproc.add_argument('--n-pcs', type=int, default=None, 
+                         help='Number of PCs for neighbors (default: None = CPU count)')
+    preproc.add_argument('--n-neighbors', type=int, default=15, 
+                         help='Number of neighbors for graph (default: 15)')
+    preproc.add_argument('--leiden-resolution', type=float, default=1.0, 
+                         help='Leiden clustering resolution (default: 1.0)')
+    preproc.add_argument('--run-bbknn', action='store_true', 
+                         help='Enable BBKNN batch correction')
+    preproc.add_argument('--bbknn-batch-key', default='sample_id', 
+                         help='Batch key for BBKNN (default: sample_id)')
     
-    # Viral detection
-    viral = parser.add_argument_group('Viral Detection')
-    viral.add_argument('--enable-viral', action='store_true', help='Enable viral detection')
-    viral.add_argument('--kraken-db', help='Kraken2 database path')
-    viral.add_argument('--viral-db', help='Viral database path')
-    viral.add_argument('--viral-confidence', type=float, default=0.1, help='Viral detection confidence (default: 0.1)')
+    # ==========================================================================
+    # Annotation settings (popV only)
+    # ==========================================================================
+    annotation = parser.add_argument_group('Annotation Settings (popV)')
+    annotation.add_argument('--popv-huggingface-repo', default='popV/tabula_sapiens_All_Cells',
+                           help='Hugging Face repository for popV model (default: popV/tabula_sapiens_All_Cells)')
+    annotation.add_argument('--popv-prediction-mode', default='inference', choices=['inference', 'fast'],
+                           help='popV prediction mode: inference (full) or fast (default: inference)')
+    annotation.add_argument('--popv-gene-symbol-key', default='feature_name',
+                           help='Gene symbol column in adata.var (default: feature_name)')
+    annotation.add_argument('--popv-cache-dir', default='tmp/popv_models',
+                           help='Cache directory for popV models (default: tmp/popv_models)')
+    annotation.add_argument('--batch-key', default='sample_id',
+                           help='Batch key for annotation (default: sample_id)')
     
+    # ==========================================================================
     # Dysregulation settings
+    # ==========================================================================
     dysreg = parser.add_argument_group('Dysregulation Detection')
     dysreg.add_argument('--enable-dysregulation', action='store_true', default=True, 
                         help='Enable dysregulation detection (default: True)')
+    dysreg.add_argument('--no-dysregulation', action='store_false', dest='enable_dysregulation',
+                        help='Disable dysregulation detection')
     dysreg.add_argument('--cytotrace2-enabled', action='store_true', default=True, 
-                        help='Enable CytoTRACE2')
+                        help='Enable CytoTRACE2 (default: True)')
+    dysreg.add_argument('--no-cytotrace2', action='store_false', dest='cytotrace2_enabled',
+                        help='Disable CytoTRACE2')
     dysreg.add_argument('--infercnv-enabled', action='store_true', default=True, 
-                        help='Enable inferCNV')
+                        help='Enable inferCNV (default: True)')
+    dysreg.add_argument('--no-infercnv', action='store_false', dest='infercnv_enabled',
+                        help='Disable inferCNV')
     dysreg.add_argument('--infercnv-reference-groups', nargs='+', 
-                        help='Reference cell types for inferCNV')
+                        help='Reference cell types for inferCNV (e.g., "T cells" "B cells")')
     dysreg.add_argument('--species', default='human', choices=['human', 'mouse'],
                         help='Species for CytoTRACE2 (default: human)')
     dysreg.add_argument('--max-cells-chunk', type=int, default=200000,
@@ -412,7 +544,19 @@ Examples:
     dysreg.add_argument('--min-correlation', type=float, default=0.5,
                         help='Minimum Spearman correlation for quartile selection (default: 0.5)')
     
+    # ==========================================================================
+    # Viral detection
+    # ==========================================================================
+    viral = parser.add_argument_group('Viral Detection')
+    viral.add_argument('--enable-viral', action='store_true', help='Enable viral detection')
+    viral.add_argument('--kraken-db', help='Kraken2 database path')
+    viral.add_argument('--viral-db', help='Viral database path')
+    viral.add_argument('--viral-confidence', type=float, default=0.1, 
+                       help='Viral detection confidence (default: 0.1)')
+    
+    # ==========================================================================
     # SComatic settings
+    # ==========================================================================
     scomatic = parser.add_argument_group('SComatic Mutation Calling')
     scomatic.add_argument('--enable-scomatic', action='store_true', help='Enable SComatic mutation calling')
     scomatic.add_argument('--scomatic-scripts-dir', help='SComatic scripts directory')
@@ -421,8 +565,14 @@ Examples:
     scomatic.add_argument('--scomatic-bed-file', help='Mappable regions BED file')
     scomatic.add_argument('--scomatic-min-cov', type=int, default=5, help='Min coverage (default: 5)')
     scomatic.add_argument('--scomatic-min-cells', type=int, default=5, help='Min cells with variant (default: 5)')
+    scomatic.add_argument('--scomatic-min-base-quality', type=int, default=30, 
+                          help='Min base quality (default: 30)')
+    scomatic.add_argument('--scomatic-min-map-quality', type=int, default=30, 
+                          help='Min mapping quality (default: 30)')
     
+    # ==========================================================================
     # Signature analysis settings
+    # ==========================================================================
     sigs = parser.add_argument_group('Signature Analysis')
     sigs.add_argument('--enable-signatures', action='store_true', help='Enable signature analysis')
     sigs.add_argument('--cosmic-file', help='COSMIC signature database file')

@@ -55,6 +55,11 @@ def find_snakefile():
     if cwd_snakefile.exists():
         return str(cwd_snakefile)
     
+    # Try parent directory (if running from snakemake_wrapper)
+    parent_snakefile = Path.cwd() / 'Snakefile'
+    if parent_snakefile.exists():
+        return str(parent_snakefile)
+    
     return None
 
 
@@ -103,7 +108,82 @@ def validate_config_file(config_path):
         if not config['reference'].get('cellranger'):
             errors.append("Missing reference.cellranger (Cell Ranger reference path)")
     
+    # Check annotation config (popV)
+    if 'annotation' in config and config['annotation']:
+        annotation = config['annotation']
+        # Check for popV config (new structure)
+        if 'popv_huggingface_repo' not in annotation:
+            # Could be using old config format - warn but don't error
+            if 'method' in annotation:
+                errors.append("Old annotation config format detected. Please regenerate config with create_config.py")
+    
+    # Check QC config
+    if 'qc' in config and config['qc']:
+        qc = config['qc']
+        # Ensure all required QC params are present
+        required_qc = ['min_genes', 'max_mito_pct', 'doublet_rate']
+        for param in required_qc:
+            if param not in qc:
+                errors.append(f"Missing qc.{param}")
+    
+    # Check preprocessing config
+    if 'preprocessing' not in config:
+        errors.append("Missing preprocessing config section")
+    
     return config, errors
+
+
+def get_expected_outputs(config):
+    """
+    Get list of expected output files based on config.
+    
+    Parameters
+    ----------
+    config : dict
+        Pipeline configuration
+        
+    Returns
+    -------
+    list
+        List of (filepath, description) tuples
+    """
+    outputs = []
+    modules = config.get('modules', {})
+    
+    # Always generated
+    outputs.append(('qc/qc_metrics.tsv', 'QC metrics'))
+    outputs.append(('qc/multiqc_report.html', 'MultiQC report'))
+    outputs.append(('annotation/adata_annotated.h5ad', 'Annotated AnnData'))
+    outputs.append(('annotation/annotation_summary.tsv', 'Annotation summary'))
+    outputs.append(('figures/qc/', 'QC and annotation figures'))
+    
+    # Dysregulation (default enabled)
+    if modules.get('dysregulation', True):
+        outputs.append(('dysregulation/adata_cancer_detected.h5ad', 'Cancer detection AnnData'))
+        outputs.append(('dysregulation/dysregulation_summary.tsv', 'Dysregulation summary'))
+    
+    # Viral detection
+    if modules.get('viral', False):
+        outputs.append(('viral/viral_detection_summary.tsv', 'Viral detection summary'))
+        outputs.append(('viral/viral_counts.h5ad', 'Viral counts AnnData'))
+        if config.get('viral', {}).get('viral_db'):
+            outputs.append(('viral_integration/adata_with_virus.h5ad', 'Viral integration AnnData'))
+    
+    # SComatic
+    if modules.get('scomatic', False):
+        outputs.append(('mutations/all_samples.single_cell_genotype.filtered.tsv', 'Filtered mutations'))
+        outputs.append(('mutations/CombinedCallableSites/complete_callable_sites.tsv', 'Callable sites'))
+    
+    # Signatures
+    if modules.get('signatures', False):
+        outputs.append(('signatures/signature_weights_per_cell.txt', 'Signature weights'))
+        outputs.append(('signatures/adata_final.h5ad', 'Final AnnData with signatures'))
+        outputs.append(('adata_final.h5ad', 'Final AnnData (copy)'))
+    
+    # Always generated
+    outputs.append(('master_summary.yaml', 'Pipeline summary'))
+    
+    return outputs
 
 
 @click.command('run-config')
@@ -289,6 +369,11 @@ def run_config(config_yaml, cores, jobs, dryrun, unlock, rerun_incomplete,
     if enabled:
         click.echo(f"Enabled modules: {', '.join(enabled)}")
     
+    # Show annotation config
+    annotation = config.get('annotation', {})
+    if annotation.get('popv_huggingface_repo'):
+        click.echo(f"Annotation: popV ({annotation['popv_huggingface_repo']})")
+    
     # Build Snakemake command
     cmd = ['snakemake']
     
@@ -362,22 +447,44 @@ def run_config(config_yaml, cores, jobs, dryrun, unlock, rerun_incomplete,
             click.echo(f"\n{'='*60}")
             click.echo("Pipeline completed successfully!")
             click.echo(f"{'='*60}")
-            click.echo(f"\nResults in: {config.get('output_dir', 'results')}")
             
-            # Show key output files
             output_dir = config.get('output_dir', 'results')
+            click.echo(f"\nResults in: {output_dir}")
+            
+            # Show expected output files based on config
+            expected_outputs = get_expected_outputs(config)
+            click.echo("\nExpected output files:")
+            for fpath, desc in expected_outputs:
+                full_path = os.path.join(output_dir, fpath)
+                if os.path.exists(full_path):
+                    click.echo(f"  ✓ {fpath}")
+                else:
+                    # Don't show missing files for disabled modules
+                    pass
+            
+            # Show key files that should always exist
             click.echo("\nKey output files:")
             key_files = [
-                'annotation/adata_annotated.h5ad',
-                'dysregulation/adata_cancer_detected.h5ad',
-                'mutations/all_samples.single_cell_genotype.filtered.tsv',
-                'signatures/adata_final.h5ad',
-                'master_summary.yaml'
+                ('annotation/adata_annotated.h5ad', 'Annotated cells with popV predictions'),
+                ('qc/qc_metrics.tsv', 'Per-sample QC statistics'),
+                ('figures/qc/UMAP_final_annotation.pdf', 'Cell type UMAP with labels'),
             ]
-            for f in key_files:
-                fpath = os.path.join(output_dir, f)
-                if os.path.exists(fpath):
-                    click.echo(f"  ✓ {f}")
+            
+            # Add module-specific key files
+            if modules.get('dysregulation', True):
+                key_files.append(('dysregulation/adata_cancer_detected.h5ad', 'Cancer cell detection'))
+            if modules.get('scomatic', False):
+                key_files.append(('mutations/all_samples.single_cell_genotype.filtered.tsv', 'Somatic mutations'))
+            if modules.get('signatures', False):
+                key_files.append(('signatures/adata_final.h5ad', 'Final AnnData with signatures'))
+            
+            key_files.append(('master_summary.yaml', 'Pipeline summary'))
+            
+            for fpath, desc in key_files:
+                full_path = os.path.join(output_dir, fpath)
+                if os.path.exists(full_path):
+                    click.echo(f"  ✓ {fpath} - {desc}")
+                    
         else:
             click.echo(f"\n{'='*60}")
             click.echo(f"Pipeline failed with exit code: {result.returncode}")
@@ -386,6 +493,7 @@ def run_config(config_yaml, cores, jobs, dryrun, unlock, rerun_incomplete,
             click.echo("  1. Check the log files in logs/ directory")
             click.echo("  2. Run with --verbose for more details")
             click.echo("  3. Run with --dryrun to check workflow")
+            click.echo("  4. Check logs/qc_annotation/qc_annotation.log for annotation errors")
             sys.exit(result.returncode)
             
     except FileNotFoundError:
@@ -406,4 +514,3 @@ def run_config(config_yaml, cores, jobs, dryrun, unlock, rerun_incomplete,
 
 if __name__ == '__main__':
     run_config()
-
