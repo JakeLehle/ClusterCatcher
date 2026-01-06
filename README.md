@@ -30,7 +30,7 @@ ClusterCatcher is a comprehensive Snakemake-based pipeline designed for end-to-e
 - **Mutational signature detection** at single-cell resolution
 - **Cancer/dysregulated cell identification** using dual-model consensus
 - **Viral pathogen detection** in unmapped reads
-- **Automated cell type annotation** with multiple method support
+- **Automated cell type annotation** using popV with cluster-based refinement
 
 The pipeline integrates seven major analysis modules that can be flexibly enabled or disabled based on your research needs.
 
@@ -41,6 +41,7 @@ The pipeline integrates seven major analysis modules that can be flexibly enable
 - **Scalable**: Supports local execution and HPC cluster submission
 - **Comprehensive**: From raw FASTQs to annotated single-cell mutations
 - **Well-documented**: Extensive logging and summary reports
+- **Publication-ready plots**: Non-overlapping UMAP labels, stacked bar plots
 
 ---
 
@@ -72,7 +73,7 @@ The pipeline integrates seven major analysis modules that can be flexibly enable
 │           ▼                        ▼                        │               │
 │  ┌──────────────────┐     ┌──────────────────┐              │               │
 │  │ 3. Cell Annot.   │     │ Viral Integration│              │               │
-│  │   (popV/CT)      │     │                  │              │               │
+│  │   (popV)         │     │                  │              │               │
 │  └────────┬─────────┘     └──────────────────┘              │               │
 │           │                                                 │               │
 │           ▼                                                 │               │
@@ -104,7 +105,7 @@ The pipeline integrates seven major analysis modules that can be flexibly enable
 |---|--------|--------|----------|-------------|
 | 1 | Cell Ranger | `cellranger_count.py` | Yes | FASTQ alignment, counting, BAM generation |
 | 2 | QC & Filtering | `scanpy_qc_annotation.py` | Yes | Quality control, doublet removal, filtering |
-| 3 | Cell Annotation | `scanpy_qc_annotation.py` | Yes | Cell type annotation (popV, CellTypist, etc.) |
+| 3 | Cell Annotation | `scanpy_qc_annotation.py` | Yes | popV annotation with cluster-based refinement |
 | 4 | Dysregulation | `cancer_cell_detection.py` | Default | Cancer cell detection (CytoTRACE2 + inferCNV) |
 | 5 | Viral Detection | `kraken2_viral_detection.py`, `summarize_viral_detection.py`, `viral_integration.py` | Optional | Pathogen detection in unmapped reads |
 | 6 | Mutation Calling | `scomatic_mutation_calling.py` | Optional | Somatic mutation calling (SComatic) |
@@ -431,51 +432,156 @@ Performs quality control, doublet detection, and cell filtering using Scanpy.
 
 #### Filtering Steps
 1. Remove cells with < `min_genes` genes detected
-2. Remove cells with < `min_counts` total counts
-3. Remove cells with > `max_mito_pct` mitochondrial reads
-4. Remove predicted doublets
+2. Remove cells with > `max_genes` genes detected
+3. Remove cells with < `min_counts` total counts
+4. Remove cells with > `max_counts` total counts
+5. Remove cells with > `max_mito_pct` mitochondrial reads
+6. Remove predicted doublets
 
 #### Key Parameters
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `min_genes` | `200` | Minimum genes per cell |
+| `max_genes` | `5000` | Maximum genes per cell |
 | `min_counts` | `500` | Minimum UMI counts |
+| `max_counts` | `50000` | Maximum UMI counts |
 | `max_mito_pct` | `20` | Maximum mitochondrial % |
+| `min_cells` | `3` | Minimum cells expressing a gene |
+| `doublet_removal` | `true` | Enable doublet detection |
 | `doublet_rate` | `0.08` | Expected doublet rate |
 
 #### Outputs
-- `qc/qc_metrics.tsv` - Per-cell QC metrics
+- `qc/qc_metrics.tsv` - Per-sample QC statistics
 - `qc/multiqc_report.html` - MultiQC summary
-- `qc/figures/` - QC visualization plots
+- `figures/qc/pre_filter_*.png` - Pre-filter QC plots
+- `figures/qc/post_filter_*.png` - Post-filter QC plots
 
 ---
 
-### Module 3: Cell Type Annotation
+### Module 3: Cell Type Annotation (popV)
 
 **Script**: `scripts/scanpy_qc_annotation.py` (combined with QC)
 
-Annotates cells with cell type labels using consensus methods.
+Annotates cells with cell type labels using popV with cluster-based refinement.
 
-#### Supported Methods
+#### Workflow
 
-| Method | Description | Reference Required |
-|--------|-------------|-------------------|
-| `popv` | Population-level Voting | No (uses internal reference) |
-| `celltypist` | CellTypist models | Optional model file |
-| `leiden` | Cluster-based (fallback) | No |
+The annotation follows a 7-step pipeline:
 
-#### Outputs
-- `annotation/adata_annotated.h5ad` - Annotated AnnData object
-- `annotation/annotation_summary.tsv` - Cell type counts
-- `annotation/figures/` - UMAP plots colored by cell type
+```
+┌──────────────────┐
+│ 1. Load Cell     │
+│    Ranger Data   │
+└────────┬─────────┘
+         │
+         ▼
+┌──────────────────┐
+│ 2. QC Metrics    │
+│    Calculation   │
+└────────┬─────────┘
+         │
+         ▼
+┌──────────────────┐
+│ 3. Cell/Gene     │
+│    Filtering     │
+└────────┬─────────┘
+         │
+         ▼
+┌──────────────────┐
+│ 4. Doublet       │
+│    Detection     │
+└────────┬─────────┘
+         │
+         ▼
+┌──────────────────┐
+│ 5. popV Annot.   │◄── RAW COUNTS (no normalization)
+│  (HubModel)      │    Pulls from Hugging Face
+└────────┬─────────┘
+         │
+         ▼
+┌──────────────────┐
+│ 6. Post-Annot.   │◄── Normalize (CPM), UMAP, Leiden
+│    Processing    │    Optional BBKNN batch correction
+└────────┬─────────┘
+         │
+         ▼
+┌──────────────────┐
+│ 7. Cluster-Based │◄── Weighted scoring per cluster
+│    Refinement    │    Assigns final_annotation
+└──────────────────┘
+```
+
+#### popV Annotation Details
+
+ClusterCatcher uses **popV** (Population-level Voting) with HubModel from Hugging Face for automated cell type annotation.
+
+**Key features:**
+- Runs on **raw counts** (before normalization)
+- Downloads pre-trained models from Hugging Face
+- Uses batch correction during annotation
+- Transfers predictions back to original object
+
+**Available models** (set via `popv_huggingface_repo`):
+
+| Model | Description |
+|-------|-------------|
+| `popV/tabula_sapiens_All_Cells` | All cell types (default, recommended) |
+| `popV/tabula_sapiens_immune` | Immune cells only |
+| `popV/human_lung` | Lung-specific |
+
+See [Hugging Face popV](https://huggingface.co/popV) for more models.
+
+#### Cluster-Based Annotation Refinement
+
+After popV annotation, ClusterCatcher refines predictions using cluster-level weighted scoring:
+
+1. **Min-Max normalization** of `popv_prediction_score` within each cluster
+2. **Linear weighting** to sum to 1 within each cluster
+3. **Weighted aggregation** of scores per cell type per cluster
+4. **Assignment** of dominant cell type to all cells in cluster
+
+This approach:
+- Reduces noise from low-confidence predictions
+- Leverages cluster structure for more robust assignments
+- Produces cleaner cell type boundaries
 
 #### Key Parameters
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `method` | `popv` | Annotation method |
-| `reference` | `null` | Reference for annotation |
+| `popv_huggingface_repo` | `popV/tabula_sapiens_All_Cells` | Hugging Face model repository |
+| `popv_prediction_mode` | `inference` | `inference` (full) or `fast` |
+| `popv_gene_symbol_key` | `feature_name` | Gene symbol column in adata.var |
+| `popv_cache_dir` | `tmp/popv_models` | Cache for downloaded models |
+| `batch_key` | `sample_id` | Batch correction key |
+
+#### Post-Annotation Processing Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `target_sum` | `1000000` | Normalization target (1e6 = CPM) |
+| `n_pcs` | `null` | PCs for neighbors (null = CPU count) |
+| `n_neighbors` | `15` | Neighbors for graph construction |
+| `leiden_resolution` | `1.0` | Clustering resolution |
+| `run_bbknn` | `false` | Enable BBKNN batch correction |
+| `bbknn_batch_key` | `sample_id` | Batch key for BBKNN |
+
+#### Outputs
+
+- `annotation/adata_annotated.h5ad` - Annotated AnnData with:
+  - `popv_prediction`: Raw popV cell type calls
+  - `popv_prediction_score`: Confidence scores
+  - `clusters`: Leiden cluster assignments
+  - `final_annotation`: Cluster-refined cell types
+- `annotation/annotation_summary.tsv` - Cell type counts per sample
+- `figures/qc/UMAP_popv_prediction.pdf` - UMAP colored by popV calls
+- `figures/qc/UMAP_popv_prediction_score.pdf` - UMAP colored by confidence
+- `figures/qc/UMAP_final_annotation.pdf` - UMAP with non-overlapping labels
+- `figures/qc/UMAP_samples.pdf` - UMAP colored by sample
+- `figures/qc/UMAP_clusters.pdf` - UMAP colored by cluster
+- `figures/qc/Stacked_Bar_Cluster_Composition.pdf` - Cell type composition per cluster
+- `figures/qc/cell_type_proportions.pdf` - Cell type proportions per sample
 
 ---
 
@@ -799,6 +905,64 @@ reference:
    - `gtf` from `{cellranger}/genes/genes.gtf`
 3. Override these only if your reference has a non-standard layout
 
+### Complete Configuration Example
+
+```yaml
+# =============================================================================
+# ClusterCatcher Configuration
+# =============================================================================
+
+output_dir: "/path/to/results"
+threads: 8
+memory_gb: 64
+
+# Sample specification
+sample_info: "/path/to/samples.pkl"
+
+# Reference (only cellranger required)
+reference:
+  cellranger: "/path/to/refdata-gex-GRCh38-2020-A"
+  genome: "GRCh38"
+
+# QC parameters
+qc:
+  min_genes: 200
+  max_genes: 5000
+  min_counts: 500
+  max_counts: 50000
+  max_mito_pct: 20
+  min_cells: 3
+  doublet_removal: true
+  doublet_rate: 0.08
+
+# Preprocessing (post-annotation)
+preprocessing:
+  target_sum: 1000000  # CPM
+  n_pcs: null          # Uses CPU count
+  n_neighbors: 15
+  leiden_resolution: 1.0
+  run_bbknn: false
+  bbknn_batch_key: "sample_id"
+
+# Annotation (popV)
+annotation:
+  popv_huggingface_repo: "popV/tabula_sapiens_All_Cells"
+  popv_prediction_mode: "inference"
+  popv_gene_symbol_key: "feature_name"
+  popv_cache_dir: "tmp/popv_models"
+  batch_key: "sample_id"
+
+# Module flags
+modules:
+  cellranger: true
+  qc: true
+  annotation: true
+  viral: false
+  dysregulation: true
+  scomatic: false
+  signatures: false
+```
+
 ### Complete `create_config.py` Options
 
 #### Required Arguments
@@ -843,16 +1007,12 @@ reference:
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--min-genes` | `200` | Min genes per cell |
+| `--max-genes` | `5000` | Max genes per cell |
 | `--min-counts` | `500` | Min UMI counts |
+| `--max-counts` | `50000` | Max UMI counts |
 | `--max-mito-pct` | `20` | Max mitochondrial % |
+| `--min-cells` | `3` | Min cells expressing gene |
 | `--doublet-rate` | `0.08` | Expected doublet rate |
-
-#### Annotation Settings
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--annotation-method` | `popv` | Annotation method |
-| `--annotation-reference` | `null` | Reference dataset |
 
 #### Module Enable/Disable
 
@@ -878,28 +1038,31 @@ results/
 │
 ├── qc/                                  # Quality control
 │   ├── qc_metrics.tsv
-│   ├── multiqc_report.html
-│   └── figures/
-│       ├── violin_qc.pdf
-│       ├── scatter_qc.pdf
-│       └── doublet_scores.pdf
+│   └── multiqc_report.html
+│
+├── figures/                             # Visualizations
+│   └── qc/
+│       ├── pre_filter_qc_violin_plots.pdf
+│       ├── pre_filter_qc_scatter_plots.pdf
+│       ├── post_filter_qc_violin_plots.pdf
+│       ├── post_filter_qc_scatter_plots.pdf
+│       ├── UMAP_popv_prediction.pdf
+│       ├── UMAP_popv_prediction_score.pdf
+│       ├── UMAP_final_annotation.pdf
+│       ├── UMAP_samples.pdf
+│       ├── UMAP_clusters.pdf
+│       ├── Stacked_Bar_Cluster_Composition.pdf
+│       └── cell_type_proportions.pdf
 │
 ├── annotation/                          # Cell type annotation
 │   ├── adata_annotated.h5ad
-│   ├── annotation_summary.tsv
-│   └── figures/
-│       ├── umap_celltypes.pdf
-│       └── umap_samples.pdf
+│   └── annotation_summary.tsv
 │
 ├── dysregulation/                       # Cancer cell detection
 │   ├── adata_cancer_detected.h5ad
 │   ├── cancer_detection_summary.tsv
 │   ├── dysregulation_summary.tsv
 │   └── figures/
-│       ├── cytotrace_potency.pdf
-│       ├── infercnv_heatmap.pdf
-│       ├── agreement_plot.pdf
-│       └── umap_cancer_calls.pdf
 │
 ├── viral/                               # Viral detection (if enabled)
 │   ├── {sample}/
@@ -966,6 +1129,23 @@ Increase memory allocation:
 python create_config.py ... --memory-gb 128
 ```
 
+#### popV model download fails
+
+Check internet connection and try manually downloading:
+
+```bash
+# Clear cache and retry
+rm -rf tmp/popv_models
+# Run pipeline again
+```
+
+Or specify a different model:
+
+```yaml
+annotation:
+  popv_huggingface_repo: "popV/tabula_sapiens_immune"
+```
+
 #### SComatic script errors
 
 Verify SComatic installation:
@@ -989,6 +1169,9 @@ All log files are stored in `{output_dir}/logs/`:
 ```bash
 # View Cell Ranger log
 cat results/logs/cellranger/SAMPLE1.log
+
+# View QC/annotation log
+cat results/logs/qc_annotation/qc_annotation.log
 
 # View Snakemake log
 snakemake ... 2>&1 | tee snakemake.log

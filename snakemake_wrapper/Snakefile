@@ -5,11 +5,12 @@ ClusterCatcher Snakemake Pipeline
 Single-cell sequencing analysis pipeline for:
 1. Cell Ranger alignment and counting
 2. Scanpy QC and cell filtering
-3. Cell type annotation (popV/CellTypist)
-4. Dysregulation detection (CytoTRACE2 + inferCNV)
-5. Viral detection in unmapped reads (Kraken2)
-6. Somatic mutation calling (SComatic)
-7. Mutational signature deconvolution (semi-supervised NMF)
+3. Cell type annotation using popV (HubModel from Hugging Face)
+4. Cluster-based annotation refinement with weighted scoring
+5. Dysregulation detection (CytoTRACE2 + inferCNV)
+6. Viral detection in unmapped reads (Kraken2)
+7. Somatic mutation calling (SComatic)
+8. Mutational signature deconvolution (semi-supervised NMF)
 
 Configuration is loaded from the YAML file specified at runtime.
 
@@ -190,16 +191,50 @@ rule cellranger_count:
 
 rule qc_and_annotation:
     """
-    Combined QC filtering and cell type annotation.
+    Combined QC filtering and cell type annotation using popV.
     
-    This rule performs:
+    This rule performs a 7-step pipeline:
+    
     1. Loading Cell Ranger outputs
-    2. QC filtering (genes, counts, mitochondrial content)
-    3. Doublet removal (Scrublet)
-    4. Normalization and preprocessing
-    5. Dimensionality reduction (PCA, UMAP)
-    6. Clustering (Leiden)
-    7. Cell type annotation (popV)
+       - Loads filtered_feature_bc_matrix.h5 from each sample
+       - Concatenates samples with unique barcode prefixes
+       - Creates gene symbol columns for popV compatibility
+    
+    2. QC metrics calculation
+       - Identifies mitochondrial, ribosomal, and hemoglobin genes
+       - Calculates n_genes_by_counts, total_counts, pct_counts_mt
+    
+    3. Cell and gene filtering
+       - Filters by min/max genes, min/max counts, max mito %
+       - Filters genes by minimum cells expressing
+    
+    4. Doublet detection (Scrublet)
+       - Runs per-sample for accuracy
+       - Removes predicted doublets
+    
+    5. popV annotation (on RAW counts)
+       - Pulls HubModel from Hugging Face
+       - Runs annotation with batch correction
+       - Merges predictions back to original object
+    
+    6. Post-annotation processing
+       - Normalizes (CPM by default)
+       - Computes neighbors, UMAP, Leiden clusters
+       - Optional BBKNN batch correction
+    
+    7. Cluster-based annotation refinement
+       - Assigns final cell type per cluster using weighted scoring
+       - Uses popV prediction scores to weight cell type votes
+    
+    Outputs:
+    - adata_annotated.h5ad: Final annotated AnnData with:
+        - popv_prediction: Raw popV cell type calls
+        - popv_prediction_score: Confidence scores
+        - clusters: Leiden cluster assignments
+        - final_annotation: Cluster-refined cell types
+    - qc_metrics.tsv: Per-sample QC statistics
+    - annotation_summary.tsv: Cell type counts per sample
+    - figures/qc/: QC and annotation visualizations
     """
     input:
         matrices=expand(

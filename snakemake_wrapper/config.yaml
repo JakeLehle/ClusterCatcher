@@ -135,18 +135,6 @@ modules:
   signatures: false
 
 # =============================================================================
-# VIRAL DETECTION SETTINGS (requires modules.viral: true)
-# =============================================================================
-
-viral:
-  kraken_db: null
-  viral_db: null
-  confidence: 0.1
-  include_organisms: null
-  exclude_organisms: null
-  organisms_of_interest: []
-
-# =============================================================================
 # DYSREGULATION DETECTION SETTINGS (requires modules.dysregulation: true)
 # =============================================================================
 
@@ -165,6 +153,18 @@ dysregulation:
   agreement:
     alpha: 0.5
     min_correlation: 0.5
+
+# =============================================================================
+# VIRAL DETECTION SETTINGS (requires modules.viral: true)
+# =============================================================================
+
+viral:
+  kraken_db: null
+  viral_db: null
+  confidence: 0.1
+  include_organisms: null
+  exclude_organisms: null
+  organisms_of_interest: []
 
 # =============================================================================
 # SCOMATIC MUTATION CALLING SETTINGS (requires modules.scomatic: true)

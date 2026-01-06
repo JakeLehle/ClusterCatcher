@@ -25,7 +25,7 @@ else:
     long_description = "ClusterCatcher: Single-cell sequencing analysis pipeline"
 
 # Read version from __init__.py if it exists
-version = "1.1.0"
+version = "1.1.3"
 
 setup(
     name='ClusterCatcher',
