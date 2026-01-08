@@ -28,7 +28,6 @@ dependencies:
   - scvi-tools
   
   # CNV analysis
-  - infercnvpy
   - gffutils
   
   # Visualization
@@ -52,7 +51,6 @@ dependencies:
   
   # Utilities
   - pyyaml
-  - shutil
   - jupyter_core
   - jupyterlab
   
@@ -74,3 +72,4 @@ dependencies:
     - scrublet           # For doublet detection
     - popv               # For cell annotation consensus
     - cytotrace2-py      # For stemness scoring (install from github if needed)
+    - infercnvpy         # For CNV analysis  
