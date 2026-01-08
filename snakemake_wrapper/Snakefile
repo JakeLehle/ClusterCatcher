@@ -31,7 +31,7 @@ configfile: "config.yaml"
 # Extract configuration values
 OUTPUT_DIR = config.get("output_dir", "results")
 TEMP_DIR = config.get("temp_dir", "tmp")
-LOG_DIR = config.get("log_dir", os.path.join(OUTPUT_DIR, "logs"))
+LOG_DIR = config.get("log_dir") or os.path.join(OUTPUT_DIR, "logs")  # Handle null value
 THREADS = config.get("threads", 8)
 MEMORY_GB = config.get("memory_gb", 64)
 
