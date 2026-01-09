@@ -77,4 +77,4 @@ dependencies:
   - pip
   - pip:
     - cytotrace2-py  # Install from GitHub if needed: pip install git+https://github.com/digitalcytometry/cytotrace2.git#subdirectory=cytotrace2_python
-    - infercinvpy
+    - infercnvpy>=0.6.1
