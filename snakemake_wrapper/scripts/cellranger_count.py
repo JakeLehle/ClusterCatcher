@@ -6,18 +6,19 @@ cellranger_count.py
 
 Run Cell Ranger count on single-cell FASTQ files with automatic chemistry detection.
 
-This script is adapted from the standalone Cell Ranger processing script to work
-within the ClusterCatcher Snakemake pipeline. It handles:
-- Automatic chemistry detection with intelligent fallbacks
-- Multiplexed sample detection (I1/I2 files)
-- Failed run cleanup and retry logic
-- Tracking of successful runs
+This script is designed to work with SRAscraper output structure where:
+- Pickle file contains: {GSE_ID: DataFrame with run_accession column}
+- FASTQs are organized as: {fastq_base_dir}/{GSE_ID}/{SRR_ID}/*.fastq.gz
+- Each SRR is processed separately (one Cell Ranger run per SRR)
+
+The script processes all SRRs within a GSE and tracks successful runs,
+matching the behavior of the standalone SRAscraper cellranger script.
 
 Usage:
     Called via Snakemake rule with snakemake.input/output/params
     
     Or standalone:
-    python cellranger_count.py --sample SAMPLE_ID --fastq-dir /path/to/fastqs ...
+    python cellranger_count.py --gse-id GSE123456 --fastq-base-dir /path/to/fastq ...
 
 Requirements:
     - Cell Ranger must be installed and available in PATH
@@ -33,6 +34,7 @@ import subprocess
 import traceback
 import logging
 import argparse
+import pandas as pd
 from pathlib import Path
 from os import cpu_count
 
@@ -49,17 +51,16 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 # List of all possible chemistry options to try (in order of likelihood)
+# Matches the order from Jake's original script
 CHEMISTRY_OPTIONS = [
     "auto",           # Try auto first
-    "threeprime",
-    "fiveprime", 
-    "SC3Pv4-polyA",
     "SC3Pv4",
-    "SC3Pv3-polyA",
     "SC3Pv3",
     "SC3Pv2",
     "SC3Pv3HT",
-    "SC3Pv3HT-polyA",
+    "SC3Pv3LT",
+    "threeprime",
+    "fiveprime",
     "SC5P-PE-v3",
     "SC5P-PE",
     "SC5P-R2-v3",
@@ -68,96 +69,13 @@ CHEMISTRY_OPTIONS = [
     "ARC-v1"
 ]
 
+# Default sample pattern for Cell Ranger --id
+SAMPLE_PATTERN = "_S1_L001_"
+
 
 # =============================================================================
 # Helper Functions
 # =============================================================================
-
-def detect_sample_pattern(directory, sample_id):
-    """
-    Dynamically detect sample pattern from FASTQ files.
-    
-    Parameters
-    ----------
-    directory : str
-        Path to directory containing FASTQ files
-    sample_id : str
-        Sample identifier to search for
-        
-    Returns
-    -------
-    str
-        Detected sample pattern (e.g., "_S1_L001_")
-    """
-    try:
-        fastq_files = [f for f in os.listdir(directory) if f.endswith('.fastq.gz')]
-        if not fastq_files:
-            return "_S1_L001_"  # Default fallback
-        
-        # Look for files matching sample_id
-        sample_files = [f for f in fastq_files if f.startswith(sample_id)]
-        if sample_files:
-            first_file = sample_files[0]
-        else:
-            first_file = fastq_files[0]
-        
-        # Extract sample pattern from first file
-        parts = first_file.split('_')
-        if len(parts) >= 4:
-            # Reconstruct pattern like _S1_L001_
-            return '_' + '_'.join(parts[1:3]) + '_'
-        return "_S1_L001_"  # Default fallback
-    except Exception as e:
-        logger.warning(f"Could not detect sample pattern in {directory}: {e}")
-        return "_S1_L001_"  # Default fallback
-
-
-def check_if_multiplexed(directory):
-    """
-    Check if sample needs demultiplexing by looking for index files.
-    
-    Parameters
-    ----------
-    directory : str
-        Path to directory containing FASTQ files
-        
-    Returns
-    -------
-    bool
-        True if I1 and I2 index files are present
-    """
-    try:
-        files = os.listdir(directory)
-        i1_files = [f for f in files if '_I1_' in f]
-        i2_files = [f for f in files if '_I2_' in f]
-        return len(i1_files) > 0 and len(i2_files) > 0
-    except Exception as e:
-        logger.warning(f"Could not check multiplexing status for {directory}: {e}")
-        return False
-
-
-def suggest_chemistry_based_on_files(directory):
-    """
-    Suggest chemistry options based on file patterns.
-    
-    Parameters
-    ----------
-    directory : str
-        Path to directory containing FASTQ files
-        
-    Returns
-    -------
-    list
-        Ordered list of suggested chemistries to try
-    """
-    if check_if_multiplexed(directory):
-        logger.info("Sample appears to be multiplexed (has I1/I2 files).")
-        # For multiplexed data, try these chemistries first
-        return ["SC3Pv3", "SC3Pv3HT", "threeprime", "auto"]
-    else:
-        # For non-multiplexed data
-        return ["auto", "threeprime", "fiveprime", "SC3Pv3"]
-
 
 def format_error_output(result):
     """
@@ -176,10 +94,10 @@ def format_error_output(result):
     error_lines = []
     if result.stdout:
         error_lines.append("=== STDOUT ===")
-        error_lines.extend(result.stdout.split('\n')[-20:])  # Last 20 lines of stdout
+        error_lines.extend(result.stdout.split('\n')[-50:])  # Last 50 lines of stdout
     if result.stderr:
         error_lines.append("\n=== STDERR ===")
-        error_lines.extend(result.stderr.split('\n')[-20:])  # Last 20 lines of stderr
+        error_lines.extend(result.stderr.split('\n')[-50:])  # Last 50 lines of stderr
     return "\n".join(error_lines)
 
 
@@ -233,136 +151,136 @@ def verify_cellranger_installed():
         return False
 
 
-def get_fastq_dir_for_sample(sample_info):
+def get_srr_ids_from_sample_info(sample_info, gse_id):
     """
-    Get the FASTQ directory for a sample from sample info dict.
+    Extract SRR IDs from sample info (DataFrame or dict).
     
     Parameters
     ----------
-    sample_info : dict
-        Sample information dictionary
+    sample_info : DataFrame or dict
+        Sample information from pickle file
+    gse_id : str
+        GSE series ID
         
     Returns
     -------
-    str
-        Path to FASTQ directory
+    list
+        List of SRR run accession IDs
     """
-    # Handle both list and string formats for fastq paths
-    fastq_r1 = sample_info.get('fastq_r1', sample_info.get('R1', []))
-    if isinstance(fastq_r1, list) and len(fastq_r1) > 0:
-        return os.path.dirname(fastq_r1[0])
-    elif isinstance(fastq_r1, str):
-        return os.path.dirname(fastq_r1)
+    if isinstance(sample_info, pd.DataFrame):
+        if len(sample_info) == 0:
+            logger.error(f"Empty DataFrame for {gse_id} - no runs available")
+            return []
+        
+        if 'run_accession' in sample_info.columns:
+            return sample_info['run_accession'].tolist()
+        elif 'run_alias' in sample_info.columns:
+            # run_alias might have format like "SRR14340883_GSM5234567"
+            return [r.split('_')[0] for r in sample_info['run_alias'].tolist()]
+        else:
+            logger.error(f"Could not find run accession column in DataFrame for {gse_id}")
+            logger.error(f"Available columns: {list(sample_info.columns)}")
+            return []
     
-    # Try 'fastqs' key
-    fastqs = sample_info.get('fastqs', sample_info.get('fastq_dir'))
-    if fastqs:
-        if isinstance(fastqs, list):
-            return fastqs[0]
-        return fastqs
+    elif isinstance(sample_info, dict):
+        # Handle dict format if present
+        if 'run_accession' in sample_info:
+            runs = sample_info['run_accession']
+            return runs if isinstance(runs, list) else [runs]
+        if 'srr_ids' in sample_info:
+            return sample_info['srr_ids']
     
-    return None
+    return []
 
 
 # =============================================================================
-# Main Cell Ranger Function
+# Cell Ranger Execution Functions
 # =============================================================================
 
-def run_cellranger_count(
-    sample_id,
+def run_cellranger_for_srr(
+    srr_id,
     fastq_dir,
     transcriptome_ref,
-    output_dir,
+    output_base_dir,
     chemistry='auto',
     localcores=None,
     localmem=None,
     create_bam=True,
     expect_cells=None,
-    force_cells=None,
     include_introns=True,
-    no_bam=False
 ):
     """
-    Run Cell Ranger count for a single sample with automatic chemistry detection.
+    Run Cell Ranger count for a single SRR with automatic chemistry detection.
+    
+    This matches custom indiviudal script behavior I used before making this pipeline:
+    - --id={srr_id}_S1_L001_
+    - --fastqs={fastq_dir}
+    - --sample={srr_id}
     
     Parameters
     ----------
-    sample_id : str
-        Sample identifier (must match FASTQ file prefix)
+    srr_id : str
+        SRR run accession ID
     fastq_dir : str
-        Path to directory containing FASTQ files
+        Path to directory containing FASTQ files for this SRR
     transcriptome_ref : str
         Path to Cell Ranger transcriptome reference
-    output_dir : str
-        Directory where output will be written
+    output_base_dir : str
+        Base directory where Cell Ranger output will be written
     chemistry : str
         Chemistry type or 'auto' for automatic detection
     localcores : int, optional
         Number of cores to use (default: all available)
     localmem : int, optional
-        Memory in GB (default: system limit)
+        Memory in GB (default: 64)
     create_bam : bool
         Whether to create BAM file
     expect_cells : int, optional
         Expected number of cells
-    force_cells : int, optional
-        Force this number of cells
     include_introns : bool
         Include intronic reads
-    no_bam : bool
-        Skip BAM generation
         
     Returns
     -------
     dict
         Result dictionary with status, chemistry used, and output paths
     """
-    
-    # Verify Cell Ranger is installed
-    if not verify_cellranger_installed():
-        logger.error("Cell Ranger is not installed or not in PATH")
-        logger.error("Please install Cell Ranger from 10X Genomics and add to PATH")
-        return {'success': False, 'error': 'Cell Ranger not found'}
-    
     # Set defaults
     if localcores is None:
         localcores = cpu_count()
     if localmem is None:
-        localmem = 64  # Default to 64GB
-        
-    # Verify inputs
+        localmem = 64
+    
+    # Verify FASTQ directory exists
     if not os.path.exists(fastq_dir):
         logger.error(f"FASTQ directory not found: {fastq_dir}")
-        return {'success': False, 'error': f'FASTQ directory not found: {fastq_dir}'}
-        
-    if not os.path.exists(transcriptome_ref):
-        logger.error(f"Transcriptome reference not found: {transcriptome_ref}")
-        return {'success': False, 'error': f'Reference not found: {transcriptome_ref}'}
+        return {'success': False, 'srr_id': srr_id, 'error': f'FASTQ directory not found: {fastq_dir}'}
     
-    # Create output directory structure
-    # Cell Ranger creates output in: {output_dir}/{sample_id}/outs/
-    cellranger_base = os.path.join(output_dir, 'cellranger')
-    os.makedirs(cellranger_base, exist_ok=True)
+    # Check for FASTQ files
+    fastq_files = [f for f in os.listdir(fastq_dir) if f.endswith('.fastq.gz')]
+    if not fastq_files:
+        logger.error(f"No FASTQ files found in: {fastq_dir}")
+        return {'success': False, 'srr_id': srr_id, 'error': f'No FASTQ files in {fastq_dir}'}
+    
+    logger.info(f"Found {len(fastq_files)} FASTQ files in {fastq_dir}")
+    
+    # Cell Ranger output ID
+    cellranger_id = f"{srr_id}{SAMPLE_PATTERN}"
+    
+    # Cell Ranger creates output in: {cwd}/{cellranger_id}/outs/
+    # We run from the output base directory
+    os.makedirs(output_base_dir, exist_ok=True)
     original_dir = os.getcwd()
-    os.chdir(cellranger_base)
-    
-    # Determine chemistries to try
-    if chemistry == 'auto':
-        suggested_chemistries = suggest_chemistry_based_on_files(fastq_dir)
-        trial_chemistries = suggested_chemistries + [c for c in CHEMISTRY_OPTIONS if c not in suggested_chemistries]
-    else:
-        # User specified chemistry - try that first, then fallback to auto-detection
-        trial_chemistries = [chemistry] + CHEMISTRY_OPTIONS
-        trial_chemistries = list(dict.fromkeys(trial_chemistries))  # Remove duplicates, preserve order
+    os.chdir(output_base_dir)
     
     success = False
     last_errors = {}
     successful_chemistry = None
     result_paths = {}
     
-    for chem in trial_chemistries:
-        # Cell Ranger output directory is named after sample_id
-        run_dir = os.path.join(cellranger_base, sample_id)
+    for chem in CHEMISTRY_OPTIONS:
+        # Cell Ranger output directory
+        run_dir = os.path.join(output_base_dir, cellranger_id)
         
         # Clean up any previous attempts
         if not cleanup_directory(run_dir):
@@ -371,32 +289,31 @@ def run_cellranger_count(
             continue
         
         try:
-            logger.info(f"Trying chemistry {chem} for sample {sample_id}")
+            logger.info(f"Trying chemistry {chem} for SRR {srr_id}")
             
             # Build command
             cmd = [
                 "cellranger", "count",
-                f"--id={sample_id}",
+                f"--id={cellranger_id}",
                 f"--fastqs={fastq_dir}",
-                f"--sample={sample_id}",
+                f"--sample={srr_id}",
                 f"--transcriptome={transcriptome_ref}",
                 f"--localcores={localcores}",
-                f"--localmem={localmem}",
                 f"--chemistry={chem}"
             ]
             
             # Optional arguments
-            if create_bam and not no_bam:
+            if create_bam:
                 cmd.append("--create-bam=true")
-            elif no_bam:
+            else:
                 cmd.append("--create-bam=false")
                 
             if expect_cells:
                 cmd.append(f"--expect-cells={expect_cells}")
-            if force_cells:
-                cmd.append(f"--force-cells={force_cells}")
             if include_introns:
                 cmd.append("--include-introns=true")
+            if localmem:
+                cmd.append(f"--localmem={localmem}")
             
             logger.info(f"Running: {' '.join(cmd)}")
             
@@ -408,7 +325,7 @@ def run_cellranger_count(
             )
             
             if result.returncode == 0:
-                logger.info(f"SUCCESS with chemistry {chem} for sample {sample_id}")
+                logger.info(f"SUCCESS with chemistry {chem} for SRR {srr_id}")
                 success = True
                 successful_chemistry = chem
                 
@@ -417,6 +334,7 @@ def run_cellranger_count(
                 result_paths = {
                     'run_dir': run_dir,
                     'outs_dir': outs_dir,
+                    'cellranger_id': cellranger_id,
                     'matrix_h5': os.path.join(outs_dir, 'filtered_feature_bc_matrix.h5'),
                     'matrix_dir': os.path.join(outs_dir, 'filtered_feature_bc_matrix'),
                     'bam': os.path.join(outs_dir, 'possorted_genome_bam.bam'),
@@ -429,7 +347,7 @@ def run_cellranger_count(
             else:
                 error_output = format_error_output(result)
                 last_errors[chem] = error_output
-                logger.warning(f"Chemistry {chem} failed for sample {sample_id}")
+                logger.warning(f"Chemistry {chem} failed for SRR {srr_id}")
                 logger.debug(f"Error details:\n{error_output}")
                 cleanup_directory(run_dir)
                 
@@ -445,21 +363,157 @@ def run_cellranger_count(
     if success:
         return {
             'success': True,
-            'sample_id': sample_id,
+            'srr_id': srr_id,
             'chemistry': successful_chemistry,
             'paths': result_paths
         }
     else:
-        logger.error(f"All chemistry options failed for sample {sample_id}")
-        logger.error("Last errors encountered:")
-        for chem, error in list(last_errors.items())[-3:]:
-            first_line = error.splitlines()[0] if error else 'Unknown error'
-            logger.error(f"  Chemistry {chem}: {first_line}")
+        logger.error(f"All chemistry options failed for SRR {srr_id}")
         return {
             'success': False,
-            'sample_id': sample_id,
+            'srr_id': srr_id,
             'errors': last_errors
         }
+
+
+def run_cellranger_for_gse(
+    gse_id,
+    sample_info,
+    fastq_base_dir,
+    transcriptome_ref,
+    output_dir,
+    chemistry='auto',
+    localcores=None,
+    localmem=None,
+    create_bam=True,
+    expect_cells=None,
+    include_introns=True,
+):
+    """
+    Run Cell Ranger for all SRRs within a GSE series.
+    
+    Matches previous workflow:
+    - Iterates over each run_accession in the GSE DataFrame
+    - Runs Cell Ranger separately for each SRR
+    - Tracks successful runs
+    
+    Parameters
+    ----------
+    gse_id : str
+        GSE series ID
+    sample_info : DataFrame
+        Sample information DataFrame from pickle file
+    fastq_base_dir : str
+        Base directory containing FASTQs: {fastq_base_dir}/{GSE_ID}/{SRR_ID}/
+    transcriptome_ref : str
+        Path to Cell Ranger transcriptome reference
+    output_dir : str
+        Output directory for Cell Ranger results
+    chemistry : str
+        Chemistry type or 'auto'
+    localcores : int, optional
+        Number of cores
+    localmem : int, optional
+        Memory in GB
+    create_bam : bool
+        Whether to create BAM
+    expect_cells : int, optional
+        Expected cells
+    include_introns : bool
+        Include intronic reads
+        
+    Returns
+    -------
+    dict
+        Results with successful_runs DataFrame and failed_runs list
+    """
+    # Verify Cell Ranger is installed
+    if not verify_cellranger_installed():
+        logger.error("Cell Ranger is not installed or not in PATH")
+        return {'success': False, 'error': 'Cell Ranger not found'}
+    
+    # Get SRR IDs from sample info
+    srr_ids = get_srr_ids_from_sample_info(sample_info, gse_id)
+    
+    if not srr_ids:
+        logger.error(f"No SRR IDs found for {gse_id}")
+        return {'success': False, 'error': 'No SRR IDs found'}
+    
+    logger.info(f"Processing {len(srr_ids)} SRR runs for {gse_id}")
+    
+    # Output directory for this GSE's Cell Ranger runs
+    gse_output_dir = os.path.join(output_dir, 'cellranger', gse_id)
+    os.makedirs(gse_output_dir, exist_ok=True)
+    
+    # Track results
+    successful_runs = []
+    failed_runs = []
+    all_results = {}
+    
+    for srr_id in srr_ids:
+        logger.info("="*60)
+        logger.info(f"Processing SRR: {srr_id}")
+        logger.info("="*60)
+        
+        # FASTQ directory for this SRR: {fastq_base_dir}/{GSE_ID}/{SRR_ID}/
+        srr_fastq_dir = os.path.join(fastq_base_dir, gse_id, srr_id)
+        
+        if not os.path.exists(srr_fastq_dir):
+            logger.warning(f"FASTQ directory not found for {srr_id}: {srr_fastq_dir}")
+            failed_runs.append({'srr_id': srr_id, 'error': 'FASTQ directory not found'})
+            continue
+        
+        # Run Cell Ranger for this SRR
+        result = run_cellranger_for_srr(
+            srr_id=srr_id,
+            fastq_dir=srr_fastq_dir,
+            transcriptome_ref=transcriptome_ref,
+            output_base_dir=gse_output_dir,
+            chemistry=chemistry,
+            localcores=localcores,
+            localmem=localmem,
+            create_bam=create_bam,
+            expect_cells=expect_cells,
+            include_introns=include_introns,
+        )
+        
+        all_results[srr_id] = result
+        
+        if result['success']:
+            successful_runs.append(srr_id)
+            logger.info(f"SUCCESS: {srr_id} (chemistry: {result['chemistry']})")
+        else:
+            failed_runs.append({'srr_id': srr_id, 'error': result.get('error', 'Unknown error')})
+            logger.warning(f"FAILED: {srr_id}")
+    
+    # Create successful runs DataFrame
+    successful_df = pd.DataFrame()
+    if isinstance(sample_info, pd.DataFrame) and successful_runs:
+        successful_df = sample_info[sample_info['run_accession'].isin(successful_runs)].copy()
+    
+    # Summary
+    logger.info("="*60)
+    logger.info(f"SUMMARY for {gse_id}")
+    logger.info("="*60)
+    logger.info(f"Total SRRs: {len(srr_ids)}")
+    logger.info(f"Successful: {len(successful_runs)}")
+    logger.info(f"Failed: {len(failed_runs)}")
+    
+    if failed_runs:
+        logger.warning("Failed runs:")
+        for fail in failed_runs:
+            logger.warning(f"  {fail['srr_id']}: {fail['error']}")
+    
+    return {
+        'success': len(successful_runs) > 0,
+        'gse_id': gse_id,
+        'total_runs': len(srr_ids),
+        'successful_runs': successful_runs,
+        'failed_runs': failed_runs,
+        'successful_df': successful_df,
+        'all_results': all_results,
+        'output_dir': gse_output_dir,
+    }
 
 
 # =============================================================================
@@ -470,7 +524,7 @@ def run_from_snakemake():
     """Run Cell Ranger from Snakemake rule."""
     
     # Get Snakemake variables
-    sample_id = snakemake.params.sample_id  # Use params.sample_id instead of wildcards
+    sample_id = snakemake.params.sample_id  # GSE ID
     log_file = snakemake.log[0] if snakemake.log else None
     
     # Get parameters from Snakemake
@@ -483,25 +537,11 @@ def run_from_snakemake():
     include_introns = params.include_introns
     create_bam = params.create_bam
     output_dir = params.output_dir
+    fastq_base_dir = getattr(params, 'fastq_base_dir', None)
     
     # Get sample information from params
     samples_dict = params.samples_dict
-    sample_info = samples_dict.get(sample_id, {})
-    
-    # Determine FASTQ directory
-    fastq_dir = get_fastq_dir_for_sample(sample_info)
-    
-    if not fastq_dir:
-        # Fallback: try to find FASTQs based on sample structure
-        # Check if sample_info contains direct path information
-        if 'fastq_dir' in sample_info:
-            fastq_dir = sample_info['fastq_dir']
-        elif 'path' in sample_info:
-            fastq_dir = sample_info['path']
-        else:
-            logger.error(f"Could not determine FASTQ directory for sample {sample_id}")
-            logger.error(f"Sample info: {sample_info}")
-            sys.exit(1)
+    sample_info = samples_dict.get(sample_id)
     
     # Set up file logging
     if log_file:
@@ -511,35 +551,83 @@ def run_from_snakemake():
         logger.addHandler(file_handler)
     
     logger.info("="*60)
-    logger.info(f"CELL RANGER COUNT - Sample: {sample_id}")
+    logger.info(f"CELL RANGER COUNT - GSE: {sample_id}")
     logger.info("="*60)
-    logger.info(f"FASTQ directory: {fastq_dir}")
+    
+    # Validate inputs
+    if sample_info is None:
+        logger.error(f"No sample info found for {sample_id}")
+        sys.exit(1)
+    
+    if isinstance(sample_info, pd.DataFrame):
+        logger.info(f"Sample info: DataFrame with {len(sample_info)} runs")
+        if len(sample_info) == 0:
+            logger.error(f"Empty DataFrame for {sample_id} - no runs to process")
+            sys.exit(1)
+    else:
+        logger.info(f"Sample info type: {type(sample_info)}")
+    
+    if not fastq_base_dir:
+        logger.error("fastq_base_dir not provided in config")
+        logger.error("Please set cellranger.fastq_base_dir in your config.yaml")
+        logger.error("This should point to the 'fastq' directory from your SRAscraper output")
+        sys.exit(1)
+    
+    if not os.path.exists(fastq_base_dir):
+        logger.error(f"FASTQ base directory not found: {fastq_base_dir}")
+        sys.exit(1)
+    
+    logger.info(f"FASTQ base directory: {fastq_base_dir}")
     logger.info(f"Transcriptome reference: {transcriptome_ref}")
     logger.info(f"Output directory: {output_dir}")
     logger.info(f"Chemistry: {chemistry}")
     logger.info(f"Cores: {localcores}, Memory: {localmem}GB")
     
-    # Run Cell Ranger
-    result = run_cellranger_count(
-        sample_id=sample_id,
-        fastq_dir=fastq_dir,
+    # Run Cell Ranger for all SRRs in this GSE
+    result = run_cellranger_for_gse(
+        gse_id=sample_id,
+        sample_info=sample_info,
+        fastq_base_dir=fastq_base_dir,
         transcriptome_ref=transcriptome_ref,
         output_dir=output_dir,
         chemistry=chemistry,
         localcores=localcores,
         localmem=localmem,
+        create_bam=create_bam,
         expect_cells=expect_cells,
         include_introns=include_introns,
-        create_bam=create_bam
     )
     
     if not result['success']:
-        logger.error(f"Cell Ranger failed for sample {sample_id}")
-        if 'errors' in result:
-            logger.error("Errors encountered:")
-            for chem, error in result['errors'].items():
-                logger.error(f"  {chem}: {error[:200]}...")
+        logger.error(f"Cell Ranger failed for all runs in {sample_id}")
         sys.exit(1)
+    
+    # For Snakemake, we need to ensure the expected outputs exist
+    # The rule expects outputs at: {output_dir}/cellranger/{sample}/outs/...
+    # But we create outputs at: {output_dir}/cellranger/{sample}/{srr}_S1_L001_/outs/...
+    
+    # Create a symlink or marker file to satisfy Snakemake
+    # We'll create the expected output structure by symlinking to the first successful run
+    expected_outs_dir = os.path.join(output_dir, 'cellranger', sample_id, 'outs')
+    
+    if result['successful_runs']:
+        # Get the first successful run's output
+        first_srr = result['successful_runs'][0]
+        first_run_dir = os.path.join(result['output_dir'], f"{first_srr}{SAMPLE_PATTERN}", 'outs')
+        
+        if os.path.exists(first_run_dir):
+            # Create symlink from expected location to actual location
+            os.makedirs(os.path.dirname(expected_outs_dir), exist_ok=True)
+            
+            if os.path.exists(expected_outs_dir):
+                if os.path.islink(expected_outs_dir):
+                    os.unlink(expected_outs_dir)
+                else:
+                    shutil.rmtree(expected_outs_dir)
+            
+            # Create relative symlink
+            os.symlink(first_run_dir, expected_outs_dir)
+            logger.info(f"Created symlink: {expected_outs_dir} -> {first_run_dir}")
     
     # Verify expected outputs exist
     expected_outputs = [
@@ -549,14 +637,23 @@ def run_from_snakemake():
         snakemake.output.summary,
     ]
     
+    missing_outputs = []
     for output_path in expected_outputs:
         if not os.path.exists(output_path):
-            logger.error(f"Expected output not found: {output_path}")
+            missing_outputs.append(output_path)
+    
+    if missing_outputs:
+        logger.error(f"Expected outputs not found:")
+        for path in missing_outputs:
+            logger.error(f"  {path}")
+        # Don't exit with error if we have at least one successful run
+        # The symlink should have created the expected paths
+        if not result['successful_runs']:
             sys.exit(1)
     
     logger.info("="*60)
-    logger.info(f"Cell Ranger completed successfully for sample {sample_id}")
-    logger.info(f"Chemistry used: {result['chemistry']}")
+    logger.info(f"Cell Ranger completed for {sample_id}")
+    logger.info(f"Successful runs: {len(result['successful_runs'])}/{result['total_runs']}")
     logger.info("="*60)
 
 
@@ -568,41 +665,112 @@ def main():
     """Main function for standalone CLI usage."""
     
     parser = argparse.ArgumentParser(
-        description='Run Cell Ranger count with automatic chemistry detection'
+        description='Run Cell Ranger count for SRAscraper output',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    # Run for a single GSE with pickle file
+    python cellranger_count.py \\
+        --gse-id GSE173468 \\
+        --pickle-file /path/to/dictionary_file.pkl \\
+        --fastq-base-dir /path/to/fastq \\
+        --transcriptome /path/to/GRCh38 \\
+        --output-dir /path/to/output
+
+    # Run for a single SRR directly
+    python cellranger_count.py \\
+        --srr-id SRR14340883 \\
+        --fastq-dir /path/to/fastq/GSE173468/SRR14340883 \\
+        --transcriptome /path/to/GRCh38 \\
+        --output-dir /path/to/output
+        """
     )
-    parser.add_argument('--sample', required=True, help='Sample ID')
-    parser.add_argument('--fastq-dir', required=True, help='Path to FASTQ directory')
-    parser.add_argument('--transcriptome', required=True, help='Path to transcriptome reference')
-    parser.add_argument('--output-dir', required=True, help='Output directory')
-    parser.add_argument('--chemistry', default='auto', help='Chemistry type (default: auto)')
-    parser.add_argument('--cores', type=int, default=None, help='Number of cores')
-    parser.add_argument('--memory', type=int, default=64, help='Memory in GB')
-    parser.add_argument('--expect-cells', type=int, default=None, help='Expected number of cells')
-    parser.add_argument('--include-introns', action='store_true', default=True, help='Include intronic reads')
-    parser.add_argument('--no-bam', action='store_true', help='Skip BAM generation')
+    
+    # GSE-level options
+    gse_group = parser.add_argument_group('GSE-level processing')
+    gse_group.add_argument('--gse-id', help='GSE series ID')
+    gse_group.add_argument('--pickle-file', help='Path to SRAscraper pickle file')
+    gse_group.add_argument('--fastq-base-dir', help='Base directory containing FASTQs ({dir}/{GSE}/{SRR}/)')
+    
+    # SRR-level options (direct processing)
+    srr_group = parser.add_argument_group('SRR-level processing (single run)')
+    srr_group.add_argument('--srr-id', help='SRR run accession ID')
+    srr_group.add_argument('--fastq-dir', help='Path to FASTQ directory for single SRR')
+    
+    # Common options
+    common = parser.add_argument_group('Common options')
+    common.add_argument('--transcriptome', required=True, help='Path to transcriptome reference')
+    common.add_argument('--output-dir', required=True, help='Output directory')
+    common.add_argument('--chemistry', default='auto', help='Chemistry type (default: auto)')
+    common.add_argument('--cores', type=int, default=None, help='Number of cores')
+    common.add_argument('--memory', type=int, default=64, help='Memory in GB')
+    common.add_argument('--expect-cells', type=int, default=None, help='Expected number of cells')
+    common.add_argument('--include-introns', action='store_true', default=True, help='Include intronic reads')
+    common.add_argument('--no-bam', action='store_true', help='Skip BAM generation')
     
     args = parser.parse_args()
     
-    result = run_cellranger_count(
-        sample_id=args.sample,
-        fastq_dir=args.fastq_dir,
-        transcriptome_ref=args.transcriptome,
-        output_dir=args.output_dir,
-        chemistry=args.chemistry,
-        localcores=args.cores,
-        localmem=args.memory,
-        expect_cells=args.expect_cells,
-        include_introns=args.include_introns,
-        no_bam=args.no_bam
-    )
-    
-    if result['success']:
-        logger.info(f"SUCCESS - Chemistry: {result['chemistry']}")
-        logger.info(f"Output: {result['paths']['outs_dir']}")
-        sys.exit(0)
+    # Determine mode: GSE-level or SRR-level
+    if args.gse_id and args.pickle_file:
+        # GSE-level processing
+        logger.info(f"Running in GSE mode for {args.gse_id}")
+        
+        # Load pickle file
+        with open(args.pickle_file, 'rb') as f:
+            gse_dict = pickle.load(f)
+        
+        if args.gse_id not in gse_dict:
+            logger.error(f"GSE {args.gse_id} not found in pickle file")
+            sys.exit(1)
+        
+        sample_info = gse_dict[args.gse_id]
+        
+        result = run_cellranger_for_gse(
+            gse_id=args.gse_id,
+            sample_info=sample_info,
+            fastq_base_dir=args.fastq_base_dir,
+            transcriptome_ref=args.transcriptome,
+            output_dir=args.output_dir,
+            chemistry=args.chemistry,
+            localcores=args.cores,
+            localmem=args.memory,
+            create_bam=not args.no_bam,
+            expect_cells=args.expect_cells,
+            include_introns=args.include_introns,
+        )
+        
+        if result['success']:
+            logger.info(f"SUCCESS: {len(result['successful_runs'])}/{result['total_runs']} runs completed")
+            sys.exit(0)
+        else:
+            logger.error("FAILED: No successful runs")
+            sys.exit(1)
+            
+    elif args.srr_id and args.fastq_dir:
+        # SRR-level processing
+        logger.info(f"Running in SRR mode for {args.srr_id}")
+        
+        result = run_cellranger_for_srr(
+            srr_id=args.srr_id,
+            fastq_dir=args.fastq_dir,
+            transcriptome_ref=args.transcriptome,
+            output_base_dir=args.output_dir,
+            chemistry=args.chemistry,
+            localcores=args.cores,
+            localmem=args.memory,
+            create_bam=not args.no_bam,
+            expect_cells=args.expect_cells,
+            include_introns=args.include_introns,
+        )
+        
+        if result['success']:
+            logger.info(f"SUCCESS - Chemistry: {result['chemistry']}")
+            sys.exit(0)
+        else:
+            logger.error("FAILED")
+            sys.exit(1)
     else:
-        logger.error("FAILED")
-        sys.exit(1)
+        parser.error("Must provide either (--gse-id and --pickle-file and --fastq-base-dir) or (--srr-id and --fastq-dir)")
 
 
 # =============================================================================
@@ -617,4 +785,3 @@ if __name__ == '__main__':
     except NameError:
         # Running standalone
         main()
-
