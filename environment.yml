@@ -22,7 +22,8 @@ dependencies:
   - click>=8.0
   - pyyaml
   - rich  # For nice CLI output
-  
+  - coincbc
+
   # ===========================================
   # Data Handling
   # ===========================================

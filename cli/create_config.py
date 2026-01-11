@@ -209,6 +209,22 @@ def create_config(args):
     print(f"  Hugging Face repo: {args.popv_huggingface_repo}")
     print(f"  Prediction mode: {args.popv_prediction_mode}")
     
+    # Determine fastq_base_dir
+    fastq_base_dir = args.fastq_base_dir
+    if not fastq_base_dir and sample_info_path:
+        # Try to auto-derive from sample_info path
+        # SRAscraper structure: {output_dir}/metadata/dictionary_file.pkl
+        #                       {output_dir}/fastq/{GSE_ID}/{SRR_ID}/
+        sample_info_dir = os.path.dirname(os.path.abspath(sample_info_path))
+        potential_fastq_dir = os.path.join(os.path.dirname(sample_info_dir), "fastq")
+        if os.path.exists(potential_fastq_dir):
+            fastq_base_dir = potential_fastq_dir
+            print(f"\n  Auto-derived fastq_base_dir: {fastq_base_dir}")
+        else:
+            print(f"\n  WARNING: Could not auto-derive fastq_base_dir")
+            print(f"    Checked: {potential_fastq_dir}")
+            print(f"    You may need to set --fastq-base-dir manually")
+    
     # Build configuration
     print("\nBuilding configuration...")
     
@@ -225,6 +241,10 @@ def create_config(args):
         'sample_info': sample_info_path,
         'sample_ids': sample_ids,
         'samples': {},
+        
+        # FASTQ base directory for SRAscraper format (top level)
+        # Structure: {fastq_base_dir}/{GSE_ID}/{SRR_ID}/*.fastq.gz
+        'fastq_base_dir': fastq_base_dir,
         
         # Reference files (simplified)
         'reference': {
@@ -468,6 +488,9 @@ Examples:
     cellranger.add_argument('--chemistry', default='auto', help='Chemistry (default: auto)')
     cellranger.add_argument('--expect-cells', type=int, default=10000, help='Expected cells (default: 10000)')
     cellranger.add_argument('--include-introns', action='store_true', help='Include introns')
+    cellranger.add_argument('--fastq-base-dir', 
+                            help='Base directory containing FASTQ files. For SRAscraper: {dir}/{GSE_ID}/{SRR_ID}/. '
+                                 'If not provided and --sample-pickle is used, will attempt to auto-derive.')
     
     # ==========================================================================
     # QC settings

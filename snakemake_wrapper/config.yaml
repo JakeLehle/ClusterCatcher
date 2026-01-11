@@ -28,10 +28,18 @@ memory_gb: 64
 # =============================================================================
 # SAMPLE SPECIFICATION
 # =============================================================================
+# For SRAscraper users: provide sample_info (pickle) AND fastq_base_dir
+# For manual users: provide sample_ids list
 
-sample_info: null  # "/path/to/samples.pkl" - <REQUIRED if sample_ids not provided>
-sample_ids: []     # <REQUIRED if sample_info not provided>
+sample_info: null  # "/path/to/dictionary_file_filtered.pkl" - SRAscraper metadata pickle
+sample_ids: []     # Manual list of sample IDs (alternative to sample_info)
 samples: {}
+
+# FASTQ base directory for SRAscraper format
+# Structure: {fastq_base_dir}/{GSE_ID}/{SRR_ID}/*.fastq.gz
+# This is typically the 'fastq' subdirectory of your SRAscraper output
+# If null and sample_info is provided, will attempt to auto-derive as {sample_info_dir}/../fastq
+fastq_base_dir: null  # e.g., "/path/to/srascraper_output/fastq" - <REQUIRED for SRAscraper>
 
 # =============================================================================
 # REFERENCE FILES
