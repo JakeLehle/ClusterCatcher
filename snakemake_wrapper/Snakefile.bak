@@ -42,61 +42,20 @@ os.makedirs(LOG_DIR, exist_ok=True)
 SAMPLE_INFO_PATH = config.get("sample_info")
 if SAMPLE_INFO_PATH and os.path.exists(SAMPLE_INFO_PATH):
     with open(SAMPLE_INFO_PATH, 'rb') as f:
-        SAMPLES_RAW = pickle.load(f)
-    
-    # Filter out empty DataFrames (SRAscraper format)
-    # A sample is valid if it's a non-empty DataFrame or a non-empty dict
-    SAMPLES = {}
-    for key, value in SAMPLES_RAW.items():
-        if hasattr(value, 'empty'):  # It's a DataFrame
-            if not value.empty:
-                SAMPLES[key] = value
-            else:
-                print(f"WARNING: Skipping {key} - empty DataFrame (no successful Cell Ranger runs)")
-        elif isinstance(value, dict) and value:  # Non-empty dict
-            SAMPLES[key] = value
-        elif isinstance(value, (list, tuple)) and value:  # Non-empty list/tuple
-            SAMPLES[key] = value
-        else:
-            print(f"WARNING: Skipping {key} - empty or invalid sample info")
-    
+        SAMPLES = pickle.load(f)
     SAMPLE_IDS = list(SAMPLES.keys())
-    print(f"Loaded {len(SAMPLE_IDS)} valid samples from pickle (filtered from {len(SAMPLES_RAW)} total)")
 else:
     SAMPLES = config.get("samples", {})
     SAMPLE_IDS = config.get("sample_ids", list(SAMPLES.keys()))
 
 if not SAMPLE_IDS:
-    raise ValueError("No valid sample IDs found. Provide either 'sample_info' pickle with non-empty samples or 'sample_ids' list in config.")
+    raise ValueError("No sample IDs found. Provide either 'sample_info' pickle or 'sample_ids' list in config.")
 
 # Reference paths
 TRANSCRIPTOME_REF = config.get("reference", {}).get("cellranger")
 REFERENCE_FASTA = config.get("reference", {}).get("fasta")
 GENOME_BUILD = config.get("reference", {}).get("genome", "GRCh38")
 GTF_PATH = config.get("reference", {}).get("gtf")
-
-# FASTQ base directory for SRAscraper format
-# Can be specified at top level or under cellranger section
-# If not specified, attempt to auto-derive from sample_info path
-FASTQ_BASE_DIR = (
-    config.get("fastq_base_dir") or 
-    config.get("cellranger", {}).get("fastq_base_dir")
-)
-
-# Auto-derive fastq_base_dir from sample_info path if not specified
-# SRAscraper structure: {output_dir}/metadata/dictionary_file.pkl
-#                       {output_dir}/fastq/{GSE_ID}/{SRR_ID}/
-if not FASTQ_BASE_DIR and SAMPLE_INFO_PATH:
-    # Try to derive: {sample_info_dir}/../fastq
-    sample_info_dir = os.path.dirname(os.path.abspath(SAMPLE_INFO_PATH))
-    potential_fastq_dir = os.path.join(os.path.dirname(sample_info_dir), "fastq")
-    if os.path.exists(potential_fastq_dir):
-        FASTQ_BASE_DIR = potential_fastq_dir
-        print(f"Auto-derived fastq_base_dir: {FASTQ_BASE_DIR}")
-    else:
-        print(f"WARNING: Could not auto-derive fastq_base_dir from sample_info path")
-        print(f"  Checked: {potential_fastq_dir}")
-        print(f"  Please set 'fastq_base_dir' in your config.yaml")
 
 # Database paths
 KRAKEN2_DB = config.get("viral", {}).get("kraken_db")
@@ -199,11 +158,6 @@ rule cellranger_count:
     gene expression matrices. Uses automatic chemistry detection with fallback
     options if the specified chemistry fails.
     
-    For SRAscraper users:
-    - Processes each SRR within the GSE separately
-    - FASTQ structure: {fastq_base_dir}/{GSE_ID}/{SRR_ID}/*.fastq.gz
-    - Cell Ranger ID: {SRR_ID}_S1_L001_
-    
     Note: Cell Ranger must be installed separately and available in PATH.
     See: https://support.10xgenomics.com/single-cell-gene-expression/software/downloads/latest
     """
@@ -223,8 +177,6 @@ rule cellranger_count:
         create_bam=config.get("cellranger", {}).get("create_bam", True),
         samples_dict=SAMPLES,
         output_dir=OUTPUT_DIR,
-        # FASTQ base directory - uses top-level variable (auto-derived or from config)
-        fastq_base_dir=FASTQ_BASE_DIR,
     log:
         f"{LOG_DIR}/cellranger/{{sample}}.log"
     threads: THREADS

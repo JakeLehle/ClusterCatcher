@@ -51,7 +51,7 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 # List of all possible chemistry options to try (in order of likelihood)
-# Matches the order from Jake's original script
+# Matches the order from original script
 CHEMISTRY_OPTIONS = [
     "auto",           # Try auto first
     "SC3Pv4",
