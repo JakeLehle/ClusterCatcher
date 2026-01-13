@@ -873,6 +873,9 @@ def run_qc_annotation_pipeline(
     
     # Save final annotated data
     logger.info(f"\nSaving annotated data to {output_adata_path}...")
+    adata.var.index = adata.var.index.astype(str)
+    if adata.raw is not None:
+        adata.raw.var.index = adata.raw.var.index.astype(str)
     adata.write(output_adata_path)
     
     logger.info("\n" + "="*60)
