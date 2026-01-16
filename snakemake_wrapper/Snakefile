@@ -481,7 +481,7 @@ rule summarize_viral:
     log:
         f"{LOG_DIR}/viral/summarize.log"
     conda:
-        "envs/kraken2.yaml"
+        "envs/sc_pre.yaml"
     script:
         "scripts/summarize_viral_detection.py"
 
