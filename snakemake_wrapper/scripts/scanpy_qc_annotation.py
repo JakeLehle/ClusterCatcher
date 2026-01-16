@@ -876,6 +876,9 @@ def run_qc_annotation_pipeline(
     adata.var.index = adata.var.index.astype(str)
     if adata.raw is not None:
         adata.raw.var.index = adata.raw.var.index.astype(str)
+    for col in adata.obs.columns:
+        if adata.obs[col].dtype == object:
+            adata.obs[col] = adata.obs[col].fillna('').astype(str)
     adata.write(output_adata_path)
     
     logger.info("\n" + "="*60)
