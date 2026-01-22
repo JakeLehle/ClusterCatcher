@@ -75,11 +75,35 @@ REFERENCE_FASTA = config.get("reference", {}).get("fasta")
 GENOME_BUILD = config.get("reference", {}).get("genome", "GRCh38")
 GTF_PATH = config.get("reference", {}).get("gtf")
 
+# Auto-derive FASTA and GTF from cellranger reference if not specified
+if TRANSCRIPTOME_REF:
+    # Auto-derive FASTA
+    if not REFERENCE_FASTA or REFERENCE_FASTA is None:
+        derived_fasta = os.path.join(TRANSCRIPTOME_REF, "fasta", "genome.fa")
+        if os.path.exists(derived_fasta):
+            REFERENCE_FASTA = derived_fasta
+            print(f"Auto-derived reference FASTA: {REFERENCE_FASTA}")
+        else:
+            print(f"WARNING: Could not auto-derive FASTA from cellranger reference")
+            print(f"  Checked: {derived_fasta}")
+            print(f"  Please set 'reference.fasta' in your config.yaml")
+    
+    # Auto-derive GTF
+    if not GTF_PATH or GTF_PATH is None:
+        derived_gtf = os.path.join(TRANSCRIPTOME_REF, "genes", "genes.gtf")
+        if os.path.exists(derived_gtf):
+            GTF_PATH = derived_gtf
+            print(f"Auto-derived GTF: {GTF_PATH}")
+        else:
+            print(f"WARNING: Could not auto-derive GTF from cellranger reference")
+            print(f"  Checked: {derived_gtf}")
+            print(f"  Please set 'reference.gtf' in your config.yaml")
+
 # FASTQ base directory for SRAscraper format
 # Can be specified at top level or under cellranger section
 # If not specified, attempt to auto-derive from sample_info path
 FASTQ_BASE_DIR = (
-    config.get("fastq_base_dir") or 
+    config.get("fastq_base_dir") or
     config.get("cellranger", {}).get("fastq_base_dir")
 )
 
@@ -326,7 +350,7 @@ rule multiqc:
         "envs/sc_pre.yaml"
     shell:
         """
-        multiqc {params.outdir} -o {params.outdir} -n multiqc_report.html 2>&1 | tee {log}
+        multiqc {OUTPUT_DIR}/cellranger -o {params.outdir} -n multiqc_report.html 2>&1 | tee {log}
         """
 
 # =============================================================================

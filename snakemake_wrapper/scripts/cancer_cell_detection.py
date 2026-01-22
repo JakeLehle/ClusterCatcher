@@ -176,7 +176,13 @@ def safe_makedirs(dir_path):
 
 
 def process_cytotrace_chunk(adata_chunk, chunk_name, working_dir, species='human', seed=42):
-    """Process a single chunk of cells through CytoTRACE2."""
+    """
+    Process a single chunk of cells through CytoTRACE2.
+    
+    Note: CytoTRACE2 writes output to the current working directory by default.
+    This function handles changing to the working_dir before running CytoTRACE2
+    to ensure output files are created in the expected location.
+    """
     try:
         from cytotrace2_py.cytotrace2_py import cytotrace2
     except ImportError:
@@ -187,6 +193,8 @@ def process_cytotrace_chunk(adata_chunk, chunk_name, working_dir, species='human
             "  pip install ."
         )
     
+    # Save original working directory - CytoTRACE2 writes to cwd by default
+    original_cwd = os.getcwd()
     cytotrace2_results_dir = os.path.join(working_dir, "cytotrace2_results")
     
     # Prepare cell annotations
@@ -215,23 +223,54 @@ def process_cytotrace_chunk(adata_chunk, chunk_name, working_dir, species='human
     expression_path = os.path.join(working_dir, f"gene_expression_matrix_{chunk_name}.txt")
     adata_X_df_T.to_csv(expression_path, sep="\t", header=True, index=True, chunksize=10000)
     
-    # Clean up any existing results
+    # Clean up any existing results in the target directory
     if os.path.exists(cytotrace2_results_dir):
         shutil.rmtree(cytotrace2_results_dir)
     
-    # Run CytoTRACE2
-    results = cytotrace2(
-        expression_path,
-        annotation_path=annotation_path,
-        species=species,
-        max_cores=os.cpu_count(),
-        seed=seed
-    )
+    # Also clean up any stale results in original cwd (from previous failed runs)
+    stale_results_dir = os.path.join(original_cwd, "cytotrace2_results")
+    if os.path.exists(stale_results_dir):
+        logger.info(f"Cleaning up stale CytoTRACE2 results at: {stale_results_dir}")
+        shutil.rmtree(stale_results_dir)
     
-    # Read results
+    # Change to working directory before running CytoTRACE2
+    # CytoTRACE2 writes output to current working directory
+    try:
+        os.chdir(working_dir)
+        logger.info(f"Changed working directory to: {working_dir}")
+        
+        # Run CytoTRACE2
+        results = cytotrace2(
+            expression_path,
+            annotation_path=annotation_path,
+            species=species,
+            max_cores=os.cpu_count(),
+            seed=seed
+        )
+    finally:
+        # Always change back to original directory
+        os.chdir(original_cwd)
+        logger.info(f"Restored working directory to: {original_cwd}")
+    
+    # Read results - now cytotrace2_results should be in working_dir
     project_results_path = os.path.join(cytotrace2_results_dir, "cytotrace2_results.txt")
+    
     if not os.path.exists(project_results_path):
-        raise FileNotFoundError(f"CytoTRACE2 output missing at {project_results_path}")
+        # Check if it was created in the original location as fallback
+        fallback_path = os.path.join(original_cwd, "cytotrace2_results", "cytotrace2_results.txt")
+        if os.path.exists(fallback_path):
+            logger.warning(f"CytoTRACE2 output found at fallback location: {fallback_path}")
+            logger.warning("Moving to expected location...")
+            # Move it to the expected location
+            fallback_dir = os.path.join(original_cwd, "cytotrace2_results")
+            shutil.move(fallback_dir, cytotrace2_results_dir)
+        else:
+            # List what's in working_dir to help debug
+            logger.error(f"Expected output not found at: {project_results_path}")
+            logger.error(f"Contents of working_dir ({working_dir}):")
+            for item in os.listdir(working_dir):
+                logger.error(f"  - {item}")
+            raise FileNotFoundError(f"CytoTRACE2 output missing at {project_results_path}")
     
     cytotrace_txt = pd.read_csv(project_results_path, sep='\t')
     
@@ -1310,4 +1349,3 @@ if __name__ == '__main__':
         run_from_snakemake()
     except NameError:
         main()
-

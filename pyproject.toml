@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ClusterCatcher"
-version = "1.2.1"
+version = "1.3.0"
 description = "Single-cell sequencing analysis pipeline for mutation signature detection and cell annotation"
 readme = "README.md"
 license = {text = "GPL-3.0"}
