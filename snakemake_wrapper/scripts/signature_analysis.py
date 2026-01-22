@@ -56,6 +56,15 @@ COSMIC_COLORS = {
     'T>G': '#EDB6C2'
 }
 
+# Standard 96 trinucleotide contexts (used for empty matrix creation)
+ALL_MUTATION_TYPES = [
+    f"{five}[{ref}>{alt}]{three}"
+    for ref in ['C', 'T']
+    for alt in (['A', 'G', 'T'] if ref == 'C' else ['A', 'C', 'G'])
+    for five in ['A', 'C', 'G', 'T']
+    for three in ['A', 'C', 'G', 'T']
+]
+
 
 def reverse_complement(sequence):
     """Generate reverse complement of a DNA sequence"""
@@ -72,20 +81,97 @@ def get_mutation_type(ref, alt, context):
     return None
 
 
+def create_empty_mutation_matrix(output_file):
+    """Create an empty mutation matrix with standard 96 contexts."""
+    result_df = pd.DataFrame(index=ALL_MUTATION_TYPES, columns=[], dtype=int)
+    result_df.to_csv(output_file, sep='\t')
+    logger.info(f"Created empty mutation matrix at {output_file}")
+    return result_df
+
+
 def process_mutations(input_file, output_file):
     """Process mutations into 96-trinucleotide context matrix."""
     logger.info(f"Processing mutations from {input_file}...")
     
+    # Check if file exists
+    if not os.path.exists(input_file):
+        logger.warning(f"Mutations file not found: {input_file}")
+        return create_empty_mutation_matrix(output_file)
+    
+    # Check if file is empty
+    file_size = os.path.getsize(input_file)
+    if file_size == 0:
+        logger.warning(f"Mutations file is empty (0 bytes): {input_file}")
+        return create_empty_mutation_matrix(output_file)
+    
+    # Try to find header line starting with #
+    header = None
+    line_count = 0
     with open(input_file, 'r') as f:
         for line in f:
+            line_count += 1
             if line.startswith('#'):
                 header = line.lstrip('#').strip().split('\t')
                 break
     
-    df = pd.read_csv(input_file, sep='\t', comment='#', names=header)
-    df = df[(df['REF'].str.len() == 1) & (df['ALT_expected'].str.len() == 1)]
-    df = df[~df['REF_TRI'].str.contains('N') & ~df['ALT_TRI'].str.contains('N')]
+    # Handle missing header or empty file
+    if header is None:
+        logger.warning(f"No header line (starting with #) found in {input_file}")
+        logger.warning(f"File has {line_count} lines but no valid header")
+        
+        # Check if file has any content at all
+        if line_count == 0:
+            logger.warning("File appears to be empty")
+            return create_empty_mutation_matrix(output_file)
+        
+        # Try to read without header comment
+        try:
+            df = pd.read_csv(input_file, sep='\t')
+            if df.empty or len(df.columns) == 0:
+                logger.warning("File has no data columns")
+                return create_empty_mutation_matrix(output_file)
+            # Use the DataFrame's columns as header
+            header = list(df.columns)
+            logger.info(f"Using column names from file: {header[:5]}...")
+        except Exception as e:
+            logger.warning(f"Could not parse mutations file: {e}")
+            return create_empty_mutation_matrix(output_file)
+    else:
+        # Read with the header we found
+        try:
+            df = pd.read_csv(input_file, sep='\t', comment='#', names=header)
+        except Exception as e:
+            logger.warning(f"Error reading mutations file with header: {e}")
+            return create_empty_mutation_matrix(output_file)
     
+    # Check if DataFrame is empty
+    if df.empty:
+        logger.warning("Mutations DataFrame is empty after reading")
+        return create_empty_mutation_matrix(output_file)
+    
+    # Check for required columns
+    required_cols = ['REF', 'ALT_expected', 'REF_TRI', 'ALT_TRI', 'CB']
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    if missing_cols:
+        logger.warning(f"Missing required columns: {missing_cols}")
+        logger.warning(f"Available columns: {list(df.columns)}")
+        return create_empty_mutation_matrix(output_file)
+    
+    # Filter to SNVs only
+    df = df[(df['REF'].str.len() == 1) & (df['ALT_expected'].str.len() == 1)]
+    
+    if df.empty:
+        logger.warning("No SNVs found after filtering")
+        return create_empty_mutation_matrix(output_file)
+    
+    # Filter out N-containing contexts
+    df = df[~df['REF_TRI'].str.contains('N', na=True) & ~df['ALT_TRI'].str.contains('N', na=True)]
+    
+    if df.empty:
+        logger.warning("No mutations remaining after filtering N-containing contexts")
+        return create_empty_mutation_matrix(output_file)
+    
+    # Convert to pyrimidine context
     for idx, row in df.iterrows():
         ref = row['REF']
         alt = row['ALT_expected']
@@ -95,6 +181,7 @@ def process_mutations(input_file, output_file):
             df.at[idx, 'REF_TRI'] = reverse_complement(row['REF_TRI'])
             df.at[idx, 'ALT_TRI'] = reverse_complement(row['ALT_TRI'])
     
+    # Count mutations per cell per context
     mutation_counts = defaultdict(lambda: defaultdict(int))
     for _, row in df.iterrows():
         cb = row['CB']
@@ -109,27 +196,29 @@ def process_mutations(input_file, output_file):
         if mutation_type:
             mutation_counts[cb][mutation_type] += 1
     
-    all_mutation_types = [
-        f"{five}[{ref}>{alt}]{three}"
-        for ref in ['C', 'T']
-        for alt in (['A', 'G', 'T'] if ref == 'C' else ['A', 'C', 'G'])
-        for five in ['A', 'C', 'G', 'T']
-        for three in ['A', 'C', 'G', 'T']
-    ]
+    # Check if we have any mutations
+    if not mutation_counts:
+        logger.warning("No valid mutations found after processing")
+        return create_empty_mutation_matrix(output_file)
     
+    # Build result DataFrame
     cell_barcodes = list(mutation_counts.keys())
-    data_dict = {mut_type: [mutation_counts[cb].get(mut_type, 0) for cb in cell_barcodes] for mut_type in all_mutation_types}
+    data_dict = {mut_type: [mutation_counts[cb].get(mut_type, 0) for cb in cell_barcodes] for mut_type in ALL_MUTATION_TYPES}
     result_df = pd.DataFrame(data_dict, index=cell_barcodes).T
-    result_df = result_df.reindex(all_mutation_types, fill_value=0).astype(int)
+    result_df = result_df.reindex(ALL_MUTATION_TYPES, fill_value=0).astype(int)
     result_df.to_csv(output_file, sep='\t')
     
-    logger.info(f"Matrix shape: {result_df.shape}")
+    logger.info(f"Matrix shape: {result_df.shape} ({result_df.shape[1]} cells with mutations)")
     return result_df
 
 
 def extract_cosmic_signatures(cosmic_file, output_dir=None, hnscc_only=False):
     """Extract COSMIC signatures."""
     logger.info(f"Loading COSMIC signatures from: {cosmic_file}")
+    
+    if cosmic_file is None or not os.path.exists(cosmic_file):
+        raise FileNotFoundError(f"COSMIC signatures file not found: {cosmic_file}")
+    
     cosmic_all = pd.read_csv(cosmic_file, sep='\t', index_col=0)
     
     if hnscc_only:
@@ -137,9 +226,12 @@ def extract_cosmic_signatures(cosmic_file, output_dir=None, hnscc_only=False):
                       "SBS17a", "SBS17b", "SBS18", "SBS33", "SBS40a", "SBS40b", "SBS40c"]
         available = [s for s in hnscc_sigs if s in cosmic_all.columns]
         sigs = cosmic_all[available].copy()
+        logger.info(f"Using HNSCC-specific signatures: {available}")
     else:
         sigs = cosmic_all.copy()
+        logger.info(f"Using all {len(sigs.columns)} COSMIC signatures")
     
+    # Normalize columns to sum to 1
     col_sums = sigs.sum(axis=0)
     if not np.allclose(col_sums, 1.0, atol=1e-5):
         sigs = sigs / col_sums
@@ -156,11 +248,22 @@ def fit_signatures_nnls(mutation_matrix, signature_matrix, verbose=True):
     if verbose:
         logger.info("Fitting signatures using NNLS...")
     
+    # Align indices
     if not all(mutation_matrix.index == signature_matrix.index):
-        signature_matrix = signature_matrix.loc[mutation_matrix.index]
+        common_contexts = mutation_matrix.index.intersection(signature_matrix.index)
+        mutation_matrix = mutation_matrix.loc[common_contexts]
+        signature_matrix = signature_matrix.loc[common_contexts]
     
     n_cells = mutation_matrix.shape[1]
     n_sigs = signature_matrix.shape[1]
+    
+    if n_cells == 0:
+        logger.warning("No cells in mutation matrix")
+        return {
+            'weights': pd.DataFrame(index=signature_matrix.columns, columns=[]),
+            'residuals': np.array([]),
+            'reconstruction': pd.DataFrame(index=mutation_matrix.index, columns=[])
+        }
     
     X = mutation_matrix.values
     H = signature_matrix.values
@@ -172,7 +275,8 @@ def fit_signatures_nnls(mutation_matrix, signature_matrix, verbose=True):
             weights, residual = nnls(H, X[:, i])
             W[:, i] = weights
             residuals[i] = residual
-        except:
+        except Exception as e:
+            logger.warning(f"NNLS failed for cell {i}: {e}")
             W[:, i] = 0
             residuals[i] = np.inf
     
@@ -180,11 +284,35 @@ def fit_signatures_nnls(mutation_matrix, signature_matrix, verbose=True):
     reconstruction = H @ W
     reconstruction_df = pd.DataFrame(reconstruction, index=mutation_matrix.index, columns=mutation_matrix.columns)
     
+    if verbose:
+        logger.info(f"Fitted {n_sigs} signatures to {n_cells} cells")
+    
     return {'weights': weights_df, 'residuals': residuals, 'reconstruction': reconstruction_df}
 
 
 def evaluate_reconstruction(original_matrix, reconstructed_matrix, verbose=True):
     """Evaluate reconstruction quality."""
+    if original_matrix.shape[1] == 0:
+        logger.warning("Empty matrix - skipping evaluation")
+        return {
+            'frobenius_norm_original': 0,
+            'frobenius_norm_reconstructed': 0,
+            'frobenius_error': 0,
+            'relative_frobenius_error': 0,
+            'optimality_ratio': 1.0,
+            'pearson_per_cell': np.array([]),
+            'cosine_per_cell': np.array([]),
+            'cell_frobenius_errors': np.array([]),
+            'mean_pearson': np.nan,
+            'median_pearson': np.nan,
+            'std_pearson': np.nan,
+            'mean_cosine': np.nan,
+            'median_cosine': np.nan,
+            'mean_cell_error': 0,
+            'quality': 'N/A',
+            'quality_correlation': 'N/A'
+        }
+    
     X = original_matrix.values
     X_recon = reconstructed_matrix.values
     
@@ -252,12 +380,31 @@ def select_signatures_scree(mutation_matrix, signature_pool, core_sigs, candidat
     """Select signatures via scree plot elbow detection."""
     logger.info("Selecting signatures via scree plot...")
     
+    if mutation_matrix.shape[1] == 0:
+        logger.warning("Empty mutation matrix - returning core signatures only")
+        available_core = [s for s in core_sigs if s in signature_pool.columns]
+        return {
+            'selected_signatures': available_core,
+            'signature_matrix': signature_pool[available_core] if available_core else signature_pool.iloc[:, :1],
+            'n_signatures': len(available_core),
+            'scree_data': []
+        }
+    
     available = set(signature_pool.columns)
     core = [s for s in core_sigs if s in available]
     cands = [s for s in candidates if s in available and s not in core]
     
     X = mutation_matrix.values
     X_norm = np.linalg.norm(X, 'fro')
+    
+    if X_norm == 0:
+        logger.warning("Mutation matrix has zero norm - returning core signatures")
+        return {
+            'selected_signatures': core,
+            'signature_matrix': signature_pool[core] if core else signature_pool.iloc[:, :1],
+            'n_signatures': len(core),
+            'scree_data': []
+        }
     
     scores = []
     for sig in cands:
@@ -283,6 +430,15 @@ def select_signatures_scree(mutation_matrix, signature_pool, core_sigs, candidat
             'exp_var': 1 - ev['relative_frobenius_error']**2
         })
     
+    if len(scree_data) < 2:
+        logger.warning("Not enough data points for scree plot - using core signatures")
+        return {
+            'selected_signatures': core,
+            'signature_matrix': signature_pool[core] if core else signature_pool.iloc[:, :1],
+            'n_signatures': len(core),
+            'scree_data': scree_data
+        }
+    
     errors = np.array([s['error'] for s in scree_data])
     d2y = np.gradient(np.gradient(errors))
     elbow_idx = np.argmax(d2y)
@@ -304,6 +460,10 @@ def plot_results(weights_df, evaluation, output_dir):
     output_path = Path(output_dir)
     output_path.mkdir(exist_ok=True, parents=True)
     
+    if weights_df.shape[1] == 0:
+        logger.warning("No cells to plot - skipping visualization")
+        return
+    
     # Weights summary
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
     
@@ -315,14 +475,22 @@ def plot_results(weights_df, evaluation, output_dir):
     axes[0].set_title('Signature Activity')
     axes[0].invert_yaxis()
     
-    pearson = evaluation['pearson_per_cell']
-    valid_p = pearson[~np.isnan(pearson)]
-    axes[1].hist(valid_p, bins=50, color='steelblue', alpha=0.7)
-    axes[1].axvline(np.nanmean(pearson), color='red', linestyle='--', label=f'Mean: {np.nanmean(pearson):.3f}')
-    axes[1].set_xlabel('Pearson Correlation')
-    axes[1].set_ylabel('Count')
-    axes[1].set_title('Reconstruction Quality')
-    axes[1].legend()
+    pearson = evaluation.get('pearson_per_cell', np.array([]))
+    if len(pearson) > 0:
+        valid_p = pearson[~np.isnan(pearson)]
+        if len(valid_p) > 0:
+            axes[1].hist(valid_p, bins=50, color='steelblue', alpha=0.7)
+            axes[1].axvline(np.nanmean(pearson), color='red', linestyle='--', label=f'Mean: {np.nanmean(pearson):.3f}')
+            axes[1].set_xlabel('Pearson Correlation')
+            axes[1].set_ylabel('Count')
+            axes[1].set_title('Reconstruction Quality')
+            axes[1].legend()
+        else:
+            axes[1].text(0.5, 0.5, 'No valid correlations', ha='center', va='center', transform=axes[1].transAxes)
+            axes[1].set_title('Reconstruction Quality')
+    else:
+        axes[1].text(0.5, 0.5, 'No data', ha='center', va='center', transform=axes[1].transAxes)
+        axes[1].set_title('Reconstruction Quality')
     
     plt.tight_layout()
     plt.savefig(output_path / 'signature_analysis_summary.png', dpi=200)
@@ -336,7 +504,14 @@ def plot_signature_umaps(adata, sig_cols, output_dir):
     output_path = Path(output_dir) / 'signature_UMAPs'
     output_path.mkdir(exist_ok=True, parents=True)
     
+    if 'X_umap' not in adata.obsm:
+        logger.warning("No UMAP found in AnnData - skipping signature UMAPs")
+        return
+    
     for sig in sig_cols:
+        if sig not in adata.obs.columns:
+            continue
+            
         if adata.obs[sig].dtype == 'object':
             adata.obs[sig] = pd.to_numeric(adata.obs[sig], errors='coerce').fillna(0)
         
@@ -371,15 +546,20 @@ def run_signature_analysis(
     matrix_file = output_path / "mutation_matrix_96contexts.txt"
     mut_matrix = process_mutations(mutations_file, matrix_file)
     
+    # Load AnnData early so we can save it even if there are no mutations
+    logger.info(f"Loading AnnData from {adata_path}...")
+    adata = sc.read_h5ad(adata_path)
+    logger.info(f"Loaded {adata.n_obs} cells, {adata.n_vars} genes")
+    
     # Handle empty mutations case
     if mut_matrix.shape[1] == 0:
-        logger.warning("No mutations found in input file - creating empty output files")
+        logger.warning("No mutations found - creating output files with zero mutation counts")
+        
         # Create empty weights file
-        empty_weights = pd.DataFrame(columns=['Cell'])
+        empty_weights = pd.DataFrame(index=[], columns=['Cell'])
         empty_weights.to_csv(output_path / "signature_weights_per_cell.txt", sep='\t', index=True)
         
-        # Load and save AnnData with empty signature columns
-        adata = sc.read_h5ad(adata_path)
+        # Add zero mutation count to adata
         adata.obs['total_mutations'] = 0
         
         # Handle column types for HDF5
@@ -391,70 +571,97 @@ def run_signature_analysis(
         adata.write(final_path)
         logger.info(f"Saved: {final_path}")
         
+        logger.info("="*60)
+        logger.info("COMPLETE (no mutations to analyze)")
+        logger.info("="*60)
+        
         return {'weights': empty_weights, 'evaluation': None, 'adata_path': str(final_path)}
     
+    # Apply mutation threshold filter
     if mut_threshold > 0:
         cells_keep = mut_matrix.sum(axis=0) >= mut_threshold
+        n_before = mut_matrix.shape[1]
         mut_matrix = mut_matrix.loc[:, cells_keep]
-        logger.info(f"After filtering: {mut_matrix.shape[1]} cells")
-    
-    # Load AnnData
-    adata = sc.read_h5ad(adata_path)
+        logger.info(f"After filtering (>={mut_threshold} mutations): {mut_matrix.shape[1]} cells (removed {n_before - mut_matrix.shape[1]})")
     
     # Handle callable sites
     if callable_sites_file and os.path.exists(callable_sites_file):
-        callable_df = pd.read_csv(callable_sites_file, sep='\t')
-        callable_bcs = set(callable_df['CB'])
-        missing = set(mut_matrix.columns) - callable_bcs
-        if missing:
-            mut_matrix.loc[:, list(missing)] = 0
+        try:
+            callable_df = pd.read_csv(callable_sites_file, sep='\t')
+            if 'CB' in callable_df.columns:
+                callable_bcs = set(callable_df['CB'])
+                missing = set(mut_matrix.columns) - callable_bcs
+                if missing:
+                    logger.info(f"Setting {len(missing)} cells not in callable sites to 0")
+                    mut_matrix.loc[:, list(missing)] = 0
+        except Exception as e:
+            logger.warning(f"Could not process callable sites file: {e}")
     
-    # Load signatures
+    # Load COSMIC signatures
+    if cosmic_file is None:
+        raise ValueError("COSMIC signature file is required but not provided")
+    
     cosmic_sigs = extract_cosmic_signatures(cosmic_file, output_dir, hnscc_only)
     
     # Signature selection
     if use_scree and core_sigs:
-        if 'SBS40a' in cosmic_sigs.columns and 'SBS40' in core_sigs:
+        # Handle SBS40 variants
+        if 'SBS40a' in cosmic_sigs.columns and 'SBS40' in (core_sigs or []):
             core_sigs = [s if s != 'SBS40' else 'SBS40a' for s in core_sigs]
         if candidate_order is None:
             candidate_order = [s for s in cosmic_sigs.columns if s not in core_sigs]
         
         selection = select_signatures_scree(mut_matrix, cosmic_sigs, core_sigs, candidate_order, output_dir, max_sigs)
         final_sigs = selection['signature_matrix']
+        logger.info(f"Selected signatures: {list(final_sigs.columns)}")
     else:
         final_sigs = cosmic_sigs
         selection = None
+        logger.info(f"Using all {len(final_sigs.columns)} signatures")
     
     # Fit and evaluate
     fitting = fit_signatures_nnls(mut_matrix, final_sigs)
     evaluation = evaluate_reconstruction(mut_matrix, fitting['reconstruction'])
     
-    # Plot
+    # Plot results
     plot_results(fitting['weights'], evaluation, figures_dir)
     
     # Save weights
     fitting['weights'].to_csv(output_path / "signature_weights_per_cell.txt", sep='\t', float_format='%.6f')
+    logger.info(f"Saved weights for {fitting['weights'].shape[1]} cells")
+    
+    # Save evaluation metrics
+    eval_df = pd.DataFrame([{
+        'frobenius_error': evaluation['frobenius_error'],
+        'relative_error': evaluation['relative_frobenius_error'],
+        'mean_pearson': evaluation['mean_pearson'],
+        'median_pearson': evaluation['median_pearson'],
+        'quality': evaluation['quality'],
+        'n_cells': mut_matrix.shape[1],
+        'n_signatures': final_sigs.shape[1]
+    }])
+    eval_df.to_csv(output_path / "reconstruction_evaluation.txt", sep='\t', index=False)
     
     # Add to adata
     muts_per_cell = mut_matrix.sum(axis=0)
     muts_reindex = muts_per_cell.reindex(adata.obs.index).fillna(0)
-    adata.obs['total_mutations'] = muts_reindex.values
+    adata.obs['total_mutations'] = muts_reindex.values.astype(int)
     
     for sig in fitting['weights'].index:
         sig_vals = fitting['weights'].loc[sig].reindex(adata.obs.index).fillna(0)
-        adata.obs[sig] = sig_vals.values
+        adata.obs[sig] = sig_vals.values.astype(float)
     
-    # Handle column types for HDF5
+    # Handle column types for HDF5 compatibility
     for col in adata.obs.columns:
         if adata.obs[col].dtype not in ['float64', 'float32', 'int64', 'int32', 'bool']:
             adata.obs[col] = adata.obs[col].astype(str)
     
-    # Signature UMAPs
+    # Generate signature UMAPs
     sig_cols = [c for c in adata.obs.columns if c.startswith('SBS')]
     if sig_cols:
         plot_signature_umaps(adata, sig_cols, figures_dir)
     
-    # Save
+    # Save final AnnData
     final_path = output_path / "adata_final.h5ad"
     adata.write(final_path)
     logger.info(f"Saved: {final_path}")
@@ -462,12 +669,23 @@ def run_signature_analysis(
     logger.info("="*60)
     logger.info("COMPLETE")
     logger.info("="*60)
+    logger.info(f"Cells with mutations: {mut_matrix.shape[1]}")
+    logger.info(f"Signatures used: {list(final_sigs.columns)}")
+    logger.info(f"Reconstruction quality: {evaluation['quality']}")
     
     return {'weights': fitting['weights'], 'evaluation': evaluation, 'adata_path': str(final_path)}
 
 
 def run_from_snakemake():
     """Run from Snakemake context."""
+    # Set up file logging if log path provided
+    if hasattr(snakemake, 'log') and snakemake.log:
+        log_path = snakemake.log[0]
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        file_handler = logging.FileHandler(log_path)
+        file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        logger.addHandler(file_handler)
+    
     run_signature_analysis(
         mutations_file=snakemake.input.mutations,
         adata_path=snakemake.input.adata,
@@ -485,18 +703,18 @@ def run_from_snakemake():
 
 def main():
     """CLI entry point."""
-    parser = argparse.ArgumentParser(description="Signature analysis")
-    parser.add_argument('--mutations', required=True)
-    parser.add_argument('--adata', required=True)
-    parser.add_argument('--cosmic-file', required=True)
-    parser.add_argument('--output-dir', required=True)
-    parser.add_argument('--callable-sites')
-    parser.add_argument('--use-scree', action='store_true')
-    parser.add_argument('--core-signatures', nargs='+')
-    parser.add_argument('--candidate-order', nargs='+')
-    parser.add_argument('--mutation-threshold', type=int, default=0)
-    parser.add_argument('--max-signatures', type=int, default=15)
-    parser.add_argument('--hnscc-only', action='store_true')
+    parser = argparse.ArgumentParser(description="Signature analysis for single-cell mutations")
+    parser.add_argument('--mutations', required=True, help='Input mutations TSV file')
+    parser.add_argument('--adata', required=True, help='Input AnnData H5AD file')
+    parser.add_argument('--cosmic-file', required=True, help='COSMIC signatures file')
+    parser.add_argument('--output-dir', required=True, help='Output directory')
+    parser.add_argument('--callable-sites', help='Callable sites TSV file')
+    parser.add_argument('--use-scree', action='store_true', help='Use scree plot for signature selection')
+    parser.add_argument('--core-signatures', nargs='+', help='Core signatures to always include')
+    parser.add_argument('--candidate-order', nargs='+', help='Order of candidate signatures')
+    parser.add_argument('--mutation-threshold', type=int, default=0, help='Minimum mutations per cell')
+    parser.add_argument('--max-signatures', type=int, default=15, help='Maximum signatures to test')
+    parser.add_argument('--hnscc-only', action='store_true', help='Use HNSCC-specific signatures only')
     
     args = parser.parse_args()
     
@@ -521,4 +739,3 @@ if __name__ == '__main__':
         run_from_snakemake()
     except NameError:
         main()
-

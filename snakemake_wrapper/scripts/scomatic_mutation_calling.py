@@ -736,7 +736,7 @@ def run_trinucleotide_context(args):
             shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-def generate_complete_callable_sites(output_dir, valid_samples, adata_pp, cell_annotations, sample_metadata):
+def generate_complete_callable_sites(output_dir, valid_samples, adata_pp, cell_annotations, sample_col):
     """Generate complete callable sites file including all cells"""
     combined_callable_dir = os.path.join(output_dir, 'CombinedCallableSites')
     os.makedirs(combined_callable_dir, exist_ok=True)
@@ -754,13 +754,15 @@ def generate_complete_callable_sites(output_dir, valid_samples, adata_pp, cell_a
         'files_skipped': 0
     }
     
-    for run_acc in tqdm(valid_samples, desc="Processing callable sites"):
-        mask = adata_pp.obs['run_accession'] == run_acc
+    for sample_id in tqdm(valid_samples, desc="Processing callable sites"):
+        mask = adata_pp.obs[sample_col] == sample_id
         subset = adata_pp[mask, :]
-        series_id = subset.obs['series_id'].iloc[0] if 'series_id' in subset.obs.columns else run_acc
+        
+        # Get series_id if available, otherwise use sample_id
+        series_id = subset.obs['series_id'].iloc[0] if 'series_id' in subset.obs.columns else sample_id
         
         callable_sites_dir = os.path.join(
-            output_dir, 'scomatic', series_id, run_acc, 'UniqueCellCallableSites'
+            output_dir, 'scomatic', series_id, sample_id, 'UniqueCellCallableSites'
         )
         
         if not os.path.exists(callable_sites_dir):
@@ -799,7 +801,7 @@ def generate_complete_callable_sites(output_dir, valid_samples, adata_pp, cell_a
                     stats['files_skipped'] += 1
                     continue
                     
-                df['CB'] = df['CB'] + f"-1-{run_acc}"
+                df['CB'] = df['CB'] + f"-1-{sample_id}"
                 
                 cells_updated = 0
                 for _, row in df.iterrows():
@@ -834,62 +836,62 @@ def generate_complete_callable_sites(output_dir, valid_samples, adata_pp, cell_a
     return output_path
 
 
-def prepare_sample_args(run_acc, adata_pp, output_dir, scomatic_scripts_dir, ref_genome, custom_genotype_script=None):
+def prepare_sample_args(sample_id, adata_pp, output_dir, scomatic_scripts_dir, ref_genome, sample_col, custom_genotype_script=None):
     """Prepare arguments for sample processing with phase completion validation"""
     if not all([adata_pp is not None, output_dir, scomatic_scripts_dir, ref_genome]):
         raise ValueError("Missing required arguments")
     
-    mask = adata_pp.obs['run_accession'] == run_acc
+    mask = adata_pp.obs[sample_col] == sample_id
     if not any(mask):
-        logger.info(f"SKIPPING {run_acc}: Not found in AnnData")
+        logger.info(f"SKIPPING {sample_id}: Not found in AnnData")
         return None
         
     subset = adata_pp[mask, :]
-    series_id = subset.obs['series_id'].iloc[0] if 'series_id' in subset.obs.columns else run_acc
+    series_id = subset.obs['series_id'].iloc[0] if 'series_id' in subset.obs.columns else sample_id
     
-    scomatic_dir = os.path.join(output_dir, 'scomatic', series_id, run_acc)
+    scomatic_dir = os.path.join(output_dir, 'scomatic', series_id, sample_id)
     variant_calling_dir = os.path.join(scomatic_dir, 'VariantCalling')
     
     # Check required files
     meta_file = os.path.join(scomatic_dir, 'cell_barcode_annotation.tsv')
     if not os.path.exists(meta_file):
-        logger.info(f"SKIPPING {run_acc}: Missing annotation file")
+        logger.info(f"SKIPPING {sample_id}: Missing annotation file")
         return None
     
-    bam_files = glob.glob(os.path.join(scomatic_dir, f"{run_acc}.*.bam"))
+    bam_files = glob.glob(os.path.join(scomatic_dir, f"{sample_id}.*.bam"))
     if not bam_files:
-        logger.info(f"SKIPPING {run_acc}: No split BAM files found")
+        logger.info(f"SKIPPING {sample_id}: No split BAM files found")
         return None
     
     basecell_counts_dir = os.path.join(scomatic_dir, 'BaseCellCounts')
     if not os.path.exists(basecell_counts_dir):
-        logger.info(f"SKIPPING {run_acc}: BaseCellCounts directory missing")
+        logger.info(f"SKIPPING {sample_id}: BaseCellCounts directory missing")
         return None
     
-    merged_counts_file = os.path.join(scomatic_dir, 'MergedCounts', f"{run_acc}.BaseCellCounts.AllCellTypes.tsv")
+    merged_counts_file = os.path.join(scomatic_dir, 'MergedCounts', f"{sample_id}.BaseCellCounts.AllCellTypes.tsv")
     if not os.path.exists(merged_counts_file) or os.path.getsize(merged_counts_file) == 0:
-        logger.info(f"SKIPPING {run_acc}: Merged counts file missing or empty")
+        logger.info(f"SKIPPING {sample_id}: Merged counts file missing or empty")
         return None
     
-    step2_file = os.path.join(variant_calling_dir, f"{run_acc}.calling.step2.tsv")
+    step2_file = os.path.join(variant_calling_dir, f"{sample_id}.calling.step2.tsv")
     if not os.path.exists(step2_file) or os.path.getsize(step2_file) == 0:
-        logger.info(f"SKIPPING {run_acc}: Variant calling step2 file missing")
+        logger.info(f"SKIPPING {sample_id}: Variant calling step2 file missing")
         return None
     
     filtered_dir = os.path.join(scomatic_dir, 'FilteredVariants')
     filtered_files = glob.glob(os.path.join(filtered_dir, "*.filtered.tsv"))
     if not filtered_files:
-        logger.info(f"SKIPPING {run_acc}: No filtered variant files found")
+        logger.info(f"SKIPPING {sample_id}: No filtered variant files found")
         return None
     
     # Prepare arguments
     callable_sites_dir = os.path.join(scomatic_dir, 'CellTypeCallableSites')
-    step1_file = os.path.join(variant_calling_dir, f"{run_acc}.calling.step1.tsv")
+    step1_file = os.path.join(variant_calling_dir, f"{sample_id}.calling.step1.tsv")
     
     callable_args = None
     if os.path.exists(step1_file) and os.path.getsize(step1_file) > 0:
         os.makedirs(callable_sites_dir, exist_ok=True)
-        callable_args = (step1_file, os.path.join(callable_sites_dir, run_acc), "150", "2", scomatic_scripts_dir)
+        callable_args = (step1_file, os.path.join(callable_sites_dir, sample_id), "150", "2", scomatic_scripts_dir)
     
     sites_per_cell_args = []
     sites_per_cell_dir = os.path.join(scomatic_dir, 'UniqueCellCallableSites')
@@ -915,7 +917,7 @@ def prepare_sample_args(run_acc, adata_pp, output_dir, scomatic_scripts_dir, ref
         filtered_genotype_files = [(step2_file, single_cell_dir)]
     
     return {
-        'run_acc': run_acc,
+        'sample_id': sample_id,
         'callable_args': callable_args,
         'sites_per_cell_args': sites_per_cell_args,
         'genotype_args': genotype_args,
@@ -933,8 +935,8 @@ def prepare_sample_args(run_acc, adata_pp, output_dir, scomatic_scripts_dir, ref
 
 def process_sample(sample_args):
     """Process all steps for a single sample"""
-    run_acc = sample_args['run_acc']
-    results = {'run_acc': run_acc, 'success': True}
+    sample_id = sample_args['sample_id']
+    results = {'sample_id': sample_id, 'success': True}
     
     try:
         for dir_path in sample_args['directories'].values():
@@ -949,7 +951,7 @@ def process_sample(sample_args):
                 if not success:
                     results['success'] = False
             except Exception as e:
-                logger.error(f"Error in callable sites for {run_acc}: {str(e)}")
+                logger.error(f"Error in callable sites for {sample_id}: {str(e)}")
                 results['callable_sites'] = False
                 results['success'] = False
         
@@ -960,7 +962,7 @@ def process_sample(sample_args):
                     sites_results = list(pool.imap(run_sites_per_cell, sample_args['sites_per_cell_args']))
                 results['sites_per_cell'] = sum(sites_results)
             except Exception as e:
-                logger.error(f"Error in sites per cell for {run_acc}: {str(e)}")
+                logger.error(f"Error in sites per cell for {sample_id}: {str(e)}")
                 results['sites_per_cell'] = 0
                 results['success'] = False
         
@@ -978,7 +980,7 @@ def process_sample(sample_args):
                     results['filtered_genotypes'] = False
                     
             except Exception as e:
-                logger.error(f"Error in genotype processing for {run_acc}: {str(e)}")
+                logger.error(f"Error in genotype processing for {sample_id}: {str(e)}")
                 results['single_cell_genotypes'] = 0
                 results['success'] = False
                 sample_args['filtered_genotype_files'] = []
@@ -996,13 +998,13 @@ def process_sample(sample_args):
                     raise FileNotFoundError(f"Input directory not found: {input_dir}")
                 
                 processed_files, combined_data = filter_and_annotate_sc_genotypes(
-                    input_dir, variant_file, sample_args['directories']['root'], run_acc
+                    input_dir, variant_file, sample_args['directories']['root'], sample_id
                 )
                 results['filtered_genotypes'] = bool(processed_files)
                 results['combined_data'] = combined_data
                     
             except Exception as e:
-                logger.error(f"Error in genotype filtering for {run_acc}: {str(e)}")
+                logger.error(f"Error in genotype filtering for {sample_id}: {str(e)}")
                 results['filtered_genotypes'] = False
                 results['success'] = False
         else:
@@ -1011,8 +1013,8 @@ def process_sample(sample_args):
         return results
         
     except Exception as e:
-        logger.error(f"CRITICAL ERROR processing sample {run_acc}: {str(e)}")
-        return {'run_acc': run_acc, 'success': False, 'error': str(e)}
+        logger.error(f"CRITICAL ERROR processing sample {sample_id}: {str(e)}")
+        return {'sample_id': sample_id, 'success': False, 'error': str(e)}
 
 
 def monitor_resources(interval=300, stop_event=None):
@@ -1101,8 +1103,15 @@ def run_scomatic_pipeline(
         logger.info("Loading AnnData object...")
         adata_pp = sc.read_h5ad(adata_path)
         
-        # Process barcodes
-        adata_pp.obs['original_barcode'] = adata_pp.obs_names.str.split('-').str[0]
+        # Process barcodes - extract raw barcode without sample prefix
+        # Handle formats like: GSE173468_AAACCTGAGAGCCTAG-1
+        if '_' in adata_pp.obs_names[0]:
+            # Barcode format: {sample_id}_{barcode}-{suffix}
+            adata_pp.obs['original_barcode'] = adata_pp.obs_names.str.split('_').str[1].str.split('-').str[0]
+        else:
+            # Barcode format: {barcode}-{suffix}
+            adata_pp.obs['original_barcode'] = adata_pp.obs_names.str.split('-').str[0]
+        
         adata_pp.obs['cell_barcodes'] = adata_pp.obs.index
         
         # Create cell annotations file
@@ -1110,15 +1119,67 @@ def run_scomatic_pipeline(
         cell_annotations_path = os.path.join(mutations_dir, 'cell_annotations.tsv')
         adata_annotation_df.to_csv(cell_annotations_path, sep="\t", header=True, index=False)
         
-        # Get run accessions
-        if 'run_accession' not in adata_pp.obs.columns:
-            # Try to extract from barcode
-            adata_pp.obs['run_accession'] = adata_pp.obs_names.str.split('-').str[-1]
+        # ======================
+        # DETERMINE SAMPLE COLUMN
+        # ======================
+        # Priority: sample_id > run_accession > extract from barcode prefix
+        if 'sample_id' in adata_pp.obs.columns:
+            sample_col = 'sample_id'
+            logger.info(f"Using 'sample_id' column for sample identification")
+        elif 'run_accession' in adata_pp.obs.columns:
+            sample_col = 'run_accession'
+            logger.info(f"Using 'run_accession' column for sample identification")
+        else:
+            # Try to extract from barcode prefix (before first underscore)
+            # Handle formats like: GSE173468_AAACCTGAGAGCCTAG-1
+            if '_' in adata_pp.obs_names[0]:
+                adata_pp.obs['sample_id'] = adata_pp.obs_names.str.split('_').str[0]
+            else:
+                # Fallback: use the suffix after last hyphen (old behavior)
+                adata_pp.obs['sample_id'] = adata_pp.obs_names.str.split('-').str[-1]
+            sample_col = 'sample_id'
+            logger.info(f"Extracted sample IDs from barcode prefixes")
         
-        run_accessions = adata_pp.obs['run_accession'].unique()
-        valid_samples = [s for s in run_accessions if s in sample_ids]
+        # Log sample information for debugging
+        unique_samples_in_adata = adata_pp.obs[sample_col].unique()
+        logger.info(f"Sample IDs in AnnData ({sample_col}): {list(unique_samples_in_adata)}")
+        logger.info(f"Sample IDs from config: {sample_ids}")
         
-        logger.info(f"Found {len(valid_samples)} valid samples to process")
+        # Find valid samples (intersection of adata samples and provided sample_ids)
+        valid_samples = [s for s in unique_samples_in_adata if s in sample_ids]
+        
+        # If no matches found, try the other direction
+        if not valid_samples:
+            valid_samples = [s for s in sample_ids if s in unique_samples_in_adata]
+        
+        logger.info(f"Found {len(valid_samples)} valid samples to process: {valid_samples}")
+        
+        if not valid_samples:
+            logger.error("No valid samples found! Check that sample IDs match between AnnData and config.")
+            logger.error(f"  AnnData {sample_col}: {list(unique_samples_in_adata)}")
+            logger.error(f"  Config sample_ids: {sample_ids}")
+            # Create empty outputs for Snakemake
+            final_output_path = os.path.join(mutations_dir, 'all_samples.single_cell_genotype.filtered.tsv')
+            pd.DataFrame(columns=['CHROM', 'POS', 'REF', 'ALT', 'Cell', 'Sample']).to_csv(
+                final_output_path, sep='\t', index=False
+            )
+            output_trinuc = os.path.join(mutations_dir, 'trinucleotide_background.tsv')
+            pd.DataFrame(columns=['Context', 'Count']).to_csv(output_trinuc, sep='\t', index=False)
+            
+            # Generate callable sites (all zeros)
+            cell_annotations = pd.read_csv(cell_annotations_path, sep='\t')
+            callable_path = generate_complete_callable_sites(
+                mutations_dir, [], adata_pp, cell_annotations, sample_col
+            )
+            
+            return {
+                'mutations_file': final_output_path,
+                'callable_sites': callable_path,
+                'cell_annotations': cell_annotations_path,
+                'trinucleotide_background': output_trinuc,
+                'samples_processed': 0,
+                'final_results': []
+            }
         
         # ======================
         # PHASE 1: Prepare and Split BAMs
@@ -1128,28 +1189,43 @@ def run_scomatic_pipeline(
         logger.info("="*80)
         
         scomatic_args = []
-        for run_acc in tqdm(valid_samples, desc='Preparing samples'):
-            mask = adata_pp.obs['run_accession'] == run_acc
+        for sample_id in tqdm(valid_samples, desc='Preparing samples'):
+            mask = adata_pp.obs[sample_col] == sample_id
             subset = adata_pp[mask, :]
-            series_id = subset.obs['series_id'].iloc[0] if 'series_id' in subset.obs.columns else run_acc
+            
+            # Get series_id if available, otherwise use sample_id
+            series_id = subset.obs['series_id'].iloc[0] if 'series_id' in subset.obs.columns else sample_id
             
             # Find BAM file
-            sample_cellranger_dir = os.path.join(cellranger_dir, run_acc, "outs")
+            sample_cellranger_dir = os.path.join(cellranger_dir, sample_id, "outs")
             original_bam = os.path.join(sample_cellranger_dir, "possorted_genome_bam.bam")
             
             if not os.path.exists(original_bam):
-                logger.warning(f"Skipping {run_acc} - BAM not found")
-                continue
+                # Try alternative path without 'outs' subdirectory
+                alt_bam = os.path.join(cellranger_dir, sample_id, "possorted_genome_bam.bam")
+                if os.path.exists(alt_bam):
+                    original_bam = alt_bam
+                else:
+                    logger.warning(f"Skipping {sample_id} - BAM not found at:")
+                    logger.warning(f"  - {original_bam}")
+                    logger.warning(f"  - {alt_bam}")
+                    continue
             
-            scomatic_sample_dir = os.path.join(mutations_dir, 'scomatic', series_id, run_acc)
+            logger.info(f"Found BAM for {sample_id}: {original_bam}")
+            
+            scomatic_sample_dir = os.path.join(mutations_dir, 'scomatic', series_id, sample_id)
             os.makedirs(scomatic_sample_dir, exist_ok=True)
             
-            filtered_bam = os.path.join(scomatic_sample_dir, f"filtered_{run_acc}.bam")
+            filtered_bam = os.path.join(scomatic_sample_dir, f"filtered_{sample_id}.bam")
             valid_barcodes = set(subset.obs['original_barcode'])
+            
+            logger.info(f"Sample {sample_id}: {len(valid_barcodes)} valid barcodes")
             
             if not os.path.exists(filtered_bam):
                 if not create_filtered_bam(original_bam, filtered_bam, valid_barcodes):
                     continue
+            else:
+                logger.info(f"Filtered BAM already exists: {filtered_bam}")
             
             annotation_file = os.path.join(scomatic_sample_dir, 'cell_barcode_annotation.tsv')
             if not os.path.exists(annotation_file):
@@ -1159,7 +1235,7 @@ def run_scomatic_pipeline(
                 })
                 annotation_df.to_csv(annotation_file, sep='\t', index=False)
             
-            scomatic_args.append((filtered_bam, annotation_file, run_acc, scomatic_sample_dir, scomatic_scripts_dir))
+            scomatic_args.append((filtered_bam, annotation_file, sample_id, scomatic_sample_dir, scomatic_scripts_dir))
         
         # Run SplitBam
         if scomatic_args:
@@ -1181,19 +1257,20 @@ def run_scomatic_pipeline(
         logger.info("="*80)
         
         basecell_counter_args = []
-        for run_acc in valid_samples:
-            mask = adata_pp.obs['run_accession'] == run_acc
+        for sample_id in valid_samples:
+            mask = adata_pp.obs[sample_col] == sample_id
             subset = adata_pp[mask, :]
-            series_id = subset.obs['series_id'].iloc[0] if 'series_id' in subset.obs.columns else run_acc
+            series_id = subset.obs['series_id'].iloc[0] if 'series_id' in subset.obs.columns else sample_id
             
-            scomatic_sample_dir = os.path.join(mutations_dir, 'scomatic', series_id, run_acc)
+            scomatic_sample_dir = os.path.join(mutations_dir, 'scomatic', series_id, sample_id)
             
-            bam_files = glob.glob(os.path.join(scomatic_sample_dir, f"{run_acc}.*.bam"))
+            bam_files = glob.glob(os.path.join(scomatic_sample_dir, f"{sample_id}.*.bam"))
             if not bam_files:
                 bam_files = [f for f in glob.glob(os.path.join(scomatic_sample_dir, "*.bam")) 
-                            if not f.endswith(f"filtered_{run_acc}.bam")]
+                            if not f.endswith(f"filtered_{sample_id}.bam")]
             
             if not bam_files:
+                logger.warning(f"No split BAM files found for {sample_id}")
                 continue
                 
             basecell_counts_dir = os.path.join(scomatic_sample_dir, 'BaseCellCounts')
@@ -1212,12 +1289,12 @@ def run_scomatic_pipeline(
         logger.info("PHASE 3: Merging Counts")
         logger.info("="*80)
         
-        for run_acc in valid_samples:
-            mask = adata_pp.obs['run_accession'] == run_acc
+        for sample_id in valid_samples:
+            mask = adata_pp.obs[sample_col] == sample_id
             subset = adata_pp[mask, :]
-            series_id = subset.obs['series_id'].iloc[0] if 'series_id' in subset.obs.columns else run_acc
+            series_id = subset.obs['series_id'].iloc[0] if 'series_id' in subset.obs.columns else sample_id
             
-            scomatic_sample_dir = os.path.join(mutations_dir, 'scomatic', series_id, run_acc)
+            scomatic_sample_dir = os.path.join(mutations_dir, 'scomatic', series_id, sample_id)
             basecell_counts_dir = os.path.join(scomatic_sample_dir, 'BaseCellCounts')
             
             if not os.path.exists(basecell_counts_dir):
@@ -1226,8 +1303,8 @@ def run_scomatic_pipeline(
             merged_counts_dir = os.path.join(scomatic_sample_dir, 'MergedCounts')
             os.makedirs(merged_counts_dir, exist_ok=True)
             
-            output_file = os.path.join(merged_counts_dir, f"{run_acc}.BaseCellCounts.AllCellTypes.tsv")
-            run_merge_counts(basecell_counts_dir, output_file, scomatic_scripts_dir, run_acc)
+            output_file = os.path.join(merged_counts_dir, f"{sample_id}.BaseCellCounts.AllCellTypes.tsv")
+            run_merge_counts(basecell_counts_dir, output_file, scomatic_scripts_dir, sample_id)
         
         # ======================
         # PHASE 4: Variant Calling
@@ -1240,13 +1317,13 @@ def run_scomatic_pipeline(
         variant_step2_args = []
         variant_valid_samples = []
         
-        for run_acc in valid_samples:
-            mask = adata_pp.obs['run_accession'] == run_acc
+        for sample_id in valid_samples:
+            mask = adata_pp.obs[sample_col] == sample_id
             subset = adata_pp[mask, :]
-            series_id = subset.obs['series_id'].iloc[0] if 'series_id' in subset.obs.columns else run_acc
+            series_id = subset.obs['series_id'].iloc[0] if 'series_id' in subset.obs.columns else sample_id
             
-            scomatic_sample_dir = os.path.join(mutations_dir, 'scomatic', series_id, run_acc)
-            merged_counts_file = os.path.join(scomatic_sample_dir, 'MergedCounts', f"{run_acc}.BaseCellCounts.AllCellTypes.tsv")
+            scomatic_sample_dir = os.path.join(mutations_dir, 'scomatic', series_id, sample_id)
+            merged_counts_file = os.path.join(scomatic_sample_dir, 'MergedCounts', f"{sample_id}.BaseCellCounts.AllCellTypes.tsv")
             
             if not os.path.exists(merged_counts_file) or os.path.getsize(merged_counts_file) == 0:
                 continue
@@ -1254,10 +1331,10 @@ def run_scomatic_pipeline(
             variant_calling_dir = os.path.join(scomatic_sample_dir, 'VariantCalling')
             os.makedirs(variant_calling_dir, exist_ok=True)
             
-            output_prefix_step1 = os.path.join(variant_calling_dir, run_acc)
+            output_prefix_step1 = os.path.join(variant_calling_dir, sample_id)
             variant_step1_args.append((merged_counts_file, output_prefix_step1, ref_genome, scomatic_scripts_dir))
             variant_step2_args.append((f"{output_prefix_step1}.calling.step1.tsv", output_prefix_step1, editing_sites, pon_file, scomatic_scripts_dir))
-            variant_valid_samples.append(run_acc)
+            variant_valid_samples.append(sample_id)
         
         if variant_step1_args:
             with ThreadPool(min(n_workers, len(variant_step1_args))) as pool:
@@ -1282,12 +1359,12 @@ def run_scomatic_pipeline(
         logger.info("="*80)
         
         final_valid_samples = []
-        for run_acc in variant_valid_samples:
-            mask = adata_pp.obs['run_accession'] == run_acc
+        for sample_id in variant_valid_samples:
+            mask = adata_pp.obs[sample_col] == sample_id
             subset = adata_pp[mask, :]
-            series_id = subset.obs['series_id'].iloc[0] if 'series_id' in subset.obs.columns else run_acc
+            series_id = subset.obs['series_id'].iloc[0] if 'series_id' in subset.obs.columns else sample_id
             
-            scomatic_sample_dir = os.path.join(mutations_dir, 'scomatic', series_id, run_acc)
+            scomatic_sample_dir = os.path.join(mutations_dir, 'scomatic', series_id, sample_id)
             variant_calling_dir = os.path.join(scomatic_sample_dir, 'VariantCalling')
             filtered_dir = os.path.join(scomatic_sample_dir, 'FilteredVariants')
             os.makedirs(filtered_dir, exist_ok=True)
@@ -1297,7 +1374,7 @@ def run_scomatic_pipeline(
                 filename = os.path.basename(variant_file)
                 filtered_file = os.path.join(filtered_dir, filename.replace('.step2.tsv', '.filtered.tsv'))
                 if filter_with_bed(variant_file, bed_file, filtered_file):
-                    final_valid_samples.append(run_acc)
+                    final_valid_samples.append(sample_id)
         
         final_valid_samples = list(set(final_valid_samples))
         
@@ -1310,13 +1387,14 @@ def run_scomatic_pipeline(
         
         all_sample_args = [
             prepare_sample_args(
-                run_acc=run_acc,
+                sample_id=sample_id,
                 adata_pp=adata_pp,
                 output_dir=mutations_dir,
                 scomatic_scripts_dir=scomatic_scripts_dir,
                 ref_genome=ref_genome,
+                sample_col=sample_col,
                 custom_genotype_script=custom_genotype_script
-            ) for run_acc in final_valid_samples
+            ) for sample_id in final_valid_samples
         ]
         all_sample_args = [args for args in all_sample_args if args is not None]
         
@@ -1369,7 +1447,7 @@ def run_scomatic_pipeline(
         # Generate callable sites
         cell_annotations = pd.read_csv(cell_annotations_path, sep='\t')
         callable_path = generate_complete_callable_sites(
-            mutations_dir, final_valid_samples, adata_pp, cell_annotations, None
+            mutations_dir, final_valid_samples, adata_pp, cell_annotations, sample_col
         )
         
         # Summary
@@ -1468,4 +1546,3 @@ if __name__ == '__main__':
         run_from_snakemake()
     except NameError:
         main()
-
