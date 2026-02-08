@@ -42,6 +42,7 @@ The pipeline integrates seven major analysis modules that can be flexibly enable
 - **Comprehensive**: From raw FASTQs to annotated single-cell mutations
 - **Well-documented**: Extensive logging and summary reports
 - **Publication-ready plots**: Non-overlapping UMAP labels, stacked bar plots
+- **Adaptive QC filtering**: MAD-based outlier detection that adapts to each dataset
 
 ---
 
@@ -58,43 +59,51 @@ The pipeline integrates seven major analysis modules that can be flexibly enable
 │           │                                                                 │
 │           ▼                                                                 │
 │  ┌──────────────────┐     ┌──────────────────┐                              │
-│  │  1. Cell Ranger  │───▶│   BAM + Matrix   │                              │
-│  │   (Alignment)    │     │                  │                              │
-│  └──────────────────┘     └────────┬─────────┘                              │
-│                                    │                                        │
-│           ┌────────────────────────┼────────────────────────┐               │
-│           │                        │                        │               │
-│           ▼                        ▼                        ▼               │
-│  ┌──────────────────┐     ┌──────────────────┐     ┌──────────────────┐     │
-│  │ 2. QC & Filter   │     │ 5. Viral Detect  │     │ 6. SComatic      │     │
-│  │   (Scanpy)       │     │   (Kraken2)      │     │ (Mutations)      │     │
-│  └────────┬─────────┘     └────────┬─────────┘     └────────┬─────────┘     │
-│           │                        │                        │               │
-│           ▼                        ▼                        │               │
-│  ┌──────────────────┐     ┌──────────────────┐              │               │
-│  │ 3. Cell Annot.   │     │ Viral Integration│              │               │
-│  │   (popV)         │     │                  │              │               │
-│  └────────┬─────────┘     └──────────────────┘              │               │
-│           │                                                 │               │
-│           ▼                                                 │               │
-│  ┌──────────────────┐                                       │               │
-│  │ 4. Dysregulation │                                       │               │
-│  │ (CytoTRACE2+CNV) │                                       │               │
-│  └────────┬─────────┘                                       │               │
-│           │                                                 │               │
-│           └──────────────────────────┬──────────────────────┘               │
-│                                      │                                      │
-│                                      ▼                                      │
-│                             ┌──────────────────┐                            │
-│                             │ 7. Signatures    │                            │
-│                             │   (NNLS/COSMIC)  │                            │
-│                             └────────┬─────────┘                            │
-│                                      │                                      │
-│                                      ▼                                      │
-│                             ┌──────────────────┐                            │
-│                             │  Final AnnData   │                            │
-│                             │  + Summaries     │                            │
-│                             └──────────────────┘                            │
+│  │  1. Cell Ranger  │────▶│  Unmapped Reads  │                              │
+│  │  (Alignment)     │     └────────┬─────────┘                              │
+│  └────────┬─────────┘              │                                        │
+│           │                        ▼                                        │
+│           │              ┌──────────────────┐                               │
+│           │              │  5. Kraken2      │                               │
+│           │              │  Viral Detection │                               │
+│           │              └────────┬─────────┘                               │
+│           ▼                       │                                         │
+│  ┌──────────────────┐             │                                         │
+│  │  2. QC/Filter    │             │                                         │
+│  │  (Adaptive MAD)  │             │                                         │
+│  └────────┬─────────┘             │                                         │
+│           │                       │                                         │
+│           ▼                       │                                         │
+│  ┌──────────────────┐             │                                         │
+│  │  3. popV         │             │                                         │
+│  │  Annotation      │             │                                         │
+│  └────────┬─────────┘             │                                         │
+│           │                       │                                         │
+│           ▼                       │                                         │
+│  ┌──────────────────┐             │                                         │
+│  │  4. Dysregulation│◀────────────┘                                         │
+│  │  (CytoTRACE2 +   │                                                       │
+│  │   inferCNV)      │                                                       │
+│  └────────┬─────────┘                                                       │
+│           │                                                                 │
+│           ▼                                                                 │
+│  ┌──────────────────┐                                                       │
+│  │  6. SComatic     │                                                       │
+│  │  Mutations       │                                                       │
+│  └────────┬─────────┘                                                       │
+│           │                                                                 │
+│           ▼                                                                 │
+│  ┌──────────────────┐                                                       │
+│  │  7. Mutational   │                                                       │
+│  │  Signatures      │                                                       │
+│  │  (NNLS/COSMIC)   │                                                       │
+│  └────────┬─────────┘                                                       │
+│           │                                                                 │
+│           ▼                                                                 │
+│  ┌──────────────────┐                                                       │
+│  │  Final AnnData   │                                                       │
+│  │  + Summaries     │                                                       │
+│  └──────────────────┘                                                       │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -104,10 +113,10 @@ The pipeline integrates seven major analysis modules that can be flexibly enable
 | # | Module | Script | Required | Description |
 |---|--------|--------|----------|-------------|
 | 1 | Cell Ranger | `cellranger_count.py` | Yes | FASTQ alignment, counting, BAM generation |
-| 2 | QC & Filtering | `scanpy_qc_annotation.py` | Yes | Quality control, doublet removal, filtering |
+| 2 | QC & Filtering | `scanpy_qc_annotation.py` | Yes | Quality control, doublet removal, adaptive filtering |
 | 3 | Cell Annotation | `scanpy_qc_annotation.py` | Yes | popV annotation with cluster-based refinement |
 | 4 | Dysregulation | `cancer_cell_detection.py` | Default | Cancer cell detection (CytoTRACE2 + inferCNV) |
-| 5 | Viral Detection | `kraken2_viral_detection.py`, `summarize_viral_detection.py`, `viral_integration.py` | Optional | Pathogen detection in unmapped reads |
+| 5 | Viral Detection | `kraken2_viral_detection.py` | Optional | Pathogen detection in unmapped reads |
 | 6 | Mutation Calling | `scomatic_mutation_calling.py` | Optional | Somatic mutation calling (SComatic) |
 | 7 | Signatures | `signature_analysis.py` | Optional | Mutational signature deconvolution |
 
@@ -263,62 +272,45 @@ python snakemake_wrapper/create_config.py \
 
 The FASTA and GTF files are automatically derived from the Cell Ranger reference directory.
 
-**Override if needed** (for non-standard reference layouts):
+### Step 3: Run the Pipeline
 
 ```bash
-python snakemake_wrapper/create_config.py \
-    --output-dir ./results \
-    --sample-pickle samples.pkl \
-    --cellranger-reference /path/to/refdata-gex-GRCh38-2020-A \
-    --reference-fasta /custom/path/to/genome.fa \
-    --gtf-file /custom/path/to/genes.gtf \
-    --threads 16 \
-    --memory-gb 64
-```
-
-### Step 3: Run Pipeline
-
-```bash
-# Dry run first (recommended)
 cd snakemake_wrapper
-snakemake --configfile ../results/config.yaml --dryrun
-
-# Full run
 snakemake --configfile ../results/config.yaml \
-    --cores 32 \
+    --cores 16 \
     --use-conda
-```
-
-### For SRAscraper Users
-
-If you used [SRAscraper](https://github.com/JakeLehle/SRAscraper) to download data:
-
-```bash
-python snakemake_wrapper/create_config.py \
-    --output-dir ./results \
-    --sample-pickle /path/to/SRAscraper_output/metadata/sample_dict.pkl \
-    --cellranger-reference /path/to/refdata-gex-GRCh38-2020-A
 ```
 
 ---
 
 ## Detailed Usage
 
+### SRAscraper Integration
+
+If using [SRAscraper](https://github.com/JakeLehle/SRAscraper) to download data:
+
+```bash
+# Use SRAscraper pickle directly - no conversion needed
+python snakemake_wrapper/create_config.py \
+    --output-dir ./results \
+    --sample-pickle /path/to/srascraper/metadata/samples.pkl \
+    --cellranger-reference /path/to/refdata-gex-GRCh38-2020-A
+```
+
 ### Sample CSV Format
 
 #### Required Columns
 
-| Column | Description | Example |
-|--------|-------------|---------|
-| `sample_id` | Unique sample identifier | `SAMPLE1` |
-| `fastq_r1` | Path to R1 FASTQ file(s) | `/path/to/R1.fastq.gz` |
-| `fastq_r2` | Path to R2 FASTQ file(s) | `/path/to/R2.fastq.gz` |
+| Column | Description |
+|--------|-------------|
+| `sample_id` | Unique identifier for the sample |
+| `fastq_r1` | Path to R1 FASTQ file(s) |
+| `fastq_r2` | Path to R2 FASTQ file(s) |
 
 #### Optional Columns
 
 | Column | Description |
 |--------|-------------|
-| `sample_name` | Human-readable name |
 | `condition` | Experimental condition (tumor, normal, etc.) |
 | `donor` | Donor/patient ID |
 | `tissue` | Tissue type |
@@ -421,35 +413,95 @@ Aligns FASTQ files to the reference transcriptome and generates gene expression 
 
 **Script**: `scripts/scanpy_qc_annotation.py`
 
-Performs quality control, doublet detection, and cell filtering using Scanpy.
+Performs quality control, doublet detection, and cell filtering using Scanpy. Supports two filtering modes: **adaptive** (MAD-based, recommended) and **fixed** (threshold-based).
 
 #### QC Metrics Calculated
-- Number of genes per cell
-- Total UMI counts per cell
-- Mitochondrial gene percentage
-- Ribosomal gene percentage
+- Number of genes per cell (`n_genes_by_counts`)
+- Total UMI counts per cell (`total_counts`)
+- Mitochondrial gene percentage (`pct_counts_mt`)
+- Ribosomal gene percentage (`pct_counts_ribo`)
+- Hemoglobin gene percentage (`pct_counts_hb`)
+- Percent counts in top 20 genes (`pct_counts_in_top_20_genes`)
 - Doublet scores (Scrublet)
 
-#### Filtering Steps
+#### QC Filtering Modes
+
+ClusterCatcher supports two QC filtering approaches:
+
+##### Adaptive Mode (Default, Recommended)
+
+Uses **Median Absolute Deviation (MAD)** to identify statistical outliers. This approach:
+- Adapts automatically to each dataset's distribution
+- Preserves biological heterogeneity while removing technical artifacts
+- Works well for heterogeneous samples (e.g., tumor tissues, mixed populations)
+- Based on best practices from Luecken & Theis (2019) and Heumos et al. (2023)
+
+**How it works:**
+1. Calculates log1p-transformed metrics: `log1p_total_counts`, `log1p_n_genes_by_counts`
+2. Computes `pct_counts_in_top_20_genes` to detect cells dominated by few genes
+3. For each metric, calculates median and MAD
+4. Flags cells where `|value - median| > nmads × MAD` as outliers
+5. Combines outlier flags with OR logic for general QC and mitochondrial filtering
+
+```
+Outlier = (log1p_total_counts outlier) OR 
+          (log1p_n_genes_by_counts outlier) OR 
+          (pct_counts_in_top_20_genes outlier)
+
+MT_Outlier = (pct_counts_mt outlier) OR (pct_counts_mt > max_mito_pct)
+
+Final Filter = NOT(Outlier) AND NOT(MT_Outlier) AND (n_genes >= min_genes)
+```
+
+##### Fixed Mode (Original Behavior)
+
+Uses hard thresholds for filtering. Good for:
+- Well-characterized datasets with known quality ranges
+- Reproducibility with specific threshold values
+- Backward compatibility with existing workflows
+
+**Filtering Steps (Fixed Mode):**
 1. Remove cells with < `min_genes` genes detected
-2. Remove cells with > `max_genes` genes detected
-3. Remove cells with < `min_counts` total counts
-4. Remove cells with > `max_counts` total counts
+2. Remove cells with > `max_genes` genes detected (if set)
+3. Remove cells with < `min_counts` total counts (if set)
+4. Remove cells with > `max_counts` total counts (if set)
 5. Remove cells with > `max_mito_pct` mitochondrial reads
-6. Remove predicted doublets
+6. Remove genes expressed in < `min_cells` cells
+7. Remove predicted doublets
 
 #### Key Parameters
 
+##### Common Parameters (Both Modes)
+
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `min_genes` | `200` | Minimum genes per cell |
-| `max_genes` | `5000` | Maximum genes per cell |
-| `min_counts` | `500` | Minimum UMI counts |
-| `max_counts` | `50000` | Maximum UMI counts |
-| `max_mito_pct` | `20` | Maximum mitochondrial % |
-| `min_cells` | `3` | Minimum cells expressing a gene |
-| `doublet_removal` | `true` | Enable doublet detection |
-| `doublet_rate` | `0.08` | Expected doublet rate |
+| `qc_mode` | `adaptive` | Filtering mode: "adaptive" or "fixed" |
+| `min_genes` | `200` | Minimum genes per cell (always applied) |
+| `max_mito_pct` | `20` | Maximum mitochondrial % (hard cap in adaptive, threshold in fixed) |
+| `min_cells` | `20` | Minimum cells expressing a gene |
+| `doublet_removal` | `true` | Enable Scrublet doublet detection |
+| `doublet_rate` | `0.08` | Expected doublet rate for Scrublet |
+
+##### Adaptive Mode Parameters (MAD-based)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `mad_n_counts` | `5` | MADs for `log1p_total_counts` outliers |
+| `mad_n_genes` | `5` | MADs for `log1p_n_genes_by_counts` outliers |
+| `mad_top_genes` | `5` | MADs for `pct_counts_in_top_20_genes` outliers |
+| `mad_mito` | `3` | MADs for `pct_counts_mt` outliers |
+
+> **Note:** Higher MAD values = more permissive (fewer cells filtered). 5 MADs is permissive for counts/genes to preserve biological heterogeneity; 3 MADs is more stringent for mitochondrial content to remove dying cells.
+
+##### Fixed Mode Parameters (Threshold-based)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `max_genes` | `null` | Maximum genes per cell |
+| `min_counts` | `null` | Minimum UMI counts per cell |
+| `max_counts` | `null` | Maximum UMI counts per cell |
+
+> **Note:** Defaults are `null` to prevent over-filtering. When using fixed mode, set these explicitly based on your dataset's characteristics.
 
 #### Outputs
 - `qc/qc_metrics.tsv` - Per-sample QC statistics
@@ -516,223 +568,60 @@ The annotation follows a 7-step pipeline:
 
 ClusterCatcher uses **popV** (Population-level Voting) with HubModel from Hugging Face for automated cell type annotation.
 
-**Key features:**
-- Runs on **raw counts** (before normalization)
-- Downloads pre-trained models from Hugging Face
-- Uses batch correction during annotation
-- Transfers predictions back to original object
-
-**Available models** (set via `popv_huggingface_repo`):
-
-| Model | Description |
-|-------|-------------|
-| `popV/tabula_sapiens_All_Cells` | All cell types (default, recommended) |
-| `popV/tabula_sapiens_immune` | Immune cells only |
-| `popV/human_lung` | Lung-specific |
-
-See [Hugging Face popV](https://huggingface.co/popV) for more models.
-
-#### Cluster-Based Annotation Refinement
-
-After popV annotation, ClusterCatcher refines predictions using cluster-level weighted scoring:
-
-1. **Min-Max normalization** of `popv_prediction_score` within each cluster
-2. **Linear weighting** to sum to 1 within each cluster
-3. **Weighted aggregation** of scores per cell type per cluster
-4. **Assignment** of dominant cell type to all cells in cluster
-
-This approach:
-- Reduces noise from low-confidence predictions
-- Leverages cluster structure for more robust assignments
-- Produces cleaner cell type boundaries
-
 #### Key Parameters
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `popv_huggingface_repo` | `popV/tabula_sapiens_All_Cells` | Hugging Face model repository |
-| `popv_prediction_mode` | `inference` | `inference` (full) or `fast` |
-| `popv_gene_symbol_key` | `feature_name` | Gene symbol column in adata.var |
-| `popv_cache_dir` | `tmp/popv_models` | Cache for downloaded models |
-| `batch_key` | `sample_id` | Batch correction key |
-
-#### Post-Annotation Processing Parameters
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `target_sum` | `1000000` | Normalization target (1e6 = CPM) |
-| `n_pcs` | `null` | PCs for neighbors (null = CPU count) |
-| `n_neighbors` | `15` | Neighbors for graph construction |
-| `leiden_resolution` | `1.0` | Clustering resolution |
-| `run_bbknn` | `false` | Enable BBKNN batch correction |
-| `bbknn_batch_key` | `sample_id` | Batch key for BBKNN |
+| `popv_huggingface_repo` | `popV/tabula_sapiens_All_Cells` | Model repository |
+| `popv_prediction_mode` | `inference` | Prediction mode |
+| `popv_gene_symbol_key` | `feature_name` | Gene symbol column |
+| `batch_key` | `sample_id` | Batch column for correction |
 
 #### Outputs
-
-- `annotation/adata_annotated.h5ad` - Annotated AnnData with:
-  - `popv_prediction`: Raw popV cell type calls
-  - `popv_prediction_score`: Confidence scores
-  - `clusters`: Leiden cluster assignments
-  - `final_annotation`: Cluster-refined cell types
+- `annotation/adata_annotated.h5ad` - Final annotated AnnData
 - `annotation/annotation_summary.tsv` - Cell type counts per sample
-- `figures/qc/UMAP_popv_prediction.pdf` - UMAP colored by popV calls
-- `figures/qc/UMAP_popv_prediction_score.pdf` - UMAP colored by confidence
-- `figures/qc/UMAP_final_annotation.pdf` - UMAP with non-overlapping labels
-- `figures/qc/UMAP_samples.pdf` - UMAP colored by sample
-- `figures/qc/UMAP_clusters.pdf` - UMAP colored by cluster
-- `figures/qc/Stacked_Bar_Cluster_Composition.pdf` - Cell type composition per cluster
-- `figures/qc/cell_type_proportions.pdf` - Cell type proportions per sample
+- `figures/qc/UMAP_*.pdf` - Annotation visualizations
 
 ---
 
-### Module 4: Dysregulation Detection (Cancer Cell Identification)
+### Module 4: Dysregulation Detection
 
 **Script**: `scripts/cancer_cell_detection.py`
 
-Identifies cancer/dysregulated cells using a dual-model consensus approach.
-
-#### How It Works
-
-```
-┌─────────────────┐     ┌─────────────────┐
-│   CytoTRACE2    │     │    InferCNV     │
-│  (Stemness)     │     │  (CNV Scores)   │
-└────────┬────────┘     └────────┬────────┘
-         │                       │
-         ▼                       ▼
-    ┌─────────┐            ┌─────────┐
-    │ Potency │            │   CNV   │
-    │  Score  │            │  Score  │
-    └────┬────┘            └────┬────┘
-         │                      │
-         └──────────┬───────────┘
-                    ▼
-           ┌──────────────┐
-           │  Agreement   │
-           │    Score     │
-           └──────┬───────┘
-                  ▼
-           ┌──────────────┐
-           │ Cancer/Normal│
-           │Classification│
-           └──────────────┘
-```
-
-#### CytoTRACE2 Component
-- Scores cell developmental potential (0-1)
-- Higher scores = more stem-like/cancer-like
-- Automatic bimodal threshold detection
-
-#### InferCNV Component
-- Uses normal cell types as reference
-- Detects copy number variations
-- Scores chromosomal instability
-
-#### Agreement Scoring
-- Combines both models using weighted correlation
-- `alpha` parameter controls rank vs. value weighting
-- Cells classified as cancer only if both models agree
+Identifies dysregulated/cancer cells using dual-model consensus (CytoTRACE2 + inferCNV).
 
 #### Key Parameters
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `cytotrace2.enabled` | `true` | Enable CytoTRACE2 |
-| `cytotrace2.species` | `human` | Species for model |
 | `infercnv.enabled` | `true` | Enable inferCNV |
-| `infercnv.window_size` | `250` | CNV sliding window |
-| `infercnv_reference_groups` | `null` | Normal cell types for reference |
-| `agreement.alpha` | `0.5` | Rank (0) vs. value (1) weight |
-| `agreement.min_correlation` | `0.5` | Minimum Spearman rho |
+| `infercnv.window_size` | `250` | Window size for CNV |
+| `infercnv_reference_groups` | `null` | Reference cell types |
 
 #### Outputs
-- `dysregulation/adata_cancer_detected.h5ad` - AnnData with cancer labels
-- `dysregulation/cancer_detection_summary.tsv` - Classification summary
-- `dysregulation/figures/` - CytoTRACE2, CNV, and agreement plots
+- `dysregulation/adata_cancer_detected.h5ad` - AnnData with cancer scores
+- `dysregulation/dysregulation_summary.tsv` - Summary statistics
 
 ---
 
 ### Module 5: Viral Detection
 
-**Scripts**: 
-- `scripts/kraken2_viral_detection.py` - Per-sample viral detection
-- `scripts/summarize_viral_detection.py` - Cross-sample summary
-- `scripts/viral_integration.py` - Integration with expression data
+**Script**: `scripts/kraken2_viral_detection.py`
 
-Detects viral/microbial sequences in unmapped reads using Kraken2.
-
-#### Workflow
-
-```
-┌──────────────────┐
-│ Cell Ranger BAM  │
-│ (unmapped reads) │
-└────────┬─────────┘
-         │
-         ▼
-┌──────────────────┐
-│ Extract Unmapped │
-│    (samtools)    │
-└────────┬─────────┘
-         │
-         ▼
-┌──────────────────┐
-│    Kraken2       │
-│ Classification   │
-└────────┬─────────┘
-         │
-         ▼
-┌──────────────────┐
-│ Build SC Matrix  │
-│(organism x cell) │
-└────────┬─────────┘
-         │
-         ▼
-┌──────────────────┐
-│ Filter Human     │
-│   Viruses Only   │
-└────────┬─────────┘
-         │
-         ▼
-┌──────────────────┐
-│ Integrate with   │
-│ Gene Expression  │
-└──────────────────┘
-```
-
-#### Outputs
-- `viral/{sample}/kraken2_filtered_feature_bc_matrix/` - Per-sample viral count matrices
-- `viral/{sample}/{sample}_organism_summary.tsv` - Per-sample organism summary
-- `viral/viral_detection_summary.tsv` - Cross-sample summary
-- `viral/viral_counts.h5ad` - Combined viral AnnData
-- `viral_integration/adata_with_virus.h5ad` - Expression + viral data
-- `viral_integration/figures/` - Viral detection visualizations
+Detects viral pathogens in unmapped reads using Kraken2.
 
 #### Key Parameters
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `kraken_db` | required | Kraken2 database path |
-| `viral_db` | optional | Human viral inspect.txt for filtering |
-| `confidence` | `0.1` | Kraken2 confidence threshold |
-| `include_organisms` | `null` | Organism patterns to include |
-| `exclude_organisms` | `null` | Organism patterns to exclude |
+| `viral_db` | optional | Viral database for integration |
+| `confidence` | `0.1` | Classification confidence |
 
-#### Kraken2 Database Setup
-
-```bash
-# Option A: Download pre-built viral database
-wget https://genome-idx.s3.amazonaws.com/kraken/k2_viral_20231009.tar.gz
-tar -xzf k2_viral_20231009.tar.gz -C ~/kraken2_db/
-
-# Option B: Build custom human viral database
-kraken2-build --download-taxonomy --db ~/kraken2_db/human_viral
-datasets download virus genome taxon "human virus" --filename human_viruses.zip
-unzip human_viruses.zip
-kraken2-build --add-to-library ncbi_dataset/data/genomic.fna --db ~/kraken2_db/human_viral
-kraken2-build --build --db ~/kraken2_db/human_viral --threads 16
-kraken2-inspect --db ~/kraken2_db/human_viral > ~/kraken2_db/human_viral/inspect.txt
-```
+#### Outputs
+- `viral/viral_detection_summary.tsv` - Viral detection results
+- `viral/viral_counts.h5ad` - Viral counts AnnData
 
 ---
 
@@ -740,50 +629,22 @@ kraken2-inspect --db ~/kraken2_db/human_viral > ~/kraken2_db/human_viral/inspect
 
 **Script**: `scripts/scomatic_mutation_calling.py`
 
-Comprehensive 10-phase somatic mutation calling pipeline using SComatic.
-
-#### Workflow Phases
-
-| Phase | Description | Output |
-|-------|-------------|--------|
-| 1 | Filter BAM to annotated cells | Filtered BAM |
-| 2 | Split BAM by cell type | Per-cell-type BAMs |
-| 3 | Count bases per cell | Base count tables |
-| 4 | Merge counts across samples | Combined counts |
-| 5 | Variant calling (Step 1) | Raw variants |
-| 6 | Filter with PoN/editing sites | Filtered variants |
-| 7 | BED file filtering | Mappable variants |
-| 8 | Callable sites (cell type) | Cell type callable |
-| 9 | Callable sites (per cell) | Per-cell callable |
-| 10 | Single-cell genotypes | Final mutations |
-
-#### Required Reference Files
-
-| File | Description | How to Obtain |
-|------|-------------|---------------|
-| `editing_sites` | Known RNA editing positions | SComatic repo or RADAR database |
-| `pon_file` | Panel of Normals | Generate from matched normals |
-| `bed_file` | Mappable genomic regions | Download or generate |
+Calls somatic mutations at single-cell resolution using SComatic.
 
 #### Key Parameters
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `scripts_dir` | required | Path to SComatic/scripts |
+| `scripts_dir` | required | SComatic scripts directory |
 | `editing_sites` | required | RNA editing sites file |
 | `pon_file` | required | Panel of Normals |
 | `bed_file` | required | Mappable regions BED |
 | `min_cov` | `5` | Minimum coverage |
 | `min_cells` | `5` | Minimum cells with variant |
-| `min_base_quality` | `30` | Base quality threshold |
-| `min_map_quality` | `30` | Mapping quality threshold |
 
 #### Outputs
-- `mutations/all_samples.single_cell_genotype.filtered.tsv` - Final mutations
-- `mutations/CombinedCallableSites/complete_callable_sites.tsv` - Callable sites
-- `mutations/cell_annotations.tsv` - Cell barcode to type mapping
-- `mutations/trinucleotide_background.tsv` - Background frequencies
-- `mutations/{sample}/` - Per-sample intermediate files
+- `mutations/all_samples.single_cell_genotype.filtered.tsv` - Filtered mutations
+- `mutations/CombinedCallableSites/` - Callable sites
 
 ---
 
@@ -791,86 +652,20 @@ Comprehensive 10-phase somatic mutation calling pipeline using SComatic.
 
 **Script**: `scripts/signature_analysis.py`
 
-Deconvolves single-cell mutations into COSMIC mutational signatures using semi-supervised NNLS (Non-Negative Least Squares).
-
-#### Workflow
-
-```
-┌──────────────────┐
-│ Single-Cell      │
-│ Mutations (TSV)  │
-└────────┬─────────┘
-         │
-         ▼
-┌──────────────────┐
-│ Build 96-Context │
-│ Mutation Matrix  │
-└────────┬─────────┘
-         │
-         ▼
-┌──────────────────┐
-│ Aggregate Cell   │
-│ Profiles         │
-└────────┬─────────┘
-         │
-         ▼
-┌──────────────────┐
-│ NNLS Fitting to  │
-│ COSMIC Signatures│
-└────────┬─────────┘
-         │
-         ▼
-┌──────────────────┐
-│ Add Signature    │
-│ Weights to       │
-│ AnnData          │
-└──────────────────┘
-```
-
-#### Signature Selection Methods
-
-1. **All Signatures**: Fit all provided COSMIC signatures
-2. **HNSCC-Specific** (`--hnscc-only`): Use curated set of 15 HNSCC-relevant signatures
-3. **Scree Plot** (`--use-scree-plot`): Automatic selection using elbow detection
-
-#### HNSCC Signature Set
-
-When `--hnscc-only` is enabled, these signatures are used:
-
-| Signature | Proposed Etiology |
-|-----------|-------------------|
-| SBS1 | Spontaneous deamination (age) |
-| SBS2 | APOBEC activity |
-| SBS4 | Tobacco smoking |
-| SBS5 | Clock-like (unknown) |
-| SBS7a/b | UV exposure |
-| SBS13 | APOBEC activity |
-| SBS16 | Unknown (liver-associated) |
-| SBS17a/b | Unknown |
-| SBS18 | Reactive oxygen species |
-| SBS29 | Tobacco chewing |
-| SBS39 | Unknown |
-| SBS40 | Unknown |
-| SBS44 | Defective DNA mismatch repair |
+Deconvolves single-cell mutations into COSMIC mutational signatures.
 
 #### Key Parameters
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `cosmic_file` | required | COSMIC signatures file |
-| `core_signatures` | `SBS2,SBS13,SBS5` | Always include these |
-| `use_scree_plot` | `false` | Use elbow detection |
-| `mutation_threshold` | `0` | Min mutations per cell |
-| `max_signatures` | `15` | Max signatures to test |
-| `hnscc_only` | `false` | Use HNSCC signature set |
+| `core_signatures` | `SBS2,SBS13,SBS5` | Always include |
+| `use_scree_plot` | `true` | Use elbow detection |
+| `hnscc_only` | `false` | HNSCC signature set |
 
 #### Outputs
-- `signatures/signature_weights_per_cell.txt` - Per-cell signature weights
-- `signatures/adata_final.h5ad` - Final AnnData with all annotations
-- `signatures/mutation_matrix_96contexts.txt` - 96-context mutation matrix
-- `signatures/cosmic_signatures_used.txt` - Signatures used
-- `signatures/reconstruction_evaluation.txt` - Quality metrics
-- `signatures/figures/` - Visualization plots
+- `signatures/signature_weights_per_cell.txt` - Per-cell weights
+- `signatures/adata_final.h5ad` - Final AnnData
 
 ---
 
@@ -898,13 +693,6 @@ reference:
   genome: "GRCh38"
 ```
 
-**How it works**:
-1. You only need to specify `cellranger` (the Cell Ranger reference directory)
-2. The pipeline automatically derives:
-   - `fasta` from `{cellranger}/fasta/genome.fa`
-   - `gtf` from `{cellranger}/genes/genes.gtf`
-3. Override these only if your reference has a non-standard layout
-
 ### Complete Configuration Example
 
 ```yaml
@@ -924,16 +712,27 @@ reference:
   cellranger: "/path/to/refdata-gex-GRCh38-2020-A"
   genome: "GRCh38"
 
-# QC parameters
+# QC parameters - Adaptive mode (recommended)
 qc:
-  min_genes: 200
-  max_genes: 5000
-  min_counts: 500
-  max_counts: 50000
-  max_mito_pct: 20
-  min_cells: 3
+  qc_mode: "adaptive"           # "adaptive" (MAD-based) or "fixed" (thresholds)
+  
+  # Common parameters
+  min_genes: 200                # Always applied
+  max_mito_pct: 20              # Hard cap in adaptive, threshold in fixed
+  min_cells: 20                 # Min cells expressing a gene
   doublet_removal: true
   doublet_rate: 0.08
+  
+  # Adaptive mode: MAD thresholds
+  mad_n_counts: 5               # MADs for log1p_total_counts
+  mad_n_genes: 5                # MADs for log1p_n_genes_by_counts
+  mad_top_genes: 5              # MADs for pct_counts_in_top_20_genes
+  mad_mito: 3                   # MADs for pct_counts_mt
+  
+  # Fixed mode: Hard thresholds (only used when qc_mode: "fixed")
+  max_genes: null               # Set explicitly if using fixed mode
+  min_counts: null              # Set explicitly if using fixed mode
+  max_counts: null              # Set explicitly if using fixed mode
 
 # Preprocessing (post-annotation)
 preprocessing:
@@ -1006,13 +805,28 @@ modules:
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--min-genes` | `200` | Min genes per cell |
-| `--max-genes` | `5000` | Max genes per cell |
-| `--min-counts` | `500` | Min UMI counts |
-| `--max-counts` | `50000` | Max UMI counts |
+| `--qc-mode` | `adaptive` | QC filtering mode: "adaptive" (MAD-based) or "fixed" (thresholds) |
+| `--min-genes` | `200` | Min genes per cell (always applied) |
 | `--max-mito-pct` | `20` | Max mitochondrial % |
-| `--min-cells` | `3` | Min cells expressing gene |
+| `--min-cells` | `20` | Min cells expressing gene |
 | `--doublet-rate` | `0.08` | Expected doublet rate |
+
+##### Adaptive Mode Options (MAD-based outlier detection)
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--mad-n-counts` | `5` | MADs for log1p_total_counts outliers |
+| `--mad-n-genes` | `5` | MADs for log1p_n_genes_by_counts outliers |
+| `--mad-top-genes` | `5` | MADs for pct_counts_in_top_20_genes outliers |
+| `--mad-mito` | `3` | MADs for pct_counts_mt outliers |
+
+##### Fixed Mode Options (threshold-based filtering)
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--max-genes` | `null` | Max genes per cell |
+| `--min-counts` | `null` | Min UMI counts |
+| `--max-counts` | `null` | Max UMI counts |
 
 #### Module Enable/Disable
 
@@ -1146,6 +960,67 @@ annotation:
   popv_huggingface_repo: "popV/tabula_sapiens_immune"
 ```
 
+### QC Filtering Issues
+
+#### Too many cells filtered
+
+If adaptive mode is removing too many cells:
+
+1. Check your QC violin plots to understand your data distribution
+2. Increase MAD thresholds (more permissive):
+   ```yaml
+   qc:
+     mad_n_counts: 6    # Default: 5
+     mad_n_genes: 6     # Default: 5
+     mad_mito: 4        # Default: 3
+   ```
+
+3. Or switch to fixed mode with custom thresholds based on your plots:
+   ```bash
+   python create_config.py ... \
+       --qc-mode fixed \
+       --max-genes 8000 \
+       --min-counts 300 \
+       --max-counts 80000
+   ```
+
+#### Too few cells filtered
+
+If you suspect low-quality cells are passing through:
+
+1. Decrease MAD thresholds (more stringent):
+   ```yaml
+   qc:
+     mad_n_counts: 3
+     mad_n_genes: 3
+     mad_mito: 2
+   ```
+
+2. Or increase `min_genes`:
+   ```yaml
+   qc:
+     min_genes: 500
+   ```
+
+#### Comparing Adaptive vs Fixed Mode
+
+To compare filtering approaches on your data:
+
+```python
+# In a Jupyter notebook after running the pipeline
+import scanpy as sc
+
+# Check outlier flags (adaptive mode adds these)
+adata = sc.read_h5ad("results/annotation/adata_annotated.h5ad")
+
+# If adaptive mode was used, these columns exist:
+if 'outlier' in adata.obs.columns:
+    print(f"General outliers: {adata.obs['outlier'].sum()}")
+    print(f"MT outliers: {adata.obs['mt_outlier'].sum()}")
+```
+
+### SComatic Issues
+
 #### SComatic script errors
 
 Verify SComatic installation:
@@ -1214,6 +1089,11 @@ Please also cite the tools used in each module:
 | SComatic | Muyas et al., Nature Biotechnology 2024 |
 | Kraken2 | Wood et al., Genome Biology 2019 |
 | COSMIC | Alexandrov et al., Nature 2020 |
+
+### QC Best Practices References
+
+- Luecken, M.D. & Theis, F.J. (2019). Current best practices in single-cell RNA-seq analysis: a tutorial. *Molecular Systems Biology*, 15(6), e8746.
+- Heumos, L. et al. (2023). Best practices for single-cell analysis across modalities. *Nature Reviews Genetics*, 24, 550–572.
 
 ---
 
