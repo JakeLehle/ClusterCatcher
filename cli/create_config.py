@@ -1,97 +1,78 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-create_config.py
-================
+ClusterCatcher Configuration Generator
+======================================
 
-CLI command to create the ClusterCatcher pipeline configuration file.
+Generate pipeline configuration YAML file with all necessary parameters.
+
+This script creates a complete config.yaml for the ClusterCatcher pipeline,
+supporting:
+- Cell Ranger alignment
+- QC and annotation (Scanpy + popV)
+- Dysregulation detection (CytoTRACE2 + inferCNV)
+- Viral detection (Kraken2)
+- Mutation calling (SComatic)
+- Signature analysis (COSMIC NNLS)
 
 Usage:
-    python create_config.py [OPTIONS]
-    clustercatcher create-config [OPTIONS]
-
-Author: Jake Lehle
-Date: 2025
+    python create_config.py --output-dir ./results --sample-pickle samples.pkl \\
+        --cellranger-reference /path/to/refdata-gex-GRCh38-2020-A
 """
 
+import argparse
 import os
 import sys
 import yaml
-import argparse
 from pathlib import Path
 
 
 def validate_path(path, name, must_exist=True, create_dir=False):
-    """Validate a file or directory path."""
+    """Validate and return absolute path."""
     if path is None:
         return None
     
-    path = Path(path).resolve()
+    abs_path = os.path.abspath(path)
     
-    if create_dir and not path.exists():
-        path.mkdir(parents=True, exist_ok=True)
-        print(f"  Created directory: {path}")
+    if create_dir and not os.path.exists(abs_path):
+        os.makedirs(abs_path, exist_ok=True)
+        print(f"  Created directory: {abs_path}")
+    elif must_exist and not os.path.exists(abs_path):
+        raise FileNotFoundError(f"{name} not found: {abs_path}")
     
-    if must_exist and not path.exists():
-        raise FileNotFoundError(f"{name} not found: {path}")
-    
-    return str(path)
+    return abs_path
 
 
 def auto_derive_reference_paths(cellranger_ref):
     """
-    Auto-derive fasta and gtf paths from Cell Ranger reference directory.
+    Auto-derive FASTA and GTF paths from Cell Ranger reference directory.
     
-    Standard 10x Genomics reference layout:
-        {cellranger}/
-        ├── fasta/
-        │   └── genome.fa
-        ├── genes/
-        │   └── genes.gtf
-        └── star/
-            └── ...
-    
-    Parameters
-    ----------
-    cellranger_ref : str
-        Path to Cell Ranger reference directory
-        
-    Returns
-    -------
-    tuple
-        (fasta_path, gtf_path) - paths if found, None if not
+    Standard Cell Ranger reference layout:
+    {cellranger_ref}/
+    ├── fasta/
+    │   └── genome.fa
+    ├── genes/
+    │   └── genes.gtf
+    └── star/
+        └── ...
     """
-    cellranger_path = Path(cellranger_ref)
-    
-    # Try to find FASTA
     fasta_path = None
-    potential_fasta_files = [
-        cellranger_path / "fasta" / "genome.fa",
-        cellranger_path / "fasta" / "genome.fasta",
-        cellranger_path / "fasta" / "reference.fa",
-    ]
-    for fasta_candidate in potential_fasta_files:
-        if fasta_candidate.exists():
-            fasta_path = str(fasta_candidate)
-            break
-    
-    # Try to find GTF
     gtf_path = None
-    potential_gtf_files = [
-        cellranger_path / "genes" / "genes.gtf",
-        cellranger_path / "genes" / "annotations.gtf",
-        cellranger_path / "genes" / "reference.gtf",
-    ]
-    for gtf_candidate in potential_gtf_files:
-        if gtf_candidate.exists():
-            gtf_path = str(gtf_candidate)
-            break
+    
+    # Try standard locations
+    potential_fasta = os.path.join(cellranger_ref, "fasta", "genome.fa")
+    if os.path.exists(potential_fasta):
+        fasta_path = potential_fasta
+    
+    potential_gtf = os.path.join(cellranger_ref, "genes", "genes.gtf")
+    if os.path.exists(potential_gtf):
+        gtf_path = potential_gtf
     
     return fasta_path, gtf_path
 
 
 def create_config(args):
-    """Create the pipeline configuration file."""
+    """Create configuration dictionary and write to YAML file."""
+    
     print("="*70)
     print("CLUSTERCATCHER - CREATE CONFIGURATION")
     print("="*70)
@@ -209,6 +190,17 @@ def create_config(args):
     print(f"  Hugging Face repo: {args.popv_huggingface_repo}")
     print(f"  Prediction mode: {args.popv_prediction_mode}")
     
+    # QC mode information
+    print("\nConfiguring QC filtering...")
+    print(f"  QC mode: {args.qc_mode}")
+    if args.qc_mode == 'adaptive':
+        print(f"    MAD thresholds: counts={args.mad_n_counts}, genes={args.mad_n_genes}, "
+              f"top_genes={args.mad_top_genes}, mito={args.mad_mito}")
+    else:
+        print(f"    Fixed thresholds: min_genes={args.min_genes}, max_genes={args.max_genes}, "
+              f"min_counts={args.min_counts}, max_counts={args.max_counts}")
+    print(f"  Common: min_cells={args.min_cells}, max_mito_pct={args.max_mito_pct}%")
+    
     # Determine fastq_base_dir
     fastq_base_dir = args.fastq_base_dir
     if not fastq_base_dir and sample_info_path:
@@ -265,15 +257,28 @@ def create_config(args):
         },
         
         # QC settings (all parameters exposed)
+        # Supports two modes: "adaptive" (MAD-based) and "fixed" (threshold-based)
         'qc': {
+            # QC mode selection
+            'qc_mode': args.qc_mode,
+            
+            # Common parameters (used in both modes)
             'min_genes': args.min_genes,
-            'max_genes': args.max_genes,
-            'min_counts': args.min_counts,
-            'max_counts': args.max_counts,
             'max_mito_pct': args.max_mito_pct,
             'min_cells': args.min_cells,
             'doublet_removal': args.doublet_removal,
             'doublet_rate': args.doublet_rate,
+            
+            # Adaptive mode parameters (MAD-based outlier detection)
+            'mad_n_counts': args.mad_n_counts,
+            'mad_n_genes': args.mad_n_genes,
+            'mad_top_genes': args.mad_top_genes,
+            'mad_mito': args.mad_mito,
+            
+            # Fixed mode parameters (threshold-based filtering)
+            'max_genes': args.max_genes,
+            'min_counts': args.min_counts,
+            'max_counts': args.max_counts,
         },
         
         # Preprocessing settings (post-annotation)
@@ -402,6 +407,11 @@ def create_config(args):
     print(f"  Cell Ranger: {cellranger_ref}")
     print(f"  FASTA: {reference_fasta or 'Not found'}")
     print(f"  GTF: {gtf_file or 'Not found'}")
+    print(f"\nQC Mode: {args.qc_mode}")
+    if args.qc_mode == 'adaptive':
+        print(f"  Using MAD-based outlier detection (recommended)")
+    else:
+        print(f"  Using fixed threshold filtering")
     print(f"\nAnnotation: popV ({args.popv_huggingface_repo})")
     print(f"\nTo run the pipeline:")
     print(f"  cd snakemake_wrapper")
@@ -416,19 +426,26 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Basic usage - only cellranger-reference is required for references
-  # FASTA and GTF are auto-derived from standard 10x reference layout
+  # Basic usage with adaptive QC (recommended) - only cellranger-reference is required
   python create_config.py \\
     --output-dir /path/to/output \\
     --sample-pickle samples.pkl \\
     --cellranger-reference /path/to/refdata-gex-GRCh38-2020-A
 
-  # Override auto-derived FASTA if using non-standard layout
+  # Use fixed threshold QC mode (original behavior)
   python create_config.py \\
     --output-dir /path/to/output \\
     --sample-pickle samples.pkl \\
-    --cellranger-reference /path/to/cellranger_ref \\
-    --reference-fasta /custom/path/to/genome.fa
+    --cellranger-reference /path/to/refdata-gex-GRCh38-2020-A \\
+    --qc-mode fixed \\
+    --max-genes 5000 --min-counts 500 --max-counts 50000
+
+  # Customize MAD thresholds for adaptive mode
+  python create_config.py \\
+    --output-dir /path/to/output \\
+    --sample-pickle samples.pkl \\
+    --cellranger-reference /path/to/refdata-gex-GRCh38-2020-A \\
+    --mad-n-counts 4 --mad-n-genes 4 --mad-mito 2.5
 
   # Enable all modules with custom popV model
   python create_config.py \\
@@ -495,16 +512,51 @@ Examples:
     # ==========================================================================
     # QC settings
     # ==========================================================================
-    qc = parser.add_argument_group('QC Settings')
-    qc.add_argument('--min-genes', type=int, default=200, help='Min genes per cell (default: 200)')
-    qc.add_argument('--max-genes', type=int, default=5000, help='Max genes per cell (default: 5000)')
-    qc.add_argument('--min-counts', type=int, default=500, help='Min counts per cell (default: 500)')
-    qc.add_argument('--max-counts', type=int, default=50000, help='Max counts per cell (default: 50000)')
-    qc.add_argument('--max-mito-pct', type=float, default=20, help='Max mitochondrial %% (default: 20)')
-    qc.add_argument('--min-cells', type=int, default=3, help='Min cells expressing a gene (default: 3)')
-    qc.add_argument('--doublet-removal', action='store_true', default=True, help='Enable doublet removal (default: True)')
-    qc.add_argument('--no-doublet-removal', action='store_false', dest='doublet_removal', help='Disable doublet removal')
-    qc.add_argument('--doublet-rate', type=float, default=0.08, help='Expected doublet rate (default: 0.08)')
+    qc = parser.add_argument_group('QC Settings',
+        description='''
+QC filtering supports two modes:
+  - "adaptive" (default, recommended): MAD-based outlier detection that adapts to each dataset
+  - "fixed": Traditional threshold-based filtering with hard min/max values
+
+Adaptive mode uses log1p-transformed metrics and identifies statistical outliers,
+preserving biological heterogeneity while removing low-quality cells.
+        ''')
+    
+    # QC mode selection
+    qc.add_argument('--qc-mode', default='adaptive', choices=['adaptive', 'fixed'],
+                    help='QC filtering mode: "adaptive" (MAD-based, recommended) or "fixed" (threshold-based). Default: adaptive')
+    
+    # Common parameters (used in both modes)
+    qc.add_argument('--min-genes', type=int, default=200, 
+                    help='Min genes per cell - always applied (default: 200)')
+    qc.add_argument('--max-mito-pct', type=float, default=20, 
+                    help='Max mitochondrial %% - hard cap in adaptive, threshold in fixed (default: 20)')
+    qc.add_argument('--min-cells', type=int, default=20, 
+                    help='Min cells expressing a gene (default: 20, CHANGED from 3)')
+    qc.add_argument('--doublet-removal', action='store_true', default=True, 
+                    help='Enable doublet removal (default: True)')
+    qc.add_argument('--no-doublet-removal', action='store_false', dest='doublet_removal', 
+                    help='Disable doublet removal')
+    qc.add_argument('--doublet-rate', type=float, default=0.08, 
+                    help='Expected doublet rate (default: 0.08)')
+    
+    # Adaptive mode parameters (MAD-based)
+    qc.add_argument('--mad-n-counts', type=float, default=5, 
+                    help='MADs for log1p_total_counts outliers (default: 5)')
+    qc.add_argument('--mad-n-genes', type=float, default=5, 
+                    help='MADs for log1p_n_genes_by_counts outliers (default: 5)')
+    qc.add_argument('--mad-top-genes', type=float, default=5, 
+                    help='MADs for pct_counts_in_top_20_genes outliers (default: 5)')
+    qc.add_argument('--mad-mito', type=float, default=3, 
+                    help='MADs for pct_counts_mt outliers (default: 3)')
+    
+    # Fixed mode parameters (threshold-based) - defaults changed to None
+    qc.add_argument('--max-genes', type=int, default=None, 
+                    help='Max genes per cell - only used in fixed mode (default: None, CHANGED from 5000)')
+    qc.add_argument('--min-counts', type=int, default=None, 
+                    help='Min counts per cell - only used in fixed mode (default: None, CHANGED from 500)')
+    qc.add_argument('--max-counts', type=int, default=None, 
+                    help='Max counts per cell - only used in fixed mode (default: None, CHANGED from 50000)')
     
     # ==========================================================================
     # Preprocessing settings (post-annotation)
@@ -524,19 +576,19 @@ Examples:
                          help='Batch key for BBKNN (default: sample_id)')
     
     # ==========================================================================
-    # Annotation settings (popV only)
+    # Annotation settings (popV)
     # ==========================================================================
-    annotation = parser.add_argument_group('Annotation Settings (popV)')
-    annotation.add_argument('--popv-huggingface-repo', default='popV/tabula_sapiens_All_Cells',
-                           help='Hugging Face repository for popV model (default: popV/tabula_sapiens_All_Cells)')
-    annotation.add_argument('--popv-prediction-mode', default='inference', choices=['inference', 'fast'],
-                           help='popV prediction mode: inference (full) or fast (default: inference)')
-    annotation.add_argument('--popv-gene-symbol-key', default='feature_name',
-                           help='Gene symbol column in adata.var (default: feature_name)')
-    annotation.add_argument('--popv-cache-dir', default='tmp/popv_models',
-                           help='Cache directory for popV models (default: tmp/popv_models)')
-    annotation.add_argument('--batch-key', default='sample_id',
-                           help='Batch key for annotation (default: sample_id)')
+    annot = parser.add_argument_group('Cell Annotation Settings (popV)')
+    annot.add_argument('--popv-huggingface-repo', default='popV/tabula_sapiens_All_Cells',
+                       help='Hugging Face repo for popV model (default: popV/tabula_sapiens_All_Cells)')
+    annot.add_argument('--popv-prediction-mode', default='inference', choices=['inference', 'fast'],
+                       help='popV prediction mode (default: inference)')
+    annot.add_argument('--popv-gene-symbol-key', default='feature_name',
+                       help='Gene symbol key in adata.var (default: feature_name)')
+    annot.add_argument('--popv-cache-dir', default='tmp/popv_models',
+                       help='Cache directory for popV models (default: tmp/popv_models)')
+    annot.add_argument('--batch-key', default='sample_id',
+                       help='Batch key for annotation (default: sample_id)')
     
     # ==========================================================================
     # Dysregulation settings

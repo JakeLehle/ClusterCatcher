@@ -10,6 +10,7 @@ Scanpy and popV.
 This script performs:
 1. Loading Cell Ranger count matrices
 2. Quality control filtering (genes, UMIs, mitochondrial content)
+   - Supports both fixed threshold and MAD-based adaptive filtering
 3. Doublet detection and removal (Scrublet)
 4. Automated cell type annotation using popV (HubModel from Hugging Face)
 5. Post-annotation normalization and dimensionality reduction
@@ -25,6 +26,10 @@ The popV annotation workflow follows the structure:
 4. Run BBKNN batch correction (optional)
 5. Assign cluster-based final annotations using weighted scoring
 6. Generate publication-quality plots
+
+QC Filtering Modes:
+- "fixed": Traditional threshold-based filtering (min/max genes, counts, mito%)
+- "adaptive": MAD-based outlier detection (recommended for heterogeneous samples)
 
 Usage:
     Called via Snakemake rule with snakemake.input/output/params
@@ -75,6 +80,74 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# MAD-Based Outlier Detection Function
+# =============================================================================
+
+def is_outlier(adata, metric, nmads):
+    """
+    Detect outliers using Median Absolute Deviation (MAD).
+    
+    Identifies cells where the metric value is more than `nmads` MADs
+    away from the median. This approach adapts to each dataset's distribution,
+    making it more robust than fixed thresholds for heterogeneous samples.
+    
+    Parameters
+    ----------
+    adata : AnnData
+        Annotated data matrix
+    metric : str
+        Column name in adata.obs to use for outlier detection.
+        Common metrics: 'log1p_total_counts', 'log1p_n_genes_by_counts', 
+        'pct_counts_mt', 'pct_counts_in_top_20_genes'
+    nmads : float
+        Number of MADs to use as threshold. Cells beyond this many MADs
+        from the median are flagged as outliers.
+        Typical values: 5 for counts/genes, 3 for mitochondrial
+        
+    Returns
+    -------
+    pd.Series
+        Boolean series indicating outlier status (True = outlier)
+        
+    Notes
+    -----
+    The MAD (Median Absolute Deviation) is a robust measure of variability:
+        MAD = median(|X_i - median(X)|)
+    
+    This function flags a cell as an outlier if:
+        |X_i - median(X)| > nmads * MAD
+    
+    If MAD is 0 (can happen with very homogeneous data), falls back to
+    standard deviation.
+    
+    References
+    ----------
+    This approach follows best practices from:
+    - Luecken & Theis (2019) Current best practices in single-cell RNA-seq analysis
+    - Heumos et al. (2023) Best practices for single-cell analysis across modalities
+    """
+    M = adata.obs[metric]
+    median_val = M.median()
+    mad = stats.median_abs_deviation(M, nan_policy='omit')
+    
+    # Handle edge case where MAD is 0 (very homogeneous data)
+    if mad == 0:
+        logger.warning(f"  MAD for {metric} is 0, using std instead")
+        mad = M.std()
+        if mad == 0:
+            logger.warning(f"  Std for {metric} is also 0, no outliers detected")
+            return pd.Series([False] * len(M), index=M.index)
+    
+    outlier_mask = (np.abs(M - median_val) > nmads * mad)
+    
+    n_outliers = outlier_mask.sum()
+    logger.info(f"  {metric}: {n_outliers} outliers ({100*n_outliers/len(M):.1f}%) "
+                f"[median={median_val:.2f}, MAD={mad:.2f}, threshold=±{nmads*mad:.2f}]")
+    
+    return outlier_mask
 
 
 # =============================================================================
@@ -137,15 +210,57 @@ def load_cellranger_outputs(cellranger_base_dir, sample_ids):
 # QC Functions
 # =============================================================================
 
-def calculate_qc_metrics(adata):
-    """Calculate QC metrics for all cells."""
+def calculate_qc_metrics(adata, qc_params=None):
+    """
+    Calculate QC metrics for all cells.
+    
+    Parameters
+    ----------
+    adata : AnnData
+        Annotated data matrix with raw counts
+    qc_params : dict, optional
+        QC parameters from config. If provided and qc_mode is 'adaptive',
+        calculates additional metrics needed for MAD-based filtering.
+        
+    Returns
+    -------
+    AnnData
+        Updated AnnData with QC metrics in .obs and gene annotations in .var
+        
+    Notes
+    -----
+    For adaptive mode, calculates:
+    - log1p_total_counts: log1p-transformed UMI counts (for MAD filtering)
+    - log1p_n_genes_by_counts: log1p-transformed gene counts (for MAD filtering)
+    - pct_counts_in_top_20_genes: Concentration metric (for MAD filtering)
+    
+    For fixed mode (or if qc_params not provided):
+    - Standard metrics without log1p transformation
+    """
     logger.info("Calculating QC metrics...")
     
+    # Identify gene categories
     adata.var['mt'] = adata.var_names.str.startswith('MT-') | adata.var_names.str.startswith('mt-')
     adata.var['ribo'] = adata.var_names.str.startswith(('RPS', 'RPL', 'Rps', 'Rpl'))
     adata.var['hb'] = adata.var_names.str.contains('^HB[^(P)]', case=False, regex=True)
     
-    sc.pp.calculate_qc_metrics(adata, qc_vars=['mt', 'ribo', 'hb'], percent_top=None, log1p=False, inplace=True)
+    # Check if adaptive mode needs percent_top and log1p
+    qc_mode = qc_params.get('qc_mode', 'fixed') if qc_params else 'fixed'
+    
+    if qc_mode == 'adaptive':
+        # For adaptive mode, calculate with log1p and percent_top for MAD-based filtering
+        logger.info("  Using adaptive mode metrics (log1p=True, percent_top=[20])")
+        sc.pp.calculate_qc_metrics(
+            adata, qc_vars=['mt', 'ribo', 'hb'], 
+            percent_top=[20], log1p=True, inplace=True
+        )
+    else:
+        # Original behavior for fixed mode
+        logger.info("  Using fixed mode metrics (log1p=False)")
+        sc.pp.calculate_qc_metrics(
+            adata, qc_vars=['mt', 'ribo', 'hb'], 
+            percent_top=None, log1p=False, inplace=True
+        )
     
     logger.info(f"  Mean genes/cell: {adata.obs['n_genes_by_counts'].mean():.1f}")
     logger.info(f"  Mean counts/cell: {adata.obs['total_counts'].mean():.1f}")
@@ -155,34 +270,139 @@ def calculate_qc_metrics(adata):
 
 
 def filter_cells_and_genes(adata, qc_params):
-    """Filter cells and genes based on QC thresholds."""
+    """
+    Filter cells and genes based on QC thresholds or MAD-based outlier detection.
+    
+    Supports two filtering modes controlled by qc_params['qc_mode']:
+    
+    1. "fixed" (default): Traditional threshold-based filtering
+       - Uses min_genes, max_genes, min_counts, max_counts, max_mito_pct
+       - Good for well-characterized datasets with known quality ranges
+    
+    2. "adaptive": MAD-based outlier detection
+       - Uses median absolute deviation to identify outliers
+       - Adapts to each dataset's distribution
+       - Recommended for heterogeneous samples or when optimal thresholds are unknown
+       - Based on best practices from Luecken & Theis (2019)
+    
+    Parameters
+    ----------
+    adata : AnnData
+        Annotated data matrix with QC metrics calculated
+    qc_params : dict
+        QC parameters from config file. Expected keys depend on mode:
+        
+        Common (both modes):
+        - qc_mode: "fixed" or "adaptive" (default: "fixed")
+        - min_genes: Minimum genes per cell (default: 200)
+        - max_mito_pct: Maximum mitochondrial % (default: 20)
+        - min_cells: Minimum cells expressing a gene (default: 20)
+        
+        Fixed mode specific:
+        - max_genes: Maximum genes per cell (default: None)
+        - min_counts: Minimum UMI counts (default: None)
+        - max_counts: Maximum UMI counts (default: None)
+        
+        Adaptive mode specific:
+        - mad_n_counts: MADs for total counts outliers (default: 5)
+        - mad_n_genes: MADs for gene count outliers (default: 5)
+        - mad_top_genes: MADs for top-20 gene concentration outliers (default: 5)
+        - mad_mito: MADs for mitochondrial outliers (default: 3)
+        
+    Returns
+    -------
+    AnnData
+        Filtered AnnData object
+    """
     logger.info("Filtering cells and genes...")
     
     n_cells_before = adata.n_obs
     n_genes_before = adata.n_vars
     
-    min_genes = qc_params['min_genes']
-    max_genes = qc_params['max_genes']
-    min_counts = qc_params['min_counts']
-    max_counts = qc_params['max_counts']
-    max_mito_pct = qc_params['max_mito_pct']
-    min_cells = qc_params['min_cells']
+    # Get common parameters with defaults
+    qc_mode = qc_params.get('qc_mode', 'fixed')
+    min_genes = qc_params.get('min_genes', 200)
+    max_mito_pct = qc_params.get('max_mito_pct', 20)
+    min_cells = qc_params.get('min_cells', 20)
     
-    logger.info(f"  Thresholds: min_genes={min_genes}, max_genes={max_genes}, "
-                f"min_counts={min_counts}, max_counts={max_counts}, "
-                f"max_mito={max_mito_pct}%, min_cells={min_cells}")
+    logger.info(f"  QC mode: {qc_mode}")
     
-    sc.pp.filter_cells(adata, min_genes=min_genes)
+    if qc_mode == 'adaptive':
+        # =====================================================================
+        # ADAPTIVE MODE (MAD-based) - matches Jake's interactive workflow
+        # =====================================================================
+        mad_n_counts = qc_params.get('mad_n_counts', 5)
+        mad_n_genes = qc_params.get('mad_n_genes', 5)
+        mad_top_genes = qc_params.get('mad_top_genes', 5)
+        mad_mito = qc_params.get('mad_mito', 3)
+        
+        logger.info(f"  MAD thresholds: counts={mad_n_counts}, genes={mad_n_genes}, "
+                    f"top_genes={mad_top_genes}, mito={mad_mito}")
+        logger.info(f"  Hard caps: min_genes={min_genes}, max_mito_pct={max_mito_pct}%")
+        
+        # Verify required columns exist
+        required_cols = ['log1p_total_counts', 'log1p_n_genes_by_counts', 'pct_counts_in_top_20_genes']
+        missing_cols = [col for col in required_cols if col not in adata.obs.columns]
+        if missing_cols:
+            raise ValueError(
+                f"Adaptive QC mode requires columns {missing_cols} which are missing. "
+                "Ensure calculate_qc_metrics() was called with qc_params containing qc_mode='adaptive'."
+            )
+        
+        # Detect outliers using MAD on log1p-transformed metrics
+        logger.info("  Detecting outliers...")
+        adata.obs["outlier"] = (
+            is_outlier(adata, "log1p_total_counts", mad_n_counts)
+            | is_outlier(adata, "log1p_n_genes_by_counts", mad_n_genes)
+            | is_outlier(adata, "pct_counts_in_top_20_genes", mad_top_genes)
+        )
+        
+        # Mitochondrial outliers: MAD-based OR hard cap
+        # This follows the approach: cells are outliers if they're statistical outliers
+        # OR if they exceed a hard biological threshold
+        adata.obs["mt_outlier"] = (
+            is_outlier(adata, "pct_counts_mt", mad_mito) 
+            | (adata.obs["pct_counts_mt"] > max_mito_pct)
+        )
+        
+        n_outliers = adata.obs["outlier"].sum()
+        n_mt_outliers = adata.obs["mt_outlier"].sum()
+        n_both = (adata.obs["outlier"] & adata.obs["mt_outlier"]).sum()
+        logger.info(f"  General outliers: {n_outliers} cells")
+        logger.info(f"  Mito outliers: {n_mt_outliers} cells")
+        logger.info(f"  Both: {n_both} cells")
+        
+        # Filter based on outlier flags
+        adata = adata[(~adata.obs.outlier) & (~adata.obs.mt_outlier)].copy()
+        
+        # Apply minimum gene threshold (always applied as a sanity check)
+        sc.pp.filter_cells(adata, min_genes=min_genes)
+        
+    else:
+        # =====================================================================
+        # FIXED MODE (threshold-based) - original behavior
+        # =====================================================================
+        max_genes = qc_params.get('max_genes')
+        min_counts = qc_params.get('min_counts')
+        max_counts = qc_params.get('max_counts')
+        
+        logger.info(f"  Thresholds: min_genes={min_genes}, max_genes={max_genes}, "
+                    f"min_counts={min_counts}, max_counts={max_counts}, "
+                    f"max_mito={max_mito_pct}%")
+        
+        # Apply filters sequentially
+        sc.pp.filter_cells(adata, min_genes=min_genes)
+        
+        if min_counts is not None:
+            adata = adata[adata.obs['total_counts'] >= min_counts, :].copy()
+        if max_counts is not None:
+            adata = adata[adata.obs['total_counts'] <= max_counts, :].copy()
+        if max_genes is not None:
+            adata = adata[adata.obs['n_genes_by_counts'] <= max_genes, :].copy()
+        if max_mito_pct is not None:
+            adata = adata[adata.obs['pct_counts_mt'] <= max_mito_pct, :].copy()
     
-    if min_counts is not None:
-        adata = adata[adata.obs['total_counts'] >= min_counts, :].copy()
-    if max_counts is not None:
-        adata = adata[adata.obs['total_counts'] <= max_counts, :].copy()
-    if max_genes is not None:
-        adata = adata[adata.obs['n_genes_by_counts'] <= max_genes, :].copy()
-    if max_mito_pct is not None:
-        adata = adata[adata.obs['pct_counts_mt'] <= max_mito_pct, :].copy()
-    
+    # Filter genes by min_cells (applied in both modes)
     sc.pp.filter_genes(adata, min_cells=min_cells)
     
     logger.info(f"  Cells: {n_cells_before} -> {adata.n_obs} ({n_cells_before - adata.n_obs} removed)")
@@ -194,7 +414,7 @@ def filter_cells_and_genes(adata, qc_params):
 def remove_doublets(adata, qc_params):
     """Detect and remove doublets using Scrublet."""
     doublet_removal = qc_params.get('doublet_removal', True)
-    expected_doublet_rate = qc_params['doublet_rate']
+    expected_doublet_rate = qc_params.get('doublet_rate', 0.08)
     
     if not doublet_removal:
         logger.info("Doublet removal disabled, skipping...")
@@ -579,48 +799,26 @@ def plot_umap_samples_clusters(adata, output_dir):
     os.makedirs(output_dir, exist_ok=True)
     logger.info("  Generating sample and cluster UMAPs...")
     
-    cmap = plt.get_cmap('turbo')
+    with plt.rc_context({"figure.figsize": (10, 10), "figure.dpi": 150, "figure.frameon": False}):
+        fig = sc.pl.umap(adata, color=['sample_id'], frameon=False, size=5, return_fig=True)
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'UMAP_samples.pdf'), bbox_inches='tight')
+        plt.savefig(os.path.join(output_dir, 'UMAP_samples.png'), dpi=150, bbox_inches='tight')
+        plt.close()
     
-    if 'sample_id' in adata.obs.columns:
-        n_samples = adata.obs['sample_id'].nunique()
-        values = np.linspace(0, 1, n_samples)
-        palette = [cmap(value) for value in values]
-        
-        with plt.rc_context({"figure.figsize": (10, 10), "figure.dpi": 150}):
-            fig = sc.pl.umap(adata, color='sample_id', palette=palette, frameon=False, size=5, return_fig=True)
-            plt.tight_layout()
-            plt.savefig(os.path.join(output_dir, 'UMAP_samples.pdf'), bbox_inches='tight')
-            plt.savefig(os.path.join(output_dir, 'UMAP_samples.png'), dpi=150, bbox_inches='tight')
-            plt.close()
-    
-    if 'clusters' in adata.obs.columns:
-        n_clusters = adata.obs['clusters'].nunique()
-        values = np.linspace(0, 1, n_clusters)
-        palette = [cmap(value) for value in values]
-        
-        with plt.rc_context({"figure.figsize": (10, 10), "figure.dpi": 150}):
-            fig = sc.pl.umap(adata, color='clusters', palette=palette, frameon=False, size=5, return_fig=True)
-            plt.tight_layout()
-            plt.savefig(os.path.join(output_dir, 'UMAP_clusters.pdf'), bbox_inches='tight')
-            plt.savefig(os.path.join(output_dir, 'UMAP_clusters.png'), dpi=150, bbox_inches='tight')
-            plt.close()
+    with plt.rc_context({"figure.figsize": (10, 10), "figure.dpi": 150, "figure.frameon": False}):
+        fig = sc.pl.umap(adata, color=['clusters'], frameon=False, size=5, return_fig=True)
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'UMAP_clusters.pdf'), bbox_inches='tight')
+        plt.savefig(os.path.join(output_dir, 'UMAP_clusters.png'), dpi=150, bbox_inches='tight')
+        plt.close()
 
 
-def get_dominant_clusters(adata):
-    """For each cell type, find the cluster with most cells of that type."""
-    df = pd.DataFrame({
-        'cell_type': adata.obs['final_annotation'],
-        'cluster': adata.obs['clusters']
-    })
-    
-    cluster_counts = df.groupby(['cell_type', 'cluster']).size().reset_index(name='count')
-    dominant_clusters = (
-        cluster_counts.sort_values('count', ascending=False)
-        .drop_duplicates('cell_type')['cluster'].tolist()
-    )
-    
-    seen = set()
-    return [str(x) for x in dominant_clusters if not (str(x) in seen or seen.add(str(x)))]
+def get_dominant_clusters(adata, min_cells=50):
+    """Get clusters with at least min_cells cells, sorted by size."""
+    cluster_counts = adata.obs['clusters'].value_counts()
+    dominant = cluster_counts[cluster_counts >= min_cells].index.tolist()
+    return sorted(dominant, key=lambda x: int(x) if x.isdigit() else x)
 
 
 def plot_stacked_bar_cluster_composition(adata, output_dir):
@@ -655,14 +853,6 @@ def plot_stacked_bar_cluster_composition(adata, output_dir):
         filtered_percentages = percentages[nonzero_mask].tolist()
         filtered_colors = [color_map.get(label, '#888888') for label in filtered_labels]
         
-        significant_idx = [i for i, p in enumerate(filtered_percentages) if p >= MIN_PERCENT]
-        labels = [filtered_labels[i] for i in significant_idx]
-        percentages_sig = [filtered_percentages[i] for i in significant_idx]
-        
-        sorted_idx = np.argsort(percentages_sig)[::-1]
-        labels = [labels[i] for i in sorted_idx]
-        percentages_sig = [percentages_sig[i] for i in sorted_idx]
-        
         x_pos = cluster_idx * PLOT_SPACING
         
         bottom = 0
@@ -671,63 +861,42 @@ def plot_stacked_bar_cluster_composition(adata, output_dir):
             ax.bar(x_pos, percent, width=BAR_WIDTH, bottom=bottom, 
                    color=color, edgecolor='white', alpha=alpha)
             bottom += percent
-        
-        segment_centers = np.cumsum(filtered_percentages) - np.array(filtered_percentages) / 2
-        
-        small_total = sum(p for p in filtered_percentages if p < MIN_PERCENT)
-        if small_total > 0:
-            ax.text(x_pos, 3, f"Trace cells\ntotal: {small_total:.1f}%",
-                    va='bottom', ha='center', fontsize=10, style='italic',
-                    bbox=dict(facecolor='white', alpha=0.9, edgecolor='lightgray'))
-        
-        for idx, label in zip(significant_idx, labels):
-            percent = filtered_percentages[idx]
-            y_center = segment_centers[idx]
-            
-            if percent >= MIN_PERCENT:
-                wrapped_label = '\n'.join(wrap(label, width=12))
-                ax.text(x_pos, y_center, f"{wrapped_label}\n({percent:.1f}%)",
-                        va='center', ha='center', fontsize=12 if percent > 20 else 10,
-                        color='black', bbox=dict(facecolor="white", alpha=0.9,
-                                                edgecolor='lightgray', boxstyle='round,pad=0.2'))
-        
-        ax.text(x_pos, -5, f"{cluster_num}", ha='center', va='top', fontsize=20)
     
-    ax.set_xlim(-0.5, len(CLUSTERS) * PLOT_SPACING - (PLOT_SPACING - BAR_WIDTH))
+    ax.set_xticks([i * PLOT_SPACING for i in range(len(CLUSTERS))])
+    ax.set_xticklabels([f"Cluster {c}" for c in CLUSTERS], rotation=45, ha='right')
+    ax.set_ylabel('Percentage')
+    ax.set_title('Cell Type Composition per Cluster')
     ax.set_ylim(0, 100)
-    ax.set_ylabel('Percentage (%)', fontsize=20)
-    ax.set_xlabel('Cluster', fontsize=20)
-    ax.spines[['top', 'right']].set_visible(False)
-    ax.grid(axis='y', linestyle=':', alpha=0.3)
-    ax.tick_params(axis='y', labelsize=14)
-    ax.tick_params(axis='x', which='both', bottom=False, labelbottom=False)
     
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'Stacked_Bar_Cluster_Composition.pdf'), bbox_inches='tight', dpi=300)
-    plt.savefig(os.path.join(output_dir, 'Stacked_Bar_Cluster_Composition.png'), bbox_inches='tight', dpi=150)
+    plt.savefig(os.path.join(output_dir, 'Stacked_Bar_Cluster_Composition.pdf'), bbox_inches='tight')
+    plt.savefig(os.path.join(output_dir, 'Stacked_Bar_Cluster_Composition.png'), dpi=150, bbox_inches='tight')
     plt.close()
 
 
 def plot_cell_type_proportions(adata, output_dir):
-    """Generate cell type proportions per sample bar plot."""
+    """Generate cell type proportions per sample."""
     os.makedirs(output_dir, exist_ok=True)
+    
+    if 'final_annotation' not in adata.obs.columns:
+        logger.warning("final_annotation not found, skipping proportions plot")
+        return
+    
     logger.info("  Generating cell type proportions plot...")
     
-    try:
-        ct_props = pd.crosstab(adata.obs['sample_id'], adata.obs['final_annotation'], normalize='index') * 100
-        
-        fig, ax = plt.subplots(figsize=(12, 6))
-        ct_props.plot(kind='bar', stacked=True, ax=ax, colormap='tab20')
-        ax.set_ylabel('Percentage')
-        ax.set_xlabel('Sample')
-        ax.legend(title='Cell Type', bbox_to_anchor=(1.05, 1), loc='upper left')
-        plt.xticks(rotation=45, ha='right')
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, 'cell_type_proportions.pdf'), bbox_inches='tight')
-        plt.savefig(os.path.join(output_dir, 'cell_type_proportions.png'), dpi=150, bbox_inches='tight')
-        plt.close()
-    except Exception as e:
-        logger.warning(f"Could not generate cell type proportions plot: {e}")
+    proportions = pd.crosstab(adata.obs['sample_id'], adata.obs['final_annotation'], normalize='index') * 100
+    
+    fig, ax = plt.subplots(figsize=(12, 8))
+    proportions.plot(kind='bar', stacked=True, ax=ax, colormap='turbo')
+    ax.set_ylabel('Percentage')
+    ax.set_xlabel('Sample')
+    ax.set_title('Cell Type Proportions per Sample')
+    ax.legend(title='Cell Type', bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.xticks(rotation=45, ha='right')
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'cell_type_proportions.pdf'), bbox_inches='tight')
+    plt.savefig(os.path.join(output_dir, 'cell_type_proportions.png'), dpi=150, bbox_inches='tight')
+    plt.close()
 
 
 def generate_annotation_plots(adata, output_dir):
@@ -828,11 +997,11 @@ def run_qc_annotation_pipeline(
     logger.info("="*60)
     adata = load_cellranger_outputs(cellranger_dir, sample_ids)
     
-    # Step 2: Calculate QC metrics
+    # Step 2: Calculate QC metrics - pass qc_params for mode detection
     logger.info("\n" + "="*60)
     logger.info("[Step 2/7] Calculating QC metrics...")
     logger.info("="*60)
-    adata = calculate_qc_metrics(adata)
+    adata = calculate_qc_metrics(adata, qc_params)
     generate_qc_plots(adata, figures_dir, prefix='pre_filter_')
     
     # Step 3: Filter cells and genes
