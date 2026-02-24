@@ -355,13 +355,21 @@ def dict2lists(nested):
 def krakenID2dict(dbfile, taxid_list):
     """
     Get taxonomy names from Kraken2 database inspect file.
-    
+
+    Supports both tab-separated and space-separated inspect.txt formats so that
+    databases from different Kraken2 builds are handled consistently. This
+    mirrors the fallback logic in parse_kraken_hierarchy (viral_integration.py)
+    and ensures the two parsers produce matching names for the same organism.
+
     Parameters
     ----------
     dbfile : str
         Path to Kraken2 inspect.txt file
     taxid_list : list
-        List of taxonomy IDs to look up
+        List of taxonomy IDs to look up. Pass the actual detected taxids so
+        the returned dict is accurate and useful to callers (e.g. for the
+        summary report and any future filtering steps). Passing an empty list
+        will always return only the 'unclassified' entry.
         
     Returns
     -------
@@ -373,7 +381,7 @@ def krakenID2dict(dbfile, taxid_list):
     
     if not os.path.exists(dbfile):
         logger.warning(f"Database inspect file not found: {dbfile}")
-        # Return just IDs as names
+        # Return just IDs as names so callers always get a usable dict
         return {tid: f"taxid_{tid}" for tid in taxid_list}
     
     with open(dbfile) as f:
@@ -383,11 +391,19 @@ def krakenID2dict(dbfile, taxid_list):
             
             parts = line.strip().split('\t')
             if len(parts) >= 6:
+                # Standard tab-separated inspect.txt
                 taxid_db = parts[4]
                 taxname = parts[5].strip()
-                
-                if taxid_db in taxid_set:
-                    taxdict[taxid_db] = taxname
+            else:
+                # Fallback: space-separated format (some Kraken2 builds)
+                parts = line.strip().split()
+                if len(parts) < 6:
+                    continue
+                taxid_db = parts[4]
+                taxname = ' '.join(parts[5:])
+
+            if taxid_db in taxid_set:
+                taxdict[taxid_db] = taxname
     
     return taxdict
 
@@ -468,7 +484,10 @@ def build_sparse_matrix(bamfile, krakenfile, dbpath, outdir,
     Returns
     -------
     dict
-        Summary statistics
+        Summary statistics, including 'taxid_list' — the ordered list of
+        taxonomy IDs present in the matrix. This is passed back to
+        process_sample so that krakenID2dict can be called with the real
+        detected taxids rather than an empty list.
     """
     logger.info("Building single-cell sparse matrix...")
     
@@ -503,7 +522,7 @@ def build_sparse_matrix(bamfile, krakenfile, dbpath, outdir,
                 with gzip.open(filepath + '.gz', 'wb') as f_out:
                     shutil.copyfileobj(f_in, f_out)
             os.remove(filepath)
-        return {'cells': 0, 'organisms': 0, 'total_counts': 0}
+        return {'cells': 0, 'organisms': 0, 'total_counts': 0, 'taxid_list': []}
     
     # Find most frequent taxonomy for each transcript (UMI deduplication)
     map_nested_dicts(mg_dict, most_frequent)
@@ -525,7 +544,7 @@ def build_sparse_matrix(bamfile, krakenfile, dbpath, outdir,
     
     if not count_dict:
         logger.warning("No data remaining after filtering!")
-        return {'cells': 0, 'organisms': 0, 'total_counts': 0}
+        return {'cells': 0, 'organisms': 0, 'total_counts': 0, 'taxid_list': []}
     
     # Convert to sparse matrix format
     rows, cols, vals, cell_list, taxid_list = dict2lists(count_dict)
@@ -567,7 +586,11 @@ def build_sparse_matrix(bamfile, krakenfile, dbpath, outdir,
         'cells': len(cell_list),
         'organisms': len(taxid_list),
         'total_counts': sum(vals),
-        'matrix_dir': matrix_dir
+        'matrix_dir': matrix_dir,
+        # Expose the detected taxid list so process_sample can pass it to
+        # krakenID2dict when building the summary report taxdict, rather than
+        # calling krakenID2dict with [] which always produces an empty result.
+        'taxid_list': taxid_list,
     }
     
     logger.info(f"  Created matrix: {stats['cells']} cells x {stats['organisms']} organisms")
@@ -585,7 +608,9 @@ def generate_summary_report(kraken_report, taxdict, output_file, top_n=50):
     kraken_report : str
         Path to Kraken2 report file
     taxdict : dict
-        {taxid: taxonomy_name}
+        {taxid: taxonomy_name} mapping built from the actual detected taxids.
+        Names in the report file are used directly; taxdict is available for
+        cross-referencing or enrichment by callers.
     output_file : str
         Path for output summary TSV
     top_n : int
@@ -593,7 +618,7 @@ def generate_summary_report(kraken_report, taxdict, output_file, top_n=50):
     """
     logger.info("Generating summary report...")
     
-    # Parse Kraken2 report
+    # Parse Kraken2 report — names come directly from the report file
     report_data = []
     
     with open(kraken_report, 'r') as f:
@@ -730,11 +755,15 @@ def process_sample(
         )
         results.update(matrix_stats)
         
-        # Step 4: Generate summary report
+        # Step 4: Generate summary report.
+        # Use the taxid_list returned by build_sparse_matrix so krakenID2dict
+        # receives the actual detected taxids and produces a meaningful taxdict,
+        # rather than being called with [] which always returns only 'unclassified'.
         inspectfile = os.path.join(db_path, 'inspect.txt')
+        detected_taxids = matrix_stats.get('taxid_list', [])
         taxdict = {}
         if os.path.exists(inspectfile):
-            taxdict = krakenID2dict(inspectfile, [])
+            taxdict = krakenID2dict(inspectfile, detected_taxids)
         generate_summary_report(kraken_report, taxdict, summary_file)
         
         results['success'] = True
@@ -854,4 +883,3 @@ if __name__ == '__main__':
         run_from_snakemake()
     except NameError:
         main()
-
