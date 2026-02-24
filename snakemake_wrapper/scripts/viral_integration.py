@@ -141,7 +141,12 @@ def clean_obs_for_saving(adata):
 def parse_kraken_hierarchy(hierarchy_file):
     """
     Parse Kraken2 hierarchy/inspect file.
-    
+
+    Extracts species-level entries (rank codes starting with 'S') and returns
+    both a name list and a taxid set for downstream filtering. The taxid set is
+    the preferred matching key because it is stable across database builds and
+    immune to any naming or whitespace inconsistencies between inspect files.
+
     Parameters
     ----------
     hierarchy_file : str
@@ -150,18 +155,22 @@ def parse_kraken_hierarchy(hierarchy_file):
     Returns
     -------
     dict
-        Dictionary mapping tax_id to virus information
+        Dictionary mapping tax_id to virus information (all ranks)
     list
-        List of species-level entries
+        List of species-level entry dicts, each with keys:
+        'tax_id', 'name', 'read_count'
+    set
+        Set of species-level taxonomy ID strings for fast membership testing
     """
     logger.info(f"Parsing Kraken2 hierarchy file: {hierarchy_file}")
     
     v_hierarchy = {}
     species_list = []
+    species_taxids = set()
     
     if not os.path.exists(hierarchy_file):
         logger.warning(f"Hierarchy file not found: {hierarchy_file}")
-        return v_hierarchy, species_list
+        return v_hierarchy, species_list, species_taxids
     
     with open(hierarchy_file, 'rt') as f:
         lines = f.readlines()
@@ -181,7 +190,7 @@ def parse_kraken_hierarchy(hierarchy_file):
             tax_id = parts[4].strip()
             name = parts[5].strip()
         else:
-            # Try space-separated format
+            # Try space-separated format (some Kraken2 builds omit tabs)
             parts = line.strip().split()
             if len(parts) < 6:
                 continue
@@ -200,17 +209,21 @@ def parse_kraken_hierarchy(hierarchy_file):
             'percentage': percentage
         }
         
-        # Add to species list if it's a species (starts with S)
+        # Collect species-level entries (rank code S, S1, S2, etc.)
         if rank_code.startswith('S'):
             species_list.append({
                 'tax_id': tax_id,
                 'name': name,
                 'read_count': read_count
             })
+            species_taxids.add(tax_id)
     
-    logger.info(f"  Found {len(v_hierarchy)} total entries, {len(species_list)} species")
+    logger.info(
+        f"  Found {len(v_hierarchy)} total entries, "
+        f"{len(species_list)} species ({len(species_taxids)} unique taxids)"
+    )
     
-    return v_hierarchy, species_list
+    return v_hierarchy, species_list, species_taxids
 
 
 # =============================================================================
@@ -247,36 +260,82 @@ def load_viral_adata(viral_adata_path):
 # Integration Functions
 # =============================================================================
 
-def filter_human_viruses(adata_v, human_species_names):
+def filter_human_viruses(adata_v, human_taxids, human_virus_names=None):
     """
     Filter viral AnnData to only human-associated viruses.
-    
+
+    Uses taxonomy ID matching as the primary strategy, which is robust to
+    naming differences and whitespace inconsistencies between Kraken2 database
+    builds. Falls back to name-based matching only if the 'taxonomy_id' column
+    is absent from adata_v.var (e.g. legacy data produced before that column
+    was added).
+
     Parameters
     ----------
     adata_v : AnnData
-        Viral counts AnnData
-    human_species_names : tuple or list
-        Human virus species names
+        Viral counts AnnData. Expected to have a 'taxonomy_id' column in
+        adata_v.var populated by summarize_viral_detection.py.
+    human_taxids : set
+        Set of taxonomy ID strings (species level) from the human viral
+        database inspect.txt.
+    human_virus_names : list or None
+        Fallback name list used only when 'taxonomy_id' is unavailable.
         
     Returns
     -------
     AnnData
-        Filtered AnnData with only human viruses
+        Filtered AnnData containing only human-database viruses
     """
     logger.info("Filtering for human-associated viruses...")
     
     if adata_v.n_vars == 0:
         return adata_v
     
-    human_virus_names = tuple(name.strip() for name in human_species_names if name and name.strip())
-    
-    if not human_virus_names:
-        logger.warning("No human virus names provided for filtering")
-        return adata_v
-    
-    human_virus_mask = adata_v.var_names.isin(human_virus_names)
-    
     n_before = adata_v.n_vars
+
+    # --- Primary path: taxid-based filtering ---
+    if 'taxonomy_id' in adata_v.var.columns and human_taxids:
+        logger.info("  Using taxid-based filtering (primary)")
+        human_taxids_clean = {str(tid).strip() for tid in human_taxids if tid}
+        var_taxids = adata_v.var['taxonomy_id'].astype(str).str.strip()
+        human_virus_mask = var_taxids.isin(human_taxids_clean)
+
+        matched = human_virus_mask.sum()
+        unmatched = (~human_virus_mask).sum()
+        logger.info(
+            f"  Taxid match: {matched} organisms matched, "
+            f"{unmatched} not in human viral database"
+        )
+
+        # Warn if suspiciously few matched — helps catch database mismatch issues
+        if matched == 0:
+            logger.warning(
+                "  No taxid matches found. Check that KRAKEN2_DB and viral_db "
+                "were built from the same NCBI taxonomy release."
+            )
+
+    # --- Fallback path: name-based filtering (legacy / missing taxonomy_id) ---
+    elif human_virus_names:
+        logger.warning(
+            "  'taxonomy_id' column not found in adata_v.var — "
+            "falling back to name-based filtering. Results may be incomplete "
+            "if organism names differ between databases."
+        )
+        human_names_clean = tuple(
+            name.strip() for name in human_virus_names if name and name.strip()
+        )
+        if not human_names_clean:
+            logger.warning("  No valid human virus names for fallback filtering")
+            return adata_v
+        human_virus_mask = adata_v.var_names.isin(human_names_clean)
+
+    else:
+        logger.warning(
+            "  Neither taxids nor names available for filtering — "
+            "returning unfiltered viral data"
+        )
+        return adata_v
+
     adata_v = adata_v[:, human_virus_mask].copy()
     n_after = adata_v.n_vars
     
@@ -387,8 +446,9 @@ def calculate_viral_markers(adata_joined, human_virus_names, groupby='final_anno
     ----------
     adata_joined : AnnData
         Integrated AnnData with genes and viruses
-    human_virus_names : tuple or list
-        Human virus names
+    human_virus_names : list
+        Human virus species names (used to identify viral features among all
+        var_names in the integrated object)
     groupby : str
         Column in obs to group by
         
@@ -444,7 +504,9 @@ def calculate_viral_markers(adata_joined, human_virus_names, groupby='final_anno
         # Format p-values
         markers['pval_adj'] = markers['pval_adj'].apply(lambda x: f'{x:.2e}')
         
-        # Filter to human viruses
+        # Filter to human viruses by name (names are reliable here because
+        # they come from the same parse_kraken_hierarchy call that produced
+        # the filtered adata_v var_names)
         virus_markers = markers[markers['virus'].isin(human_virus_names)]
         
         logger.info(f"  Found {len(virus_markers)} viral marker entries")
@@ -711,12 +773,19 @@ def run_viral_integration(
     adata_pp = sc.read_h5ad(adata_pp_path)
     logger.info(f"  Loaded: {adata_pp.n_obs} cells, {adata_pp.n_vars} genes")
     
-    # Parse human viral hierarchy
+    # Parse human viral hierarchy — extract both names (for marker analysis)
+    # and taxids (for primary filtering)
     human_virus_names = []
+    human_taxids = set()
     if human_viral_hierarchy_path and os.path.exists(human_viral_hierarchy_path):
-        v_hierarchy_human, species_list = parse_kraken_hierarchy(human_viral_hierarchy_path)
+        v_hierarchy_human, species_list, human_taxids = parse_kraken_hierarchy(
+            human_viral_hierarchy_path
+        )
         human_virus_names = [entry['name'] for entry in species_list]
-        logger.info(f"  Human virus species: {len(human_virus_names)}")
+        logger.info(
+            f"  Human virus species: {len(human_virus_names)} names, "
+            f"{len(human_taxids)} taxids"
+        )
     else:
         logger.warning("Human viral hierarchy not provided or not found")
     
@@ -738,9 +807,15 @@ def run_viral_integration(
         ad.AnnData().write(output_integrated_path)
         return adata_pp, None, summary
     
-    # Filter to human viruses if we have the list
-    if human_virus_names:
-        adata_v = filter_human_viruses(adata_v, human_virus_names)
+    # Filter to human viruses.
+    # Pass both taxids (primary) and names (fallback) so filter_human_viruses
+    # can degrade gracefully if taxonomy_id is absent from older adata_v objects.
+    if human_taxids or human_virus_names:
+        adata_v = filter_human_viruses(
+            adata_v,
+            human_taxids=human_taxids,
+            human_virus_names=human_virus_names,
+        )
     
     if adata_v.n_vars == 0:
         logger.warning("No human viruses detected after filtering")
@@ -770,7 +845,9 @@ def run_viral_integration(
         except Exception as e:
             logger.warning(f"UMAP computation failed: {e}")
     
-    # Calculate viral markers
+    # Calculate viral markers — uses name list, which is reliable here because
+    # adata_joined.var_names are already filtered to human virus species and the
+    # names originate from the same parse_kraken_hierarchy call
     markers, virus_markers = calculate_viral_markers(
         adata_joined, human_virus_names, groupby='final_annotation'
     )
@@ -902,4 +979,3 @@ if __name__ == '__main__':
         run_from_snakemake()
     except NameError:
         main()
-
