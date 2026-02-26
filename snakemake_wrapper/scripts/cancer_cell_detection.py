@@ -214,6 +214,25 @@ def process_cytotrace_chunk(adata_chunk, chunk_name, working_dir, species='human
     else:
         gene_names = adata_chunk.var_names.values
     
+    # =========================================================================
+    # FIX: Sanitize gene names - remove NaN/non-string values that cause
+    # CytoTRACE2 to crash with 'float has no attribute upper'.
+    # These NaN gene names arise from sc.concat(..., join='outer') when genes
+    # are present in only a subset of samples, leaving NaN in 'gene_symbol'.
+    # =========================================================================
+    gene_names = pd.Series(gene_names)
+    nan_mask = gene_names.isna() | gene_names.apply(lambda x: not isinstance(x, str))
+    if nan_mask.any():
+        logger.warning(
+            f"Found {nan_mask.sum()} non-string gene names in chunk '{chunk_name}', "
+            f"removing these genes before CytoTRACE2"
+        )
+        valid_idx = ~nan_mask.values
+        adata_chunk = adata_chunk[:, valid_idx].copy()
+        gene_names = gene_names[valid_idx].values
+    else:
+        gene_names = gene_names.values
+    
     adata_X_df_T = pd.DataFrame.sparse.from_spmatrix(
         scipy.sparse.csr_matrix(adata_chunk.X),
         index=adata_chunk.obs.index,
@@ -319,6 +338,27 @@ def run_cytotrace2(adata, working_dir, config):
     if 'gene_symbol' in adata.var.columns:
         adata.var.index = adata.var['gene_symbol']
         adata.var_names_make_unique()
+    
+    # =========================================================================
+    # FIX: Remove genes with NaN/non-string var_names before CytoTRACE2.
+    # When samples are concatenated with sc.concat(..., join='outer'), genes
+    # present in only some samples get NaN in the 'gene_symbol' column.
+    # Setting var.index = var['gene_symbol'] then propagates those NaNs into
+    # var_names, which crashes CytoTRACE2's preprocess() when it calls
+    # .upper() on each gene name.
+    # =========================================================================
+    nan_gene_mask = (
+        adata.var_names.to_series().isna() |
+        adata.var_names.to_series().apply(lambda x: not isinstance(x, str))
+    )
+    n_bad = nan_gene_mask.sum()
+    if n_bad > 0:
+        logger.warning(
+            f"Removing {n_bad} genes with NaN/non-string names "
+            f"(likely from outer join during sample concatenation)"
+        )
+        adata = adata[:, ~nan_gene_mask.values].copy()
+        logger.info(f"Genes remaining after cleanup: {adata.n_vars}")
     
     MAX_CELLS_PER_CHUNK = config.get('max_cells_per_chunk', 200000)
     RANDOM_SEED = config.get('seed', 42)
