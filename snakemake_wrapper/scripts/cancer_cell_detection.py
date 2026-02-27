@@ -175,6 +175,111 @@ def safe_makedirs(dir_path):
     os.makedirs(dir_path)
 
 
+def patch_cytotrace2_nan_bug():
+    """
+    Monkey-patch CytoTRACE2's preprocess() to handle NaN gene names during
+    ortholog mapping.
+    
+    CytoTRACE2's preprocess() crashes with:
+        AttributeError: 'float' object has no attribute 'upper'
+    when its internal human-to-mouse ortholog mapping produces NaN values for
+    genes that don't map between species. These NaN entries get grouped as
+    "duplicates" and the subsequent list comprehension calls .upper() on them.
+    
+    This replaces the preprocess function in both gen_utils AND the already-
+    imported cytotrace2_py module namespace (which holds its own reference).
+    No filesystem writes required.
+    """
+    try:
+        import cytotrace2_py.common.gen_utils as _gen_utils
+        import cytotrace2_py.cytotrace2_py as _ct2_module
+        from cytotrace2_py.common.gen_utils import build_mapping_dict
+    except ImportError:
+        logger.warning("CytoTRACE2 not installed, skipping patch")
+        return False
+    
+    def patched_preprocess(expression, species, cores_to_use=1):
+        """Patched preprocess that filters NaN gene names from ortholog mapping."""
+        import scipy.stats as _sp_stats
+        
+        gene_names = expression.columns
+        mt_dict, mt_dict_alias_and_previous_symbols, mt_mouse_alias_dict, features = build_mapping_dict()
+        
+        if species == "human":
+            mapped_genes = gene_names.map(mt_dict)
+            mapped_genes = mapped_genes.astype(object)
+            
+            unmapped_genes = {
+                value: index for index, value in enumerate(gene_names)
+                if value in gene_names[mapped_genes.isna()]
+            }
+            mapped_genes.values[mapped_genes.isna()] = (
+                gene_names[mapped_genes.isna()].map(mt_dict_alias_and_previous_symbols)
+            )
+            expression.columns = mapped_genes.values
+            num_genes_mapped = len([i for i in mapped_genes if i in features.values])
+            print("    Mapped " + str(num_genes_mapped) + " input gene names to mouse orthologs")
+            
+            duplicate_genes = expression.columns[expression.columns.duplicated()].values
+            
+            # FIX: filter out NaN/float entries before calling .upper()
+            duplicate_genes = [
+                i for i in duplicate_genes
+                if not pd.isna(i) and isinstance(i, str)
+            ]
+            
+            idx = [
+                unmapped_genes[i.upper()] for i in duplicate_genes
+                if i.upper() in unmapped_genes.keys()
+            ]
+            expression = expression.iloc[
+                :, [j for j, c in enumerate(expression.columns) if j not in idx]
+            ]
+        else:
+            mapped_genes = gene_names.to_numpy()
+            unmapped_genes = set(mapped_genes) - set(features)
+            unmapped_genes_in_alias = unmapped_genes.intersection(set(mt_mouse_alias_dict.keys()))
+            valid_unmapped_genes = [
+                gene for gene in unmapped_genes_in_alias
+                if mt_mouse_alias_dict[gene] not in mapped_genes
+            ]
+            is_valid_unmapped_gene = np.isin(mapped_genes, list(valid_unmapped_genes))
+            indices_to_replace = np.where(is_valid_unmapped_gene)[0]
+            for idx in indices_to_replace:
+                alias = mapped_genes[idx]
+                mapped_genes[idx] = mt_mouse_alias_dict.get(alias, alias)
+            expression.columns = mapped_genes
+        
+        expression = expression[expression.columns[~expression.columns.isna()]]
+        
+        intersection = set(expression.columns).intersection(features)
+        print("    " + str(len(intersection)) + " input genes are present in the model features.")
+        if len(intersection) < 9000:
+            warnings.warn(
+                "    Please verify the input species is correct.\n"
+                "    In case of a correct species input, be advised that model "
+                "performance might be compromised due to gene space differences."
+            )
+        
+        expression = pd.DataFrame(index=features).join(expression.T).T
+        expression = expression.fillna(0)
+        cell_names = expression.index
+        gene_names = expression.columns
+        adata_X = expression.to_numpy()
+        log2_data = np.log2(1000000 * adata_X.transpose() / adata_X.sum(1) + 1).transpose()
+        rank_data = _sp_stats.rankdata(expression.values * -1, axis=1, method='average')
+        
+        return cell_names, gene_names, rank_data, log2_data
+    
+    # Patch in BOTH locations — gen_utils module AND the cytotrace2_py module
+    # which already imported preprocess by name into its own namespace
+    _gen_utils.preprocess = patched_preprocess
+    _ct2_module.preprocess = patched_preprocess
+    
+    logger.info("Patched CytoTRACE2 preprocess() to handle NaN gene names in ortholog mapping")
+    return True
+
+
 def process_cytotrace_chunk(adata_chunk, chunk_name, working_dir, species='human', seed=42):
     """
     Process a single chunk of cells through CytoTRACE2.
@@ -332,6 +437,9 @@ def run_cytotrace2(adata, working_dir, config):
             "  pip install ."
         )
         raise ImportError("CytoTRACE2 is required for cancer cell detection")
+    
+    # Patch CytoTRACE2 bug: NaN gene names from ortholog mapping crash .upper()
+    patch_cytotrace2_nan_bug()
     
     # Ensure gene names are unique
     adata.var_names_make_unique()
