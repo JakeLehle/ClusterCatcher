@@ -4,20 +4,20 @@ channels:
   - bioconda
 dependencies:
   - python>=3.7
-  - anndata
+  - anndata=0.12.6
   - bedtools
   - datamash
   - h5py
   - hdf5
   - libxcrypt
-  - pandas
+  - pandas=2.2.3
   - pybedtools
   - pysam
   - pyyaml
   - samtools
-  - scanpy
+  - scanpy=1.10.4
   - tqdm
-  - numpy
+  - numpy=1.26.4
   - scipy
   - matplotlib-base
   - seaborn

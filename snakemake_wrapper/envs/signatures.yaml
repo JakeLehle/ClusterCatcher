@@ -4,10 +4,10 @@ channels:
   - bioconda
 dependencies:
   - python>=3.8
-  - anndata
-  - scanpy
-  - pandas
-  - numpy
+  - anndata=0.12.6
+  - scanpy=1.10.4
+  - pandas=2.2.3
+  - numpy=1.26.4
   - scipy
   - matplotlib-base
   - seaborn

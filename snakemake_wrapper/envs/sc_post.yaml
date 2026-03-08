@@ -6,16 +6,16 @@ dependencies:
   # Core Python
   - python=3.11
   - cython
-  - numpy
-  - pandas
+  - numpy=1.26.4
+  - pandas=2.2.3
   - scipy
   - scikit-learn
   - h5py
   
   # Scanpy ecosystem
-  - scanpy
-  - anndata
-  - scvi-tools
+  - scanpy=1.10.4
+  - anndata=0.12.6
+  - scvi-tools=1.4.0.post1
   - python-igraph
   - umap-learn
   - pynndescent

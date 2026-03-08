@@ -6,14 +6,14 @@ dependencies:
   # Core Python
   - python=3.11
   - cython
-  - numpy
-  - pandas
+  - numpy=1.26.4
+  - pandas=2.2.3
   - scipy
   - scikit-learn
   
   # Scanpy ecosystem
-  - scanpy
-  - anndata
+  - scanpy=1.10.4
+  - anndata=0.12.6
   - leidenalg
   - louvain
   - python-igraph
@@ -25,7 +25,7 @@ dependencies:
   # Cell annotation
   - celltypist
   - cellxgene-census
-  - scvi-tools
+  - scvi-tools=1.4.0.post1
   
   # CNV analysis
   - gffutils
@@ -70,6 +70,6 @@ dependencies:
   - pip
   - pip:
     - scrublet           # For doublet detection
-    - popv               # For cell annotation consensus
+    - popv>=0.6.1               # For cell annotation consensus
     - cytotrace2-py      # For stemness scoring (install from github if needed)
     - infercnvpy         # For CNV analysis  
