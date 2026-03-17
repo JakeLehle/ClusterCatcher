@@ -10,6 +10,7 @@ dependencies:
   - pandas=2.2.3
   - scipy
   - scikit-learn
+  - setuptools
   
   # Scanpy ecosystem
   - scanpy=1.10.4
@@ -71,5 +72,5 @@ dependencies:
   - pip:
     - scrublet           # For doublet detection
     - popv>=0.6.1               # For cell annotation consensus
-    - cytotrace2-py      # For stemness scoring (install from github if needed)
+    - cytotrace2-py>=1.1.0.4      # For stemness scoring (install from github if needed)
     - infercnvpy         # For CNV analysis  

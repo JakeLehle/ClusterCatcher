@@ -104,7 +104,7 @@ dependencies:
     - popv>=0.6.1  # Consensus annotation
     - celltypist  # Reference-based annotation
     # CytoTRACE2 (install separately from GitHub if needed)
-    # - git+https://github.com/digitalcytometry/cytotrace2.git#subdirectory=cytotrace2_python
+    - cytotrace2-py>=1.1.0.4
     # InferCNV Python wrapper
     - infercnvpy
 
