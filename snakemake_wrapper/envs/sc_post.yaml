@@ -11,6 +11,7 @@ dependencies:
   - scipy
   - scikit-learn
   - h5py
+  - setuptools
   
   # Scanpy ecosystem
   - scanpy=1.10.4
@@ -76,5 +77,5 @@ dependencies:
   # pip dependencies
   - pip
   - pip:
-    - cytotrace2-py  # Install from GitHub if needed: pip install git+https://github.com/digitalcytometry/cytotrace2.git#subdirectory=cytotrace2_python
+    - cytotrace2-py>=1.1.0.4
     - infercnvpy>=0.6.1
