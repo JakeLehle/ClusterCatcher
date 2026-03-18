@@ -350,7 +350,7 @@ rule multiqc:
         "envs/sc_pre.yaml"
     shell:
         """
-        multiqc {OUTPUT_DIR}/cellranger -o {params.outdir} -n multiqc_report.html 2>&1 | tee {log}
+        multiqc {OUTPUT_DIR}/cellranger -o {params.outdir} -n multiqc_report.html --force 2>&1 | tee {log}
         """
 
 # =============================================================================
