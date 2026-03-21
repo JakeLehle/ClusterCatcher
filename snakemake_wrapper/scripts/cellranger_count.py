@@ -583,40 +583,57 @@ def run_from_snakemake():
     logger.info(f"Chemistry: {chemistry}")
     logger.info(f"Cores: {localcores}, Memory: {localmem}GB")
     
-    # Run Cell Ranger for all SRRs in this GSE
-    result = run_cellranger_for_gse(
-        gse_id=sample_id,
-        sample_info=sample_info,
-        fastq_base_dir=fastq_base_dir,
-        transcriptome_ref=transcriptome_ref,
-        output_dir=output_dir,
-        chemistry=chemistry,
-        localcores=localcores,
-        localmem=localmem,
-        create_bam=create_bam,
-        expect_cells=expect_cells,
-        include_introns=include_introns,
-    )
+    # =========================================================================
+    # Determine processing mode: SRR-level or GSE-level
+    # =========================================================================
+    # With the Snakefile SRAscraper fix, sample_id may be an individual SRR
+    # (sample_info will be a dict) or a GSE series (sample_info will be a DataFrame).
     
-    if not result['success']:
-        logger.error(f"Cell Ranger failed for all runs in {sample_id}")
-        sys.exit(1)
+    is_srr_level = isinstance(sample_info, dict) and 'run_accession' in sample_info
     
-    # For Snakemake, we need to ensure the expected outputs exist
-    # The rule expects outputs at: {output_dir}/cellranger/{sample}/outs/...
-    # But we create outputs at: {output_dir}/cellranger/{sample}/{srr}_S1_L001_/outs/...
-    
-    # Create a symlink or marker file to satisfy Snakemake
-    # We'll create the expected output structure by symlinking to the first successful run
-    expected_outs_dir = os.path.join(output_dir, 'cellranger', sample_id, 'outs')
-    
-    if result['successful_runs']:
-        # Get the first successful run's output
-        first_srr = result['successful_runs'][0]
-        first_run_dir = os.path.join(result['output_dir'], f"{first_srr}{SAMPLE_PATTERN}", 'outs')
+    if is_srr_level:
+        # =================================================================
+        # SRR-level processing (new behavior with Snakefile fix)
+        # =================================================================
+        srr_id = sample_info.get('run_accession', sample_id)
+        series_id = sample_info.get('series_id', sample_id)
         
-        if os.path.exists(first_run_dir):
-            # Create symlink from expected location to actual location
+        logger.info(f"SRR-level mode: {srr_id} (series: {series_id})")
+        
+        # FASTQ directory: {fastq_base_dir}/{series_id}/{srr_id}/
+        srr_fastq_dir = os.path.join(fastq_base_dir, series_id, srr_id)
+        
+        if not os.path.exists(srr_fastq_dir):
+            logger.error(f"FASTQ directory not found: {srr_fastq_dir}")
+            sys.exit(1)
+        
+        # Output goes under: cellranger/{series_id}/{srr}_S1_L001_/outs/
+        gse_output_dir = os.path.join(output_dir, 'cellranger', series_id)
+        os.makedirs(gse_output_dir, exist_ok=True)
+        
+        result_srr = run_cellranger_for_srr(
+            srr_id=srr_id,
+            fastq_dir=srr_fastq_dir,
+            transcriptome_ref=transcriptome_ref,
+            output_base_dir=gse_output_dir,
+            chemistry=chemistry,
+            localcores=localcores,
+            localmem=localmem,
+            create_bam=create_bam,
+            expect_cells=expect_cells,
+            include_introns=include_introns,
+        )
+        
+        if not result_srr['success']:
+            logger.error(f"Cell Ranger failed for {srr_id}")
+            sys.exit(1)
+        
+        # Create per-SRR symlink:
+        #   cellranger/{srr_id}/outs → cellranger/{series_id}/{srr}_S1_L001_/outs
+        actual_outs = os.path.join(gse_output_dir, f"{srr_id}{SAMPLE_PATTERN}", 'outs')
+        expected_outs_dir = os.path.join(output_dir, 'cellranger', srr_id, 'outs')
+        
+        if os.path.exists(actual_outs):
             os.makedirs(os.path.dirname(expected_outs_dir), exist_ok=True)
             
             if os.path.exists(expected_outs_dir):
@@ -625,11 +642,81 @@ def run_from_snakemake():
                 else:
                     shutil.rmtree(expected_outs_dir)
             
-            # Create relative symlink
-            os.symlink(first_run_dir, expected_outs_dir)
-            logger.info(f"Created symlink: {expected_outs_dir} -> {first_run_dir}")
+            os.symlink(actual_outs, expected_outs_dir)
+            logger.info(f"Created per-SRR symlink: {expected_outs_dir} -> {actual_outs}")
+        
+        successful_count = 1
+        total_count = 1
+        
+    else:
+        # =================================================================
+        # GSE-level processing (original behavior for backward compatibility)
+        # =================================================================
+        result = run_cellranger_for_gse(
+            gse_id=sample_id,
+            sample_info=sample_info,
+            fastq_base_dir=fastq_base_dir,
+            transcriptome_ref=transcriptome_ref,
+            output_dir=output_dir,
+            chemistry=chemistry,
+            localcores=localcores,
+            localmem=localmem,
+            create_bam=create_bam,
+            expect_cells=expect_cells,
+            include_introns=include_introns,
+        )
+        
+        if not result['success']:
+            logger.error(f"Cell Ranger failed for all runs in {sample_id}")
+            sys.exit(1)
+        
+        # Create per-SRR symlinks for ALL successful runs (not just the first)
+        # This ensures downstream modules can access each sample individually
+        for srr_id in result['successful_runs']:
+            actual_outs = os.path.join(
+                result['output_dir'], f"{srr_id}{SAMPLE_PATTERN}", 'outs'
+            )
+            expected_srr_dir = os.path.join(output_dir, 'cellranger', srr_id, 'outs')
+            
+            if os.path.exists(actual_outs):
+                os.makedirs(os.path.dirname(expected_srr_dir), exist_ok=True)
+                
+                if os.path.exists(expected_srr_dir):
+                    if os.path.islink(expected_srr_dir):
+                        os.unlink(expected_srr_dir)
+                    else:
+                        shutil.rmtree(expected_srr_dir)
+                
+                os.symlink(actual_outs, expected_srr_dir)
+                logger.info(f"Created per-SRR symlink: {expected_srr_dir} -> {actual_outs}")
+        
+        # Also create the GSE-level symlink for backward compatibility
+        # (points to first successful run, same as before)
+        expected_outs_dir = os.path.join(output_dir, 'cellranger', sample_id, 'outs')
+        if result['successful_runs']:
+            first_srr = result['successful_runs'][0]
+            first_run_dir = os.path.join(
+                result['output_dir'], f"{first_srr}{SAMPLE_PATTERN}", 'outs'
+            )
+            
+            if os.path.exists(first_run_dir):
+                os.makedirs(os.path.dirname(expected_outs_dir), exist_ok=True)
+                
+                if os.path.exists(expected_outs_dir):
+                    if os.path.islink(expected_outs_dir):
+                        os.unlink(expected_outs_dir)
+                    else:
+                        shutil.rmtree(expected_outs_dir)
+                
+                os.symlink(first_run_dir, expected_outs_dir)
+                logger.info(f"Created GSE-level symlink: {expected_outs_dir} -> {first_run_dir}")
+        
+        successful_count = len(result['successful_runs'])
+        total_count = result['total_runs']
     
-    # Verify expected outputs exist
+    # =========================================================================
+    # Verify expected Snakemake outputs exist
+    # =========================================================================
     expected_outputs = [
         snakemake.output.matrix,
         snakemake.output.bam,
@@ -646,16 +733,13 @@ def run_from_snakemake():
         logger.error(f"Expected outputs not found:")
         for path in missing_outputs:
             logger.error(f"  {path}")
-        # Don't exit with error if we have at least one successful run
-        # The symlink should have created the expected paths
-        if not result['successful_runs']:
+        if is_srr_level or not result.get('successful_runs'):
             sys.exit(1)
     
     logger.info("="*60)
     logger.info(f"Cell Ranger completed for {sample_id}")
-    logger.info(f"Successful runs: {len(result['successful_runs'])}/{result['total_runs']}")
+    logger.info(f"Successful runs: {successful_count}/{total_count}")
     logger.info("="*60)
-
 
 # =============================================================================
 # Standalone CLI

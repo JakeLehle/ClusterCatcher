@@ -154,8 +154,20 @@ def is_outlier(adata, metric, nmads):
 # Data Loading Functions
 # =============================================================================
 
-def load_cellranger_outputs(cellranger_base_dir, sample_ids):
-    """Load Cell Ranger count matrices from multiple samples."""
+def load_cellranger_outputs(cellranger_base_dir, sample_ids, samples_metadata=None):
+    """Load Cell Ranger count matrices from multiple samples.
+    
+    Parameters
+    ----------
+    cellranger_base_dir : str
+        Base directory containing Cell Ranger outputs
+    sample_ids : list
+        List of sample identifiers
+    samples_metadata : dict, optional
+        Per-sample metadata from SRAscraper pickle or sample-information command.
+        Structure: {sample_id: dict_with_metadata_columns}
+        Metadata columns (e.g., treatment, donor, title) are merged into adata.obs.
+    """
     logger.info(f"Loading {len(sample_ids)} samples from {cellranger_base_dir}...")
     
     adatas = []
@@ -203,8 +215,62 @@ def load_cellranger_outputs(cellranger_base_dir, sample_ids):
     adata.obs['sample_id'] = adata.obs['sample_id'].astype('category')
     logger.info(f"Total: {adata.n_obs} cells, {adata.n_vars} genes from {len(adatas)} samples")
     
+    # =========================================================================
+    # Merge per-sample metadata into adata.obs
+    # =========================================================================
+    # Propagate metadata from the SRAscraper pickle (or sample-information CSV)
+    # into the adata so downstream modules have access to treatment, donor, etc.
+    
+    if samples_metadata:
+        # Define metadata columns to propagate
+        # These are common columns from SRAscraper pickles and sample-information CSVs
+        metadata_columns = [
+            'treatment', 'condition',           # Experimental condition
+            'subject id', 'donor_id', 'donor',  # Donor/patient identifier
+            'title', 'source_name',             # Sample title/description
+            'geo_accession', 'run_accession',   # Accession IDs
+            'series_id',                        # GSE series ID
+            'cell type', 'tissue',              # Biological source
+            'sex', 'age',                       # Demographics
+        ]
+        
+        # Find which columns actually exist in the metadata
+        available_cols = set()
+        for sid, meta in samples_metadata.items():
+            if isinstance(meta, dict):
+                available_cols.update(meta.keys())
+            elif hasattr(meta, 'columns'):
+                # DataFrame — shouldn't happen with the Snakefile fix but handle gracefully
+                available_cols.update(meta.columns.tolist())
+        
+        cols_to_add = [c for c in metadata_columns if c in available_cols]
+        
+        if cols_to_add:
+            logger.info(f"  Merging metadata columns: {cols_to_add}")
+            
+            for col in cols_to_add:
+                # Build sample_id -> value mapping for this column
+                col_map = {}
+                for sid, meta in samples_metadata.items():
+                    if isinstance(meta, dict) and col in meta:
+                        val = meta[col]
+                        # Convert pandas NA types to None for clean handling
+                        if pd.isna(val) if not isinstance(val, str) else False:
+                            continue
+                        col_map[sid] = str(val)
+                
+                if col_map:
+                    # Clean column name for HDF5 compatibility (no spaces)
+                    clean_col = col.replace(' ', '_').lower()
+                    adata.obs[clean_col] = adata.obs['sample_id'].map(col_map)
+                    n_mapped = adata.obs[clean_col].notna().sum()
+                    logger.info(f"    {clean_col}: mapped {n_mapped}/{adata.n_obs} cells")
+            
+            logger.info(f"  Metadata merge complete")
+        else:
+            logger.info(f"  No recognized metadata columns found in samples_metadata")
+    
     return adata
-
 
 # =============================================================================
 # QC Functions
@@ -956,6 +1022,7 @@ def run_qc_annotation_pipeline(
     qc_params,
     preprocessing_params,
     annotation_params,
+    samples_metadata=None,
 ):
     """
     Run the complete QC and annotation pipeline.
@@ -995,7 +1062,7 @@ def run_qc_annotation_pipeline(
     logger.info("\n" + "="*60)
     logger.info("[Step 1/7] Loading Cell Ranger outputs...")
     logger.info("="*60)
-    adata = load_cellranger_outputs(cellranger_dir, sample_ids)
+    adata = load_cellranger_outputs(cellranger_dir, sample_ids, samples_metadata=samples_metadata)
     
     # Step 2: Calculate QC metrics - pass qc_params for mode detection
     logger.info("\n" + "="*60)
@@ -1078,6 +1145,7 @@ def run_from_snakemake():
     qc_params = params.qc_params
     preprocessing_params = params.preprocessing_params
     annotation_params = params.annotation_params
+    samples_metadata = getattr(params, 'samples_metadata', None)
     
     log_file = snakemake.log[0] if snakemake.log else None
     if log_file:
@@ -1096,8 +1164,8 @@ def run_from_snakemake():
         qc_params=qc_params,
         preprocessing_params=preprocessing_params,
         annotation_params=annotation_params,
+        samples_metadata=samples_metadata,
     )
-
 
 # =============================================================================
 # CLI Entry Point
