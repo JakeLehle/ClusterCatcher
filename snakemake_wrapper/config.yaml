@@ -186,7 +186,7 @@ dysregulation:
 viral:
   kraken_db: null
   viral_db: null
-  confidence: 0.1
+  confidence: 0.0
   include_organisms: null
   exclude_organisms: null
   organisms_of_interest: []

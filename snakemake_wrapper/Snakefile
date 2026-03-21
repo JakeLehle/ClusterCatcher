@@ -39,32 +39,80 @@ MEMORY_GB = config.get("memory_gb", 64)
 os.makedirs(LOG_DIR, exist_ok=True)
 
 # Sample information - support both direct config and pickle file
+import pandas as pd
+ 
 SAMPLE_INFO_PATH = config.get("sample_info")
+GSE_TO_SRRS = {}  # Mapping for Cell Ranger: {GSE_ID: DataFrame} (preserved for GSE-level processing)
+ 
 if SAMPLE_INFO_PATH and os.path.exists(SAMPLE_INFO_PATH):
     with open(SAMPLE_INFO_PATH, 'rb') as f:
         SAMPLES_RAW = pickle.load(f)
     
-    # Filter out empty DataFrames (SRAscraper format)
-    # A sample is valid if it's a non-empty DataFrame or a non-empty dict
     SAMPLES = {}
+    
     for key, value in SAMPLES_RAW.items():
-        if hasattr(value, 'empty'):  # It's a DataFrame
-            if not value.empty:
-                SAMPLES[key] = value
+        if hasattr(value, 'empty') and not value.empty:
+            # It's a non-empty DataFrame — check if this is SRAscraper format
+            if 'run_accession' in value.columns:
+                # ============================================================
+                # SRAscraper format: {GSE_ID: DataFrame with run_accession}
+                # Extract individual SRR IDs as sample IDs
+                # ============================================================
+                srr_ids = value['run_accession'].tolist()
+                print(f"SRAscraper format detected for {key}: {len(srr_ids)} runs")
+                
+                # Store GSE -> SRR mapping for Cell Ranger rule
+                GSE_TO_SRRS[key] = value
+                
+                # Create per-SRR entries in SAMPLES with metadata from the row
+                for _, row in value.iterrows():
+                    srr = row['run_accession']
+                    sample_entry = row.to_dict()
+                    sample_entry['series_id'] = key
+                    SAMPLES[srr] = sample_entry
+                    
+                    # Log the mapping
+                    title = row.get('title', row.get('source_name', ''))
+                    treatment = row.get('treatment', '')
+                    donor = row.get('subject id', row.get('donor_id', ''))
+                    print(f"  {srr}: {title} | {treatment} | {donor}")
             else:
-                print(f"WARNING: Skipping {key} - empty DataFrame (no successful Cell Ranger runs)")
-        elif isinstance(value, dict) and value:  # Non-empty dict
+                # DataFrame but not SRAscraper format — use key as sample ID
+                SAMPLES[key] = value
+                print(f"Non-SRAscraper DataFrame for {key}: {len(value)} rows")
+        
+        elif isinstance(value, dict) and value:
+            # Dict format (from sample-information command)
             SAMPLES[key] = value
-        elif isinstance(value, (list, tuple)) and value:  # Non-empty list/tuple
+        
+        elif isinstance(value, (list, tuple)) and value:
             SAMPLES[key] = value
+        
         else:
             print(f"WARNING: Skipping {key} - empty or invalid sample info")
     
-    SAMPLE_IDS = list(SAMPLES.keys())
-    print(f"Loaded {len(SAMPLE_IDS)} valid samples from pickle (filtered from {len(SAMPLES_RAW)} total)")
+    # Use explicit sample_ids from config if provided, otherwise use parsed keys
+    if config.get("sample_ids"):
+        SAMPLE_IDS = config["sample_ids"]
+        print(f"Using explicit sample_ids from config: {len(SAMPLE_IDS)} samples")
+    else:
+        SAMPLE_IDS = list(SAMPLES.keys())
+    
+    print(f"Loaded {len(SAMPLE_IDS)} valid samples from pickle (parsed from {len(SAMPLES_RAW)} series)")
+    
 else:
     SAMPLES = config.get("samples", {})
     SAMPLE_IDS = config.get("sample_ids", list(SAMPLES.keys()))
+ 
+if not SAMPLE_IDS:
+    raise ValueError(
+        "No valid sample IDs found. Provide either:\n"
+        "  1. 'sample_info' pickle with non-empty samples (SRAscraper or sample-information format)\n"
+        "  2. 'sample_ids' list in config\n"
+        "  3. 'samples' dict in config"
+    )
+ 
+print(f"SAMPLE_IDS: {SAMPLE_IDS}")
 
 if not SAMPLE_IDS:
     raise ValueError("No valid sample IDs found. Provide either 'sample_info' pickle with non-empty samples or 'sample_ids' list in config.")
@@ -324,6 +372,7 @@ rule qc_and_annotation:
         qc_params=config.get("qc", {}),
         preprocessing_params=config.get("preprocessing", {}),
         annotation_params=config.get("annotation", {}),
+        samples_metadata=SAMPLES,
     log:
         f"{LOG_DIR}/qc_annotation/qc_annotation.log"
     threads: THREADS
