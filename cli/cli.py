@@ -24,6 +24,7 @@ import sys
 # Import subcommands
 from cli.sample_information import sample_information
 from cli.run_config import run_config
+from cli.create_config import create_config_cmd
 
 
 @click.group()
@@ -39,7 +40,7 @@ def main():
     \b
     Typical workflow:
     1. ClusterCatcher sample-information --input samples.csv --output samples.pkl
-    2. ClusterCatcher create-config --samples samples.pkl --output-dir ./results [options]
+    2. ClusterCatcher create-config --sample-pickle samples.pkl --output-dir ./results [options]
     3. ClusterCatcher run-config ./results/config.yaml
     
     \b
@@ -52,7 +53,6 @@ def main():
     ClusterCatcher create-config \\
         --output-dir ./results \\
         --sample-pickle samples.pkl \\
-        --reference-fasta /path/to/GRCh38.fa \\
         --cellranger-reference /path/to/refdata-gex-GRCh38-2020-A
     
     \b
@@ -60,40 +60,20 @@ def main():
     ClusterCatcher create-config \\
         --output-dir ./results \\
         --sample-pickle samples.pkl \\
-        --reference-fasta /path/to/GRCh38.fa \\
         --cellranger-reference /path/to/refdata-gex-GRCh38-2020-A \\
         --gtf-file /path/to/genes.gtf \\
         --enable-viral --kraken-db /path/to/kraken2_db \\
-        --enable-scomatic --scomatic-scripts-dir /path/to/SComatic/scripts \\
+        --enable-scomatic \\
         --enable-signatures --cosmic-file /path/to/COSMIC_v3.4_SBS_GRCh38.txt
     """
     pass
 
 
-@main.command('create-config')
-@click.pass_context
-def create_config_cmd(ctx):
-    """
-    Generate pipeline configuration file.
-    
-    This is a wrapper that calls the create_config.py script directly.
-    For full options, run: python snakemake_wrapper/create_config.py --help
-    """
-    click.echo("For create-config, please run directly:")
-    click.echo("  python snakemake_wrapper/create_config.py --help")
-    click.echo("\nExample:")
-    click.echo("  python snakemake_wrapper/create_config.py \\")
-    click.echo("    --output-dir ./results \\")
-    click.echo("    --sample-pickle samples.pkl \\")
-    click.echo("    --reference-fasta /path/to/GRCh38.fa \\")
-    click.echo("    --cellranger-reference /path/to/refdata-gex-GRCh38-2020-A")
-
-
 # Register subcommands
 main.add_command(sample_information)
+main.add_command(create_config_cmd)
 main.add_command(run_config)
 
 
 if __name__ == '__main__':
     main()
-

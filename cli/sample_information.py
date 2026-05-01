@@ -354,10 +354,9 @@ def sample_information(input_csv, output_pkl, skip_validation, srascraper_format
     click.echo("\n" + "="*60)
     click.echo("Next step: Create pipeline configuration")
     click.echo("="*60)
-    click.echo(f"\n  python snakemake_wrapper/create_config.py \\")
+    click.echo(f"\n  ClusterCatcher create-config \\")
     click.echo(f"    --output-dir ./results \\")
     click.echo(f"    --sample-pickle {output_pkl} \\")
-    click.echo(f"    --reference-fasta /path/to/GRCh38.fa \\")
     click.echo(f"    --cellranger-reference /path/to/refdata-gex-GRCh38-2020-A")
     click.echo("")
 
