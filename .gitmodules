@@ -1,0 +1,6 @@
+[submodule "external/SComatic"]
+	path = external/SComatic
+	url = https://github.com/cortes-ciriano-lab/SComatic.git
+[submodule "external/CytoTRACE2"]
+	path = external/CytoTRACE2
+	url = https://github.com/digitalcytometry/cytotrace2.git
