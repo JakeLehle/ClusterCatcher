@@ -14,6 +14,13 @@ This script is designed to work with SRAscraper output structure where:
 The script processes all SRRs within a GSE and tracks successful runs,
 matching the behavior of the standalone SRAscraper cellranger script.
 
+Snakemake Integration:
+    The declared Snakemake output is a status JSON file (not H5/BAM/etc).
+    Cell Ranger outputs (H5, BAM, web_summary) are side effects on disk.
+    A downstream checkpoint rule validates which samples produced usable
+    outputs and builds the dynamic DAG for QC, annotation, and beyond.
+    This ensures one failed sample never blocks the entire pipeline.
+
 Usage:
     Called via Snakemake rule with snakemake.input/output/params
     
@@ -27,6 +34,7 @@ Requirements:
 
 import os
 import sys
+import json
 import yaml
 import pickle
 import shutil
@@ -37,6 +45,7 @@ import argparse
 import pandas as pd
 from pathlib import Path
 from os import cpu_count
+from datetime import datetime
 
 # Set up logging
 logging.basicConfig(
@@ -71,6 +80,56 @@ CHEMISTRY_OPTIONS = [
 
 # Default sample pattern for Cell Ranger --id
 SAMPLE_PATTERN = "_S1_L001_"
+
+
+# =============================================================================
+# Status JSON Helper
+# =============================================================================
+
+def write_status_json(output_path, sample_id, success, chemistry=None,
+                      error=None, paths=None, series_id=None):
+    """
+    Write a status JSON file for the checkpoint to consume.
+    
+    This is the ONLY declared Snakemake output for the cellranger_count rule.
+    It is always written regardless of success or failure, ensuring the
+    Snakemake DAG is never broken by a single sample failure.
+    
+    Parameters
+    ----------
+    output_path : str
+        Path to write the status JSON
+    sample_id : str
+        SRR or GSE sample identifier
+    success : bool
+        Whether Cell Ranger completed successfully
+    chemistry : str, optional
+        Chemistry that succeeded (None if failed)
+    error : str, optional
+        Error message (None if succeeded)
+    paths : dict, optional
+        Dict of output file paths (None if failed)
+    series_id : str, optional
+        GSE series ID for this SRR
+    """
+    status = {
+        'sample_id': sample_id,
+        'success': success,
+        'chemistry': chemistry,
+        'error': error,
+        'series_id': series_id,
+        'timestamp': datetime.now().isoformat(),
+        'paths': paths or {},
+    }
+    
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with open(output_path, 'w') as f:
+        json.dump(status, f, indent=2)
+    
+    if success:
+        logger.info(f"Status JSON written: {output_path} (SUCCESS)")
+    else:
+        logger.warning(f"Status JSON written: {output_path} (FAILED: {error})")
 
 
 # =============================================================================
@@ -212,7 +271,7 @@ def run_cellranger_for_srr(
     """
     Run Cell Ranger count for a single SRR with automatic chemistry detection.
     
-    This matches custom indiviudal script behavior I used before making this pipeline:
+    This matches custom individual script behavior I used before making this pipeline:
     - --id={srr_id}_S1_L001_
     - --fastqs={fastq_dir}
     - --sample={srr_id}
@@ -521,10 +580,20 @@ def run_cellranger_for_gse(
 # =============================================================================
 
 def run_from_snakemake():
-    """Run Cell Ranger from Snakemake rule."""
+    """
+    Run Cell Ranger from Snakemake rule.
+    
+    The ONLY declared Snakemake output is a status JSON file.
+    Cell Ranger outputs (H5, BAM, etc.) are side effects on disk — the
+    downstream checkpoint rule validates which ones are usable.
+    
+    This function NEVER calls sys.exit(1) for sample-level failures.
+    Instead it writes a failure status JSON so the pipeline continues.
+    """
     
     # Get Snakemake variables
-    sample_id = snakemake.params.sample_id  # GSE ID
+    sample_id = snakemake.params.sample_id
+    status_output = snakemake.output.status
     log_file = snakemake.log[0] if snakemake.log else None
     
     # Get parameters from Snakemake
@@ -554,28 +623,36 @@ def run_from_snakemake():
     logger.info(f"CELL RANGER COUNT - GSE: {sample_id}")
     logger.info("="*60)
     
-    # Validate inputs
+    # =========================================================================
+    # Validate inputs — write failure status JSON instead of sys.exit(1)
+    # =========================================================================
     if sample_info is None:
         logger.error(f"No sample info found for {sample_id}")
-        sys.exit(1)
+        write_status_json(status_output, sample_id, success=False,
+                          error=f"No sample info found for {sample_id}")
+        return
     
     if isinstance(sample_info, pd.DataFrame):
         logger.info(f"Sample info: DataFrame with {len(sample_info)} runs")
         if len(sample_info) == 0:
             logger.error(f"Empty DataFrame for {sample_id} - no runs to process")
-            sys.exit(1)
+            write_status_json(status_output, sample_id, success=False,
+                              error=f"Empty DataFrame for {sample_id}")
+            return
     else:
         logger.info(f"Sample info type: {type(sample_info)}")
     
     if not fastq_base_dir:
         logger.error("fastq_base_dir not provided in config")
-        logger.error("Please set cellranger.fastq_base_dir in your config.yaml")
-        logger.error("This should point to the 'fastq' directory from your SRAscraper output")
-        sys.exit(1)
+        write_status_json(status_output, sample_id, success=False,
+                          error="fastq_base_dir not provided in config")
+        return
     
     if not os.path.exists(fastq_base_dir):
         logger.error(f"FASTQ base directory not found: {fastq_base_dir}")
-        sys.exit(1)
+        write_status_json(status_output, sample_id, success=False,
+                          error=f"FASTQ base directory not found: {fastq_base_dir}")
+        return
     
     logger.info(f"FASTQ base directory: {fastq_base_dir}")
     logger.info(f"Transcriptome reference: {transcriptome_ref}")
@@ -586,9 +663,6 @@ def run_from_snakemake():
     # =========================================================================
     # Determine processing mode: SRR-level or GSE-level
     # =========================================================================
-    # With the Snakefile SRAscraper fix, sample_id may be an individual SRR
-    # (sample_info will be a dict) or a GSE series (sample_info will be a DataFrame).
-    
     is_srr_level = isinstance(sample_info, dict) and 'run_accession' in sample_info
     
     if is_srr_level:
@@ -605,7 +679,10 @@ def run_from_snakemake():
         
         if not os.path.exists(srr_fastq_dir):
             logger.error(f"FASTQ directory not found: {srr_fastq_dir}")
-            sys.exit(1)
+            write_status_json(status_output, sample_id, success=False,
+                              error=f"FASTQ directory not found: {srr_fastq_dir}",
+                              series_id=series_id)
+            return
         
         # Output goes under: cellranger/{series_id}/{srr}_S1_L001_/outs/
         gse_output_dir = os.path.join(output_dir, 'cellranger', series_id)
@@ -626,7 +703,14 @@ def run_from_snakemake():
         
         if not result_srr['success']:
             logger.error(f"Cell Ranger failed for {srr_id}")
-            sys.exit(1)
+            write_status_json(status_output, sample_id, success=False,
+                              error="All chemistry options failed",
+                              series_id=series_id)
+            logger.info("="*60)
+            logger.info(f"Cell Ranger FAILED for {sample_id}")
+            logger.info(f"Sample will be excluded by checkpoint validation")
+            logger.info("="*60)
+            return
         
         # Create per-SRR symlink:
         #   cellranger/{srr_id}/outs → cellranger/{series_id}/{srr}_S1_L001_/outs
@@ -645,8 +729,18 @@ def run_from_snakemake():
             os.symlink(actual_outs, expected_outs_dir)
             logger.info(f"Created per-SRR symlink: {expected_outs_dir} -> {actual_outs}")
         
-        successful_count = 1
-        total_count = 1
+        # Write success status JSON
+        write_status_json(
+            status_output, sample_id, success=True,
+            chemistry=result_srr['chemistry'],
+            series_id=series_id,
+            paths=result_srr.get('paths', {}),
+        )
+        
+        logger.info("="*60)
+        logger.info(f"Cell Ranger completed for {sample_id}")
+        logger.info(f"Successful runs: 1/1")
+        logger.info("="*60)
         
     else:
         # =================================================================
@@ -668,7 +762,9 @@ def run_from_snakemake():
         
         if not result['success']:
             logger.error(f"Cell Ranger failed for all runs in {sample_id}")
-            sys.exit(1)
+            write_status_json(status_output, sample_id, success=False,
+                              error="All runs in GSE failed")
+            return
         
         # Create per-SRR symlinks for ALL successful runs (not just the first)
         # This ensures downstream modules can access each sample individually
@@ -711,35 +807,20 @@ def run_from_snakemake():
                 os.symlink(first_run_dir, expected_outs_dir)
                 logger.info(f"Created GSE-level symlink: {expected_outs_dir} -> {first_run_dir}")
         
-        successful_count = len(result['successful_runs'])
-        total_count = result['total_runs']
-    
-    # =========================================================================
-    # Verify expected Snakemake outputs exist
-    # =========================================================================
-    expected_outputs = [
-        snakemake.output.matrix,
-        snakemake.output.bam,
-        snakemake.output.bai,
-        snakemake.output.summary,
-    ]
-    
-    missing_outputs = []
-    for output_path in expected_outputs:
-        if not os.path.exists(output_path):
-            missing_outputs.append(output_path)
-    
-    if missing_outputs:
-        logger.error(f"Expected outputs not found:")
-        for path in missing_outputs:
-            logger.error(f"  {path}")
-        if is_srr_level or not result.get('successful_runs'):
-            sys.exit(1)
-    
-    logger.info("="*60)
-    logger.info(f"Cell Ranger completed for {sample_id}")
-    logger.info(f"Successful runs: {successful_count}/{total_count}")
-    logger.info("="*60)
+        # Write success status JSON
+        write_status_json(
+            status_output, sample_id, success=True,
+            chemistry='mixed',
+            paths={'successful_runs': result['successful_runs'],
+                   'failed_runs': [f['srr_id'] for f in result['failed_runs']],
+                   'output_dir': result['output_dir']},
+        )
+        
+        logger.info("="*60)
+        logger.info(f"Cell Ranger completed for {sample_id}")
+        logger.info(f"Successful runs: {len(result['successful_runs'])}/{result['total_runs']}")
+        logger.info("="*60)
+
 
 # =============================================================================
 # Standalone CLI

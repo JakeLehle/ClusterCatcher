@@ -62,6 +62,7 @@ dependencies:
   # Deep learning (optional)
   - dca
   - faiss
+  - pyarrow
   
   # GUI tools
   - pygraphviz

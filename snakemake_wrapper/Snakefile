@@ -12,6 +12,13 @@ Single-cell sequencing analysis pipeline for:
 7. Somatic mutation calling (SComatic)
 8. Mutational signature deconvolution (semi-supervised NMF)
 
+Architecture:
+    Cell Ranger outputs a status JSON per sample (not H5/BAM).
+    A checkpoint rule validates which samples produced usable outputs
+    (barcodes > 100B, H5 > 1000B, BAM > 10KB) and writes a dynamic
+    sample list. All downstream rules consume only validated samples
+    via input functions, so one failed sample never blocks the pipeline.
+
 Configuration is loaded from the YAML file specified at runtime.
 
 Usage:
@@ -40,16 +47,16 @@ os.makedirs(LOG_DIR, exist_ok=True)
 
 # Sample information - support both direct config and pickle file
 import pandas as pd
- 
+
 SAMPLE_INFO_PATH = config.get("sample_info")
 GSE_TO_SRRS = {}  # Mapping for Cell Ranger: {GSE_ID: DataFrame} (preserved for GSE-level processing)
- 
+
 if SAMPLE_INFO_PATH and os.path.exists(SAMPLE_INFO_PATH):
     with open(SAMPLE_INFO_PATH, 'rb') as f:
         SAMPLES_RAW = pickle.load(f)
-    
+
     SAMPLES = {}
-    
+
     for key, value in SAMPLES_RAW.items():
         if hasattr(value, 'empty') and not value.empty:
             # It's a non-empty DataFrame — check if this is SRAscraper format
@@ -60,17 +67,17 @@ if SAMPLE_INFO_PATH and os.path.exists(SAMPLE_INFO_PATH):
                 # ============================================================
                 srr_ids = value['run_accession'].tolist()
                 print(f"SRAscraper format detected for {key}: {len(srr_ids)} runs")
-                
+
                 # Store GSE -> SRR mapping for Cell Ranger rule
                 GSE_TO_SRRS[key] = value
-                
+
                 # Create per-SRR entries in SAMPLES with metadata from the row
                 for _, row in value.iterrows():
                     srr = row['run_accession']
                     sample_entry = row.to_dict()
                     sample_entry['series_id'] = key
                     SAMPLES[srr] = sample_entry
-                    
+
                     # Log the mapping
                     title = row.get('title', row.get('source_name', ''))
                     treatment = row.get('treatment', '')
@@ -80,30 +87,30 @@ if SAMPLE_INFO_PATH and os.path.exists(SAMPLE_INFO_PATH):
                 # DataFrame but not SRAscraper format — use key as sample ID
                 SAMPLES[key] = value
                 print(f"Non-SRAscraper DataFrame for {key}: {len(value)} rows")
-        
+
         elif isinstance(value, dict) and value:
             # Dict format (from sample-information command)
             SAMPLES[key] = value
-        
+
         elif isinstance(value, (list, tuple)) and value:
             SAMPLES[key] = value
-        
+
         else:
             print(f"WARNING: Skipping {key} - empty or invalid sample info")
-    
+
     # Use explicit sample_ids from config if provided, otherwise use parsed keys
     if config.get("sample_ids"):
         SAMPLE_IDS = config["sample_ids"]
         print(f"Using explicit sample_ids from config: {len(SAMPLE_IDS)} samples")
     else:
         SAMPLE_IDS = list(SAMPLES.keys())
-    
+
     print(f"Loaded {len(SAMPLE_IDS)} valid samples from pickle (parsed from {len(SAMPLES_RAW)} series)")
-    
+
 else:
     SAMPLES = config.get("samples", {})
     SAMPLE_IDS = config.get("sample_ids", list(SAMPLES.keys()))
- 
+
 if not SAMPLE_IDS:
     raise ValueError(
         "No valid sample IDs found. Provide either:\n"
@@ -111,7 +118,7 @@ if not SAMPLE_IDS:
         "  2. 'sample_ids' list in config\n"
         "  3. 'samples' dict in config"
     )
- 
+
 print(f"SAMPLE_IDS: {SAMPLE_IDS}")
 
 if not SAMPLE_IDS:
@@ -135,7 +142,7 @@ if TRANSCRIPTOME_REF:
             print(f"WARNING: Could not auto-derive FASTA from cellranger reference")
             print(f"  Checked: {derived_fasta}")
             print(f"  Please set 'reference.fasta' in your config.yaml")
-    
+
     # Auto-derive GTF
     if not GTF_PATH or GTF_PATH is None:
         derived_gtf = os.path.join(TRANSCRIPTOME_REF, "genes", "genes.gtf")
@@ -198,33 +205,86 @@ def get_fastq_r2(wildcards):
     sample_info = SAMPLES.get(wildcards.sample, {})
     return sample_info.get("fastq_r2", [])
 
-def get_all_bams():
-    """Get all BAM files from Cell Ranger output."""
+# =============================================================================
+# Checkpoint-Based Dynamic Sample Functions
+# =============================================================================
+# These functions are called AFTER the validate_cellranger checkpoint completes.
+# They read validated_samples.txt to determine which samples passed validation,
+# so downstream rules only process samples with usable Cell Ranger outputs.
+# This mirrors the standalone script's dictionary_file_filtered.pkl pattern.
+
+def get_validated_sample_ids():
+    """
+    Read validated sample IDs from checkpoint output.
+    
+    Called after the checkpoint — Snakemake ensures the checkpoint has
+    completed before evaluating input functions that reference it.
+    """
+    ck = checkpoints.validate_cellranger.get()
+    validated_file = ck.output.validated
+    with open(validated_file) as f:
+        return [line.strip() for line in f if line.strip()]
+
+def get_validated_h5_files(wildcards):
+    """Get H5 matrix files for validated samples only."""
     return expand(
-        f"{OUTPUT_DIR}/cellranger/{{sample}}/outs/possorted_genome_bam.bam",
-        sample=SAMPLE_IDS
+        f"{OUTPUT_DIR}/cellranger/{{s}}/outs/filtered_feature_bc_matrix.h5",
+        s=get_validated_sample_ids()
+    )
+
+def get_validated_bams(wildcards):
+    """Get BAM files for validated samples only."""
+    return expand(
+        f"{OUTPUT_DIR}/cellranger/{{s}}/outs/possorted_genome_bam.bam",
+        s=get_validated_sample_ids()
+    )
+
+def get_validated_bais(wildcards):
+    """Get BAM index files for validated samples only."""
+    return expand(
+        f"{OUTPUT_DIR}/cellranger/{{s}}/outs/possorted_genome_bam.bam.bai",
+        s=get_validated_sample_ids()
+    )
+
+def get_validated_web_summaries(wildcards):
+    """Get Cell Ranger web summaries for validated samples only."""
+    return expand(
+        f"{OUTPUT_DIR}/cellranger/{{s}}/outs/web_summary.html",
+        s=get_validated_sample_ids()
+    )
+
+def get_validated_viral_summaries(wildcards):
+    """Get Kraken2 viral summaries for validated samples only."""
+    return expand(
+        f"{OUTPUT_DIR}/viral/{{s}}/{{s}}_organism_summary.tsv",
+        s=get_validated_sample_ids()
     )
 
 def get_final_targets():
-    """Generate list of final target files based on configuration."""
+    """
+    Generate list of final target files based on configuration.
+    
+    Note: Individual cellranger H5/BAM files are NOT listed here.
+    The checkpoint (validated_samples.txt) is the gateway — all downstream
+    rules depend on it through their input functions.
+    """
     targets = []
-    
-    # Cell Ranger outputs (always required)
-    targets.extend(expand(
-        f"{OUTPUT_DIR}/cellranger/{{sample}}/outs/filtered_feature_bc_matrix.h5",
-        sample=SAMPLE_IDS
-    ))
-    
-    # QC and annotation outputs (always required)
+
+    # Checkpoint validation output — ensures all cellranger jobs run
+    # and validation happens before anything downstream
+    targets.append(f"{OUTPUT_DIR}/cellranger/validated_samples.txt")
+    targets.append(f"{OUTPUT_DIR}/cellranger/validation_summary.json")
+
+    # QC and annotation outputs (always required — depends on checkpoint)
     targets.append(f"{OUTPUT_DIR}/qc/multiqc_report.html")
     targets.append(f"{OUTPUT_DIR}/annotation/adata_annotated.h5ad")
     targets.append(f"{OUTPUT_DIR}/annotation/annotation_summary.tsv")
-    
+
     # Dysregulation outputs (cancer cell detection)
     if DYSREGULATION_ENABLED:
         targets.append(f"{OUTPUT_DIR}/dysregulation/dysregulation_summary.tsv")
         targets.append(f"{OUTPUT_DIR}/dysregulation/adata_cancer_detected.h5ad")
-    
+
     # Viral detection outputs
     if VIRAL_DETECTION_ENABLED:
         targets.append(f"{OUTPUT_DIR}/viral/viral_detection_summary.tsv")
@@ -232,22 +292,22 @@ def get_final_targets():
         if HUMAN_VIRAL_DB:
             targets.append(f"{OUTPUT_DIR}/viral_integration/adata_with_virus.h5ad")
             targets.append(f"{OUTPUT_DIR}/viral_integration/viral_integration_summary.tsv")
-    
+
     # SComatic mutation calling outputs
     if SCOMATIC_ENABLED:
         targets.append(f"{OUTPUT_DIR}/mutations/all_samples.single_cell_genotype.filtered.tsv")
         targets.append(f"{OUTPUT_DIR}/mutations/CombinedCallableSites/complete_callable_sites.tsv")
-    
+
     # Signature analysis outputs
     if SIGNATURES_ENABLED:
         targets.append(f"{OUTPUT_DIR}/signatures/signature_weights_per_cell.txt")
         targets.append(f"{OUTPUT_DIR}/signatures/adata_final.h5ad")
         # Also copy to main output dir
         targets.append(f"{OUTPUT_DIR}/adata_final.h5ad")
-    
+
     # Master summary (always)
     targets.append(f"{OUTPUT_DIR}/master_summary.yaml")
-    
+
     return targets
 
 # =============================================================================
@@ -266,24 +326,19 @@ rule all:
 rule cellranger_count:
     """
     Run Cell Ranger count for a single sample.
-    
+
     This rule aligns FASTQ files to the reference transcriptome and generates
     gene expression matrices. Uses automatic chemistry detection with fallback
     options if the specified chemistry fails.
-    
-    For SRAscraper users:
-    - Processes each SRR within the GSE separately
-    - FASTQ structure: {fastq_base_dir}/{GSE_ID}/{SRR_ID}/*.fastq.gz
-    - Cell Ranger ID: {SRR_ID}_S1_L001_
-    
-    Note: Cell Ranger must be installed separately and available in PATH.
-    See: https://support.10xgenomics.com/single-cell-gene-expression/software/downloads/latest
+
+    The ONLY declared output is a status JSON file. Cell Ranger outputs
+    (H5, BAM, web_summary) are side effects on disk — the downstream
+    checkpoint validates which ones are usable.
+
+    This design ensures one failed sample never blocks the pipeline.
     """
     output:
-        matrix=f"{OUTPUT_DIR}/cellranger/{{sample}}/outs/filtered_feature_bc_matrix.h5",
-        bam=f"{OUTPUT_DIR}/cellranger/{{sample}}/outs/possorted_genome_bam.bam",
-        bai=f"{OUTPUT_DIR}/cellranger/{{sample}}/outs/possorted_genome_bam.bam.bai",
-        summary=f"{OUTPUT_DIR}/cellranger/{{sample}}/outs/web_summary.html",
+        status=f"{OUTPUT_DIR}/cellranger/{{sample}}/cellranger_status.json",
     params:
         sample_id="{sample}",
         transcriptome=TRANSCRIPTOME_REF,
@@ -295,7 +350,6 @@ rule cellranger_count:
         create_bam=config.get("cellranger", {}).get("create_bam", True),
         samples_dict=SAMPLES,
         output_dir=OUTPUT_DIR,
-        # FASTQ base directory - uses top-level variable (auto-derived or from config)
         fastq_base_dir=FASTQ_BASE_DIR,
     log:
         f"{LOG_DIR}/cellranger/{{sample}}.log"
@@ -306,68 +360,71 @@ rule cellranger_count:
         "scripts/cellranger_count.py"
 
 # =============================================================================
+# Cell Ranger Validation Checkpoint
+# =============================================================================
+
+checkpoint validate_cellranger:
+    """
+    Validate Cell Ranger outputs and build dynamic sample list.
+
+    This checkpoint runs AFTER all cellranger_count jobs and BEFORE any
+    downstream analysis. It validates outputs on disk (not just exit codes):
+    - barcodes.tsv.gz > 100 bytes  (catches empty barcode whitelists)
+    - filtered_feature_bc_matrix.h5 > 1000 bytes  (catches empty H5)
+    - possorted_genome_bam.bam > 10,000 bytes  (catches empty BAMs)
+
+    Samples failing validation are excluded from all downstream steps.
+    The sample info pickle is backed up and updated with only validated
+    samples, mirroring the standalone pipeline's filtered pickle pattern.
+
+    After this checkpoint completes, Snakemake re-evaluates the DAG
+    using input functions that read validated_samples.txt.
+    """
+    input:
+        statuses=expand(
+            f"{OUTPUT_DIR}/cellranger/{{sample}}/cellranger_status.json",
+            sample=SAMPLE_IDS
+        ),
+    output:
+        validated=f"{OUTPUT_DIR}/cellranger/validated_samples.txt",
+        summary=f"{OUTPUT_DIR}/cellranger/validation_summary.json",
+    params:
+        cellranger_dir=f"{OUTPUT_DIR}/cellranger",
+        sample_info_path=SAMPLE_INFO_PATH,
+    log:
+        f"{LOG_DIR}/cellranger/validation.log"
+    script:
+        "scripts/validate_cellranger.py"
+
+# =============================================================================
 # QC and Annotation Rules
 # =============================================================================
 
 rule qc_and_annotation:
     """
     Combined QC filtering and cell type annotation using popV.
-    
+
+    Inputs are resolved dynamically via the checkpoint — only validated
+    samples (those with usable Cell Ranger outputs) are processed.
+
     This rule performs a 7-step pipeline:
-    
     1. Loading Cell Ranger outputs
-       - Loads filtered_feature_bc_matrix.h5 from each sample
-       - Concatenates samples with unique barcode prefixes
-       - Creates gene symbol columns for popV compatibility
-    
     2. QC metrics calculation
-       - Identifies mitochondrial, ribosomal, and hemoglobin genes
-       - Calculates n_genes_by_counts, total_counts, pct_counts_mt
-    
     3. Cell and gene filtering
-       - Filters by min/max genes, min/max counts, max mito %
-       - Filters genes by minimum cells expressing
-    
     4. Doublet detection (Scrublet)
-       - Runs per-sample for accuracy
-       - Removes predicted doublets
-    
     5. popV annotation (on RAW counts)
-       - Pulls HubModel from Hugging Face
-       - Runs annotation with batch correction
-       - Merges predictions back to original object
-    
-    6. Post-annotation processing
-       - Normalizes (CPM by default)
-       - Computes neighbors, UMAP, Leiden clusters
-       - Optional BBKNN batch correction
-    
+    6. Post-annotation processing (normalize, UMAP, cluster)
     7. Cluster-based annotation refinement
-       - Assigns final cell type per cluster using weighted scoring
-       - Uses popV prediction scores to weight cell type votes
-    
-    Outputs:
-    - adata_annotated.h5ad: Final annotated AnnData with:
-        - popv_prediction: Raw popV cell type calls
-        - popv_prediction_score: Confidence scores
-        - clusters: Leiden cluster assignments
-        - final_annotation: Cluster-refined cell types
-    - qc_metrics.tsv: Per-sample QC statistics
-    - annotation_summary.tsv: Cell type counts per sample
-    - figures/qc/: QC and annotation visualizations
     """
     input:
-        matrices=expand(
-            f"{OUTPUT_DIR}/cellranger/{{sample}}/outs/filtered_feature_bc_matrix.h5",
-            sample=SAMPLE_IDS
-        ),
+        matrices=get_validated_h5_files,
     output:
         adata=f"{OUTPUT_DIR}/annotation/adata_annotated.h5ad",
         qc_metrics=f"{OUTPUT_DIR}/qc/qc_metrics.tsv",
         annotation_summary=f"{OUTPUT_DIR}/annotation/annotation_summary.tsv",
         figures=directory(f"{OUTPUT_DIR}/figures/qc"),
     params:
-        sample_ids=SAMPLE_IDS,
+        sample_ids=lambda wildcards: get_validated_sample_ids(),
         cellranger_dir=f"{OUTPUT_DIR}/cellranger",
         qc_params=config.get("qc", {}),
         preprocessing_params=config.get("preprocessing", {}),
@@ -384,10 +441,7 @@ rule qc_and_annotation:
 rule multiqc:
     """Generate MultiQC report from all QC outputs."""
     input:
-        cellranger=expand(
-            f"{OUTPUT_DIR}/cellranger/{{sample}}/outs/web_summary.html",
-            sample=SAMPLE_IDS
-        ),
+        cellranger=get_validated_web_summaries,
         qc_metrics=f"{OUTPUT_DIR}/qc/qc_metrics.tsv",
     output:
         report=f"{OUTPUT_DIR}/qc/multiqc_report.html",
@@ -409,14 +463,14 @@ rule multiqc:
 rule cancer_cell_detection:
     """
     Detect cancer cells using dual-model approach.
-    
+
     This rule:
     1. Runs CytoTRACE2 for stemness/potency scoring
     2. Uses CytoTRACE2 threshold to define reference normal cells
     3. Runs inferCNV using normal cells as reference
     4. Calculates weighted agreement between models
     5. Classifies cells as Cancer/Normal based on agreement
-    
+
     Requires: GTF annotation file for chromosomal information
     """
     input:
@@ -444,7 +498,7 @@ rule cancer_cell_detection:
 rule dysregulation_summary:
     """
     Generate summary of dysregulation analysis.
-    
+
     Combines CytoTRACE2, inferCNV, and cancer classification results.
     """
     input:
@@ -457,23 +511,26 @@ rule dysregulation_summary:
     run:
         import pandas as pd
         import scanpy as sc
-        
+
         # Load data
         adata = sc.read_h5ad(input.adata)
         cancer_summary = pd.read_csv(input.cancer_summary, sep='\t')
-        
+
+        # Derive sample count from adata (not static SAMPLE_IDS)
+        n_samples = adata.obs['sample_id'].nunique() if 'sample_id' in adata.obs.columns else 0
+
         # Create comprehensive summary
         summary_data = {
             'total_cells': adata.n_obs,
             'total_genes': adata.n_vars,
-            'n_samples': len(SAMPLE_IDS),
+            'n_samples': n_samples,
         }
-        
+
         # Add cancer cell counts if available
         if 'Final_cancer_cell_status' in adata.obs.columns:
             summary_data['cancer_cells'] = (adata.obs['Final_cancer_cell_status'] == 'Cancer cell').sum()
             summary_data['normal_cells'] = (adata.obs['Final_cancer_cell_status'] == 'Normal cell').sum()
-        
+
         # Add scoring metrics if available
         if 'CytoTRACE2_Score' in adata.obs.columns:
             summary_data['mean_cytotrace_score'] = adata.obs['CytoTRACE2_Score'].mean()
@@ -481,19 +538,19 @@ rule dysregulation_summary:
             summary_data['mean_cnv_score'] = adata.obs['cnv_score'].mean()
         if 'agreement_score' in adata.obs.columns:
             summary_data['mean_agreement_score'] = adata.obs['agreement_score'].mean()
-        
+
         # Add thresholds from cancer_summary if available
         for col in ['cytotrace_threshold', 'agreement_threshold', 'spearman_correlation']:
             if col in cancer_summary.columns:
                 summary_data[col] = cancer_summary[col].iloc[0]
-        
+
         # Add cell type breakdown for cancer cells
         if 'final_annotation' in adata.obs.columns and 'Final_cancer_cell_status' in adata.obs.columns:
             cancer_mask = adata.obs['Final_cancer_cell_status'] == 'Cancer cell'
             cancer_by_type = adata.obs.loc[cancer_mask, 'final_annotation'].value_counts()
             for ct, count in cancer_by_type.items():
                 summary_data[f'cancer_cells_{ct}'] = count
-        
+
         pd.DataFrame([summary_data]).to_csv(output.summary, sep='\t', index=False)
 
 # =============================================================================
@@ -503,17 +560,23 @@ rule dysregulation_summary:
 rule kraken2_detect:
     """
     Detect viral/microbial sequences in unmapped reads using Kraken2.
-    
+
     This rule:
     1. Extracts unmapped reads from Cell Ranger BAM
     2. Runs Kraken2 classification
     3. Builds single-cell count matrix linking barcodes to organisms
-    
+
+    The validation input ensures the checkpoint has run, so the BAM
+    files on disk are verified. This rule is only triggered for validated
+    samples via the summarize_viral input function.
+
     Requires: Kraken2 database (see README for setup instructions)
     """
     input:
         bam=f"{OUTPUT_DIR}/cellranger/{{sample}}/outs/possorted_genome_bam.bam",
         bai=f"{OUTPUT_DIR}/cellranger/{{sample}}/outs/possorted_genome_bam.bam.bai",
+        # Gate: ensures checkpoint has run and BAMs are validated on disk
+        validation=f"{OUTPUT_DIR}/cellranger/validated_samples.txt",
     output:
         summary=f"{OUTPUT_DIR}/viral/{{sample}}/{{sample}}_organism_summary.tsv",
         matrix_dir=directory(f"{OUTPUT_DIR}/viral/{{sample}}/kraken2_filtered_feature_bc_matrix"),
@@ -534,21 +597,18 @@ rule kraken2_detect:
 
 rule summarize_viral:
     """
-    Summarize viral detection results across all samples.
-    
-    Creates aggregated reports and a combined AnnData object for
-    integration with cell annotations.
+    Summarize viral detection results across all validated samples.
+
+    Inputs are resolved dynamically via the checkpoint — only validated
+    samples are included in the summary.
     """
     input:
-        reports=expand(
-            f"{OUTPUT_DIR}/viral/{{sample}}/{{sample}}_organism_summary.tsv",
-            sample=SAMPLE_IDS
-        ),
+        reports=get_validated_viral_summaries,
     output:
         summary=f"{OUTPUT_DIR}/viral/viral_detection_summary.tsv",
         adata=f"{OUTPUT_DIR}/viral/viral_counts.h5ad",
     params:
-        sample_ids=SAMPLE_IDS,
+        sample_ids=lambda wildcards: get_validated_sample_ids(),
         organisms_of_interest=config.get("viral", {}).get("organisms_of_interest", []),
         viral_base_dir=f"{OUTPUT_DIR}/viral",
     log:
@@ -561,14 +621,14 @@ rule summarize_viral:
 rule viral_integration:
     """
     Integrate viral detection results with annotated expression data.
-    
+
     This rule:
     1. Merges viral counts with gene expression data
     2. Filters for human-specific viruses
     3. Calculates differential expression of viruses across cell types
     4. Creates visualizations
     5. Adds top virus to expression AnnData
-    
+
     Requires: Human viral database inspect.txt file
     """
     input:
@@ -581,7 +641,7 @@ rule viral_integration:
         summary=f"{OUTPUT_DIR}/viral_integration/viral_integration_summary.tsv",
         figures=directory(f"{OUTPUT_DIR}/viral_integration/figures"),
     params:
-        sample_ids=SAMPLE_IDS,
+        sample_ids=lambda wildcards: get_validated_sample_ids(),
         human_viral_db=HUMAN_VIRAL_DB,
         viral_base_dir=f"{OUTPUT_DIR}/viral",
     log:
@@ -599,7 +659,9 @@ rule viral_integration:
 rule scomatic_mutation_calling:
     """
     Run SComatic pipeline for somatic mutation detection.
-    
+
+    Uses checkpoint-based BAM list so only validated samples are processed.
+
     This comprehensive rule handles the complete SComatic workflow:
     1. Filters BAMs to annotated cells
     2. Splits BAMs by cell type
@@ -611,25 +673,10 @@ rule scomatic_mutation_calling:
     8. Computes callable sites per cell type and per cell
     9. Generates single-cell genotypes
     10. Filters and annotates with trinucleotide context
-    
-    Requires:
-    - SComatic installed and scripts accessible
-    - Reference genome FASTA
-    - RNA editing sites file
-    - Panel of Normals (PoN) file
-    - BED file for mappable regions
-    
-    Outputs:
-    - Filtered mutations with trinucleotide context
-    - Callable sites per cell
-    - Cell type annotations
     """
     input:
         adata=f"{OUTPUT_DIR}/dysregulation/adata_cancer_detected.h5ad",
-        bams=expand(
-            f"{OUTPUT_DIR}/cellranger/{{sample}}/outs/possorted_genome_bam.bam",
-            sample=SAMPLE_IDS
-        ),
+        bams=get_validated_bams,
     output:
         mutations=f"{OUTPUT_DIR}/mutations/all_samples.single_cell_genotype.filtered.tsv",
         callable_sites=f"{OUTPUT_DIR}/mutations/CombinedCallableSites/complete_callable_sites.tsv",
@@ -637,7 +684,7 @@ rule scomatic_mutation_calling:
         trinuc=f"{OUTPUT_DIR}/mutations/trinucleotide_background.tsv",
     params:
         output_dir=OUTPUT_DIR,
-        sample_ids=SAMPLE_IDS,
+        sample_ids=lambda wildcards: get_validated_sample_ids(),
         scomatic_scripts_dir=config.get("scomatic", {}).get("scripts_dir"),
         ref_genome=REFERENCE_FASTA,
         editing_sites=config.get("scomatic", {}).get("editing_sites"),
@@ -672,7 +719,7 @@ rule callable_sites_link:
 rule signature_analysis:
     """
     Run semi-supervised COSMIC signature analysis.
-    
+
     This rule performs complete signature analysis:
     1. Converts mutations to 96-trinucleotide context matrix
     2. Extracts relevant COSMIC signatures (all or HNSCC-specific)
@@ -681,7 +728,7 @@ rule signature_analysis:
     5. Evaluates reconstruction quality (Frobenius norm, correlations)
     6. Adds signature weights to AnnData
     7. Generates comprehensive visualizations (UMAPs, heatmaps, etc.)
-    
+
     Requires:
     - COSMIC signature database (v3.4 recommended)
     - Filtered mutations from SComatic
@@ -728,12 +775,13 @@ rule copy_final_adata:
 rule master_summary:
     """
     Generate master summary YAML combining all pipeline results.
-    
+
     Aggregates metrics from all pipeline steps into a single summary file.
     """
     input:
         qc=f"{OUTPUT_DIR}/qc/qc_metrics.tsv",
         annotation=f"{OUTPUT_DIR}/annotation/annotation_summary.tsv",
+        validation=f"{OUTPUT_DIR}/cellranger/validation_summary.json",
         dysregulation=f"{OUTPUT_DIR}/dysregulation/dysregulation_summary.tsv" if DYSREGULATION_ENABLED else [],
         viral=f"{OUTPUT_DIR}/viral/viral_detection_summary.tsv" if VIRAL_DETECTION_ENABLED else [],
         mutations=f"{OUTPUT_DIR}/mutations/all_samples.single_cell_genotype.filtered.tsv" if SCOMATIC_ENABLED else [],
@@ -742,7 +790,7 @@ rule master_summary:
         summary=f"{OUTPUT_DIR}/master_summary.yaml",
     params:
         config=config,
-        sample_ids=SAMPLE_IDS,
+        sample_ids=lambda wildcards: get_validated_sample_ids(),
         output_dir=OUTPUT_DIR,
     log:
         f"{LOG_DIR}/master_summary.log"
@@ -767,9 +815,19 @@ onsuccess:
     print("ClusterCatcher pipeline completed successfully!")
     print("="*70)
     print(f"\nResults directory: {OUTPUT_DIR}")
-    print(f"Samples processed: {len(SAMPLE_IDS)}")
+    print(f"Initial samples: {len(SAMPLE_IDS)}")
+    # Read validated count if available
+    validated_file = os.path.join(OUTPUT_DIR, "cellranger", "validated_samples.txt")
+    if os.path.exists(validated_file):
+        with open(validated_file) as f:
+            n_validated = sum(1 for line in f if line.strip())
+        print(f"Validated samples: {n_validated}")
+        if n_validated < len(SAMPLE_IDS):
+            print(f"Excluded samples: {len(SAMPLE_IDS) - n_validated}")
+            print(f"  See: {OUTPUT_DIR}/cellranger/validation_summary.json")
     print(f"\nFinal outputs:")
     print(f"  - Master summary: {OUTPUT_DIR}/master_summary.yaml")
+    print(f"  - Validation report: {OUTPUT_DIR}/cellranger/validation_summary.json")
     if SIGNATURES_ENABLED:
         print(f"  - Final AnnData: {OUTPUT_DIR}/adata_final.h5ad")
     elif DYSREGULATION_ENABLED:
@@ -783,6 +841,10 @@ onerror:
     print("ClusterCatcher pipeline failed!")
     print("="*70)
     print(f"\nCheck logs in: {LOG_DIR}")
+    # Show validation info if available
+    validation_file = os.path.join(OUTPUT_DIR, "cellranger", "validation_summary.json")
+    if os.path.exists(validation_file):
+        print(f"Cell Ranger validation report: {validation_file}")
     print("\nTo resume from failed step, run the same command again.")
     print("To unlock if needed: snakemake --unlock")
     print("="*70 + "\n")
