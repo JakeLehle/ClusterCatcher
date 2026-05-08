@@ -154,15 +154,26 @@ def is_outlier(adata, metric, nmads):
 # Data Loading Functions
 # =============================================================================
 
+# Minimum file size thresholds for safety-net validation.
+# The checkpoint already filters samples, but these catch edge cases
+# (e.g., disk corruption, race conditions, re-runs with stale files).
+_MIN_H5_BYTES = 1000    # Empty H5 headers are a few hundred bytes
+_MIN_BARCODES_BYTES = 100  # Empty gzipped barcodes.tsv.gz is ~33 bytes
+
 def load_cellranger_outputs(cellranger_base_dir, sample_ids, samples_metadata=None):
-    """Load Cell Ranger count matrices from multiple samples.
+    """
+    Load Cell Ranger count matrices from multiple samples.
+    
+    Includes resilient loading as a safety net behind the checkpoint
+    validation. Samples that fail to load (empty files, corrupt H5,
+    missing data) are skipped with a warning instead of crashing.
     
     Parameters
     ----------
     cellranger_base_dir : str
         Base directory containing Cell Ranger outputs
     sample_ids : list
-        List of sample identifiers
+        List of sample identifiers (from checkpoint's validated list)
     samples_metadata : dict, optional
         Per-sample metadata from SRAscraper pickle or sample-information command.
         Structure: {sample_id: dict_with_metadata_columns}
@@ -171,19 +182,51 @@ def load_cellranger_outputs(cellranger_base_dir, sample_ids, samples_metadata=No
     logger.info(f"Loading {len(sample_ids)} samples from {cellranger_base_dir}...")
     
     adatas = []
+    skipped_samples = []
+    
     for sample_id in sample_ids:
         cr_dir = os.path.join(cellranger_base_dir, sample_id)
         matrix_h5 = os.path.join(cr_dir, 'outs', 'filtered_feature_bc_matrix.h5')
         matrix_dir = os.path.join(cr_dir, 'outs', 'filtered_feature_bc_matrix')
         
-        if os.path.exists(matrix_h5):
-            logger.info(f"  Loading {sample_id} from H5 file...")
-            adata = sc.read_10x_h5(matrix_h5)
-        elif os.path.exists(matrix_dir):
-            logger.info(f"  Loading {sample_id} from matrix directory...")
-            adata = sc.read_10x_mtx(matrix_dir)
-        else:
-            logger.warning(f"  Could not find matrix for {sample_id}, skipping...")
+        try:
+            # --- Safety-net file size checks ---
+            # The checkpoint should have already filtered these, but check
+            # again in case of re-runs, stale files, or disk issues.
+            if os.path.exists(matrix_h5) and os.path.getsize(matrix_h5) <= _MIN_H5_BYTES:
+                logger.warning(f"  {sample_id}: H5 file too small "
+                             f"({os.path.getsize(matrix_h5)} bytes), skipping...")
+                skipped_samples.append((sample_id, "H5 file below size threshold"))
+                continue
+            
+            barcodes_path = os.path.join(matrix_dir, 'barcodes.tsv.gz')
+            if os.path.exists(barcodes_path) and os.path.getsize(barcodes_path) <= _MIN_BARCODES_BYTES:
+                logger.warning(f"  {sample_id}: barcodes.tsv.gz too small "
+                             f"({os.path.getsize(barcodes_path)} bytes), skipping...")
+                skipped_samples.append((sample_id, "barcodes.tsv.gz below size threshold"))
+                continue
+            
+            # --- Load matrix ---
+            if os.path.exists(matrix_h5):
+                logger.info(f"  Loading {sample_id} from H5 file...")
+                adata = sc.read_10x_h5(matrix_h5)
+            elif os.path.exists(matrix_dir):
+                logger.info(f"  Loading {sample_id} from matrix directory...")
+                adata = sc.read_10x_mtx(matrix_dir)
+            else:
+                logger.warning(f"  Could not find matrix for {sample_id}, skipping...")
+                skipped_samples.append((sample_id, "no matrix file found"))
+                continue
+            
+            # --- Verify we got actual cells ---
+            if adata.n_obs == 0:
+                logger.warning(f"  {sample_id}: 0 cells in matrix, skipping...")
+                skipped_samples.append((sample_id, "0 cells in matrix"))
+                continue
+            
+        except Exception as e:
+            logger.warning(f"  Failed to load {sample_id}: {e} — skipping...")
+            skipped_samples.append((sample_id, str(e)))
             continue
         
         adata.var_names_make_unique()
@@ -202,10 +245,18 @@ def load_cellranger_outputs(cellranger_base_dir, sample_ids, samples_metadata=No
         logger.info(f"    {sample_id}: {adata.n_obs} cells, {adata.n_vars} genes")
         adatas.append(adata)
     
+    # --- Report skipped samples ---
+    if skipped_samples:
+        logger.warning(f"Skipped {len(skipped_samples)}/{len(sample_ids)} samples:")
+        for sid, reason in skipped_samples:
+            logger.warning(f"  {sid}: {reason}")
+    
     if len(adatas) == 0:
         raise ValueError("No samples were loaded successfully!")
     
+    logger.info(f"Successfully loaded {len(adatas)}/{len(sample_ids)} samples")
     logger.info("Concatenating samples...")
+    
     if len(adatas) == 1:
         adata = adatas[0]
     else:
@@ -424,8 +475,6 @@ def filter_cells_and_genes(adata, qc_params):
         )
         
         # Mitochondrial outliers: MAD-based OR hard cap
-        # This follows the approach: cells are outliers if they're statistical outliers
-        # OR if they exceed a hard biological threshold
         adata.obs["mt_outlier"] = (
             is_outlier(adata, "pct_counts_mt", mad_mito) 
             | (adata.obs["pct_counts_mt"] > max_mito_pct)

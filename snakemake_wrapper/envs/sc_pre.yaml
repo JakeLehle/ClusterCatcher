@@ -28,6 +28,7 @@ dependencies:
   - celltypist
   - cellxgene-census
   - scvi-tools=1.4.0.post1
+  - pyarrow
   
   # CNV analysis
   - gffutils

@@ -74,6 +74,7 @@ dependencies:
   - scikit-learn>=1.0
   - statsmodels
   - scvi-tools=1.4.0.post1
+  - pyarrow
 
   # ===========================================
   # Kraken2 for Viral Detection
