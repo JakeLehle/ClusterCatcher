@@ -635,6 +635,7 @@ rule viral_integration:
         adata_pp=f"{OUTPUT_DIR}/dysregulation/adata_cancer_detected.h5ad",
         viral_summary=f"{OUTPUT_DIR}/viral/viral_detection_summary.tsv",
         viral_adata=f"{OUTPUT_DIR}/viral/viral_counts.h5ad",
+        validation=f"{OUTPUT_DIR}/cellranger/validated_samples.txt",
     output:
         adata=f"{OUTPUT_DIR}/viral_integration/adata_with_virus.h5ad",
         integrated=f"{OUTPUT_DIR}/viral_integration/adata_viral_integrated.h5ad",
@@ -782,6 +783,7 @@ rule master_summary:
         qc=f"{OUTPUT_DIR}/qc/qc_metrics.tsv",
         annotation=f"{OUTPUT_DIR}/annotation/annotation_summary.tsv",
         validation=f"{OUTPUT_DIR}/cellranger/validation_summary.json",
+        validated_samples=f"{OUTPUT_DIR}/cellranger/validated_samples.txt",
         dysregulation=f"{OUTPUT_DIR}/dysregulation/dysregulation_summary.tsv" if DYSREGULATION_ENABLED else [],
         viral=f"{OUTPUT_DIR}/viral/viral_detection_summary.tsv" if VIRAL_DETECTION_ENABLED else [],
         mutations=f"{OUTPUT_DIR}/mutations/all_samples.single_cell_genotype.filtered.tsv" if SCOMATIC_ENABLED else [],
