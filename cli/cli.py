@@ -28,7 +28,7 @@ from cli.create_config import create_config_cmd
 
 
 @click.group()
-@click.version_option(version='1.1.5', prog_name='ClusterCatcher')
+@click.version_option(version='1.4.1', prog_name='ClusterCatcher')
 def main():
     """
     ClusterCatcher: Single-cell sequencing analysis pipeline

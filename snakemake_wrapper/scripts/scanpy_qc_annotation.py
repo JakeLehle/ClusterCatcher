@@ -633,7 +633,26 @@ def run_popv_annotation(adata, annotation_params):
         gene_symbols=gene_symbol_key
     )
     
-    # Filter to query cells only
+    # =========================================================================
+    # FIX: Restore var_names after popV annotation.
+    #
+    # popV's annotate_data() re-indexes ALL var_names to Ensembl IDs to match
+    # its internal reference gene space. The original gene names (Cell Ranger
+    # symbols) are preserved in the 'feature_name' column. Downstream tools
+    # like CytoTRACE2 require gene symbols (e.g. TP53, GAPDH) not Ensembl
+    # IDs, so we restore from feature_name after annotation completes.
+    # =========================================================================
+    if 'feature_name' in adata.var.columns:
+        n_ensembl_before = adata.var_names.to_series().str.startswith('ENSG').sum()
+        n_ensembl_feature = adata.var['feature_name'].astype(str).str.startswith('ENSG').sum()
+        if n_ensembl_before > n_ensembl_feature:
+            logger.info(f"  Restoring var_names from feature_name "
+                        f"({n_ensembl_before} Ensembl -> {n_ensembl_feature} Ensembl + "
+                        f"{adata.n_vars - n_ensembl_feature} symbols)")
+            adata.var.index = adata.var['feature_name'].astype(str).values
+            adata.var_names_make_unique()
+    
+    # Filter to query cells only    
     if '_dataset' in adata_annotated.obs.columns:
         logger.info("  Filtering to query cells only...")
         adata_annotated = adata_annotated[adata_annotated.obs["_dataset"] == "query"].copy()
