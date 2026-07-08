@@ -162,7 +162,31 @@ def update_sample_pickle(sample_info_path, validated_ids, failed_details):
     if not sample_info_path or not os.path.exists(sample_info_path):
         logger.warning("No sample_info pickle path provided — skipping pickle update")
         return
-    
+
+    # Load original to inspect its keying before touching anything on disk.
+    with open(sample_info_path, 'rb') as f:
+        raw_dict = pickle.load(f)
+
+    # In multi (patient-level) mode the validated IDs are multi_ids (e.g. P18),
+    # not SRR run accessions, so filtering the SRAscraper pickle by run_accession
+    # would match nothing for every group and clobber the pickle with an empty
+    # dict. Detect that keying mismatch and skip the update cleanly — the library
+    # sheet governs multi-mode sample identity and validated_samples.txt is the
+    # downstream gate, so the pickle is not consulted after the checkpoint.
+    pickle_ids = set()
+    for key, value in raw_dict.items():
+        if hasattr(value, 'empty') and not value.empty and 'run_accession' in getattr(value, 'columns', []):
+            pickle_ids.update(value['run_accession'].astype(str).tolist())
+        elif isinstance(value, dict):
+            pickle_ids.add(str(value.get('run_accession', key)))
+        pickle_ids.add(str(key))
+
+    if not ({str(v) for v in validated_ids} & pickle_ids):
+        logger.info("Validated IDs are not run-accession keys in the sample pickle "
+                    "(multi / patient-level mode); skipping pickle filtering to avoid "
+                    "overwriting it. validated_samples.txt is the downstream gate.")
+        return
+
     # Back up original (only if backup doesn't already exist)
     backup_path = sample_info_path.replace('.pkl', '_original.pkl')
     if not os.path.exists(backup_path):
@@ -204,7 +228,14 @@ def update_sample_pickle(sample_info_path, validated_ids, failed_details):
                 removed_count += 1
         else:
             filtered_dict[key] = value
-    
+
+    # Safety guard: never overwrite the pickle with an empty dict. If filtering
+    # collapsed everything (keying mismatch or all-failed), keep the original.
+    if not filtered_dict:
+        logger.warning("Filtered pickle would be empty; keeping the original pickle "
+                       "unchanged (backup preserved).")
+        return
+
     # Write filtered pickle (overwrites current, backup is safe)
     with open(sample_info_path, 'wb') as f:
         pickle.dump(filtered_dict, f)

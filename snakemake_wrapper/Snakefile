@@ -177,6 +177,43 @@ if not FASTQ_BASE_DIR and SAMPLE_INFO_PATH:
         print(f"  Checked: {potential_fastq_dir}")
         print(f"  Please set 'fastq_base_dir' in your config.yaml")
 
+# =============================================================================
+# Cell Ranger mode: count (GEX only) vs multi (paired GEX + VDJ)
+# =============================================================================
+CELLRANGER_MODE = config.get("cellranger", {}).get("mode", "count")
+VDJ_REFERENCE = config.get("reference", {}).get("vdj")
+LIBRARY_SHEET = config.get("multi", {}).get("library_sheet")
+
+# In multi mode the library sheet (from `ClusterCatcher inspect`) is the
+# authoritative sample source: each multi_id (patient) groups one or more
+# libraries (Gene Expression + VDJ-T/VDJ-B) that cellranger_align.py turns
+# into a per-patient `cellranger multi` config.
+MULTI_LIBRARIES = {}
+if CELLRANGER_MODE == "multi":
+    if not LIBRARY_SHEET or not os.path.exists(LIBRARY_SHEET):
+        raise ValueError(
+            f"cellranger.mode is 'multi' but multi.library_sheet is missing/not found: {LIBRARY_SHEET}"
+        )
+    if not VDJ_REFERENCE:
+        raise ValueError("cellranger.mode is 'multi' but reference.vdj (V(D)J reference) is not set")
+
+    _sheet = pd.read_csv(LIBRARY_SHEET)
+    _required = {"multi_id", "fastq_id", "feature_type", "fastqs"}
+    _missing = _required - set(_sheet.columns)
+    if _missing:
+        raise ValueError(f"Library sheet missing required columns: {sorted(_missing)}")
+
+    for _mid, _grp in _sheet.groupby("multi_id"):
+        MULTI_LIBRARIES[str(_mid)] = _grp.to_dict("records")
+
+    # Patients (multi_id) are the unit of work in multi mode
+    SAMPLE_IDS = sorted(MULTI_LIBRARIES.keys())
+    print(f"Cell Ranger mode: multi | {len(_sheet)} libraries -> {len(SAMPLE_IDS)} multi groups")
+    for _mid in SAMPLE_IDS:
+        print(f"  {_mid}: {', '.join(r['feature_type'] for r in MULTI_LIBRARIES[_mid])}")
+else:
+    print(f"Cell Ranger mode: count | {len(SAMPLE_IDS)} samples")
+
 # Database paths
 KRAKEN2_DB = config.get("viral", {}).get("kraken_db")
 HUMAN_VIRAL_DB = config.get("viral", {}).get("viral_db")
@@ -323,13 +360,14 @@ rule all:
 # Cell Ranger Rules
 # =============================================================================
 
-rule cellranger_count:
+rule cellranger_align:
     """
-    Run Cell Ranger count for a single sample.
+    Run Cell Ranger for a single sample (count mode) or patient (multi mode).
 
-    This rule aligns FASTQ files to the reference transcriptome and generates
-    gene expression matrices. Uses automatic chemistry detection with fallback
-    options if the specified chemistry fails.
+    count mode: `cellranger count` on one SRR (GEX only), as before.
+    multi mode: `cellranger multi` on one patient (multi_id), pairing its
+    Gene Expression and VDJ-T/VDJ-B libraries from the library sheet, then
+    symlinking the per-sample outputs onto the standard filenames.
 
     The ONLY declared output is a status JSON file. Cell Ranger outputs
     (H5, BAM, web_summary) are side effects on disk — the downstream
@@ -341,7 +379,10 @@ rule cellranger_count:
         status=f"{OUTPUT_DIR}/cellranger/{{sample}}/cellranger_status.json",
     params:
         sample_id="{sample}",
+        mode=CELLRANGER_MODE,
         transcriptome=TRANSCRIPTOME_REF,
+        vdj_reference=VDJ_REFERENCE,
+        multi_libraries=lambda wildcards: MULTI_LIBRARIES.get(wildcards.sample, []),
         chemistry=config.get("cellranger", {}).get("chemistry", "auto"),
         expect_cells=config.get("cellranger", {}).get("expect_cells"),
         include_introns=config.get("cellranger", {}).get("include_introns", True),
@@ -357,7 +398,7 @@ rule cellranger_count:
     conda:
         "envs/sc_pre.yaml"
     script:
-        "scripts/cellranger_count.py"
+        "scripts/cellranger_align.py"
 
 # =============================================================================
 # Cell Ranger Validation Checkpoint
