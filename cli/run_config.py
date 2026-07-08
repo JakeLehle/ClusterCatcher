@@ -107,7 +107,18 @@ def validate_config_file(config_path):
     elif config['reference']:
         if not config['reference'].get('cellranger'):
             errors.append("Missing reference.cellranger (Cell Ranger reference path)")
-    
+
+    # Check cellranger multi mode requirements
+    cellranger = config.get('cellranger', {}) or {}
+    if cellranger.get('mode', 'count') == 'multi':
+        if not (config.get('reference', {}) or {}).get('vdj'):
+            errors.append("cellranger.mode is 'multi' but reference.vdj (V(D)J reference) is missing")
+        lib = (config.get('multi', {}) or {}).get('library_sheet')
+        if not lib:
+            errors.append("cellranger.mode is 'multi' but multi.library_sheet is missing")
+        elif not os.path.exists(lib):
+            errors.append(f"multi.library_sheet not found: {lib}")
+
     # Check annotation config (popV)
     if 'annotation' in config and config['annotation']:
         annotation = config['annotation']
@@ -362,7 +373,14 @@ def run_config(config_yaml, cores, jobs, dryrun, unlock, rerun_incomplete,
     
     click.echo(f"Samples: {n_samples}")
     click.echo(f"Output directory: {config.get('output_dir', 'N/A')}")
-    
+
+    # Show Cell Ranger mode (multi vs count)
+    cr_mode = (config.get('cellranger', {}) or {}).get('mode', 'count')
+    click.echo(f"Cell Ranger mode: {cr_mode}")
+    if cr_mode == 'multi':
+        click.echo(f"  V(D)J reference: {(config.get('reference', {}) or {}).get('vdj', 'N/A')}")
+        click.echo(f"  Library sheet: {(config.get('multi', {}) or {}).get('library_sheet', 'N/A')}")
+
     # Show enabled modules
     modules = config.get('modules', {})
     enabled = [k for k, v in modules.items() if v]
@@ -484,7 +502,7 @@ def run_config(config_yaml, cores, jobs, dryrun, unlock, rerun_incomplete,
                 full_path = os.path.join(output_dir, fpath)
                 if os.path.exists(full_path):
                     click.echo(f"  ✓ {fpath} - {desc}")
-                    
+
         else:
             click.echo(f"\n{'='*60}")
             click.echo(f"Pipeline failed with exit code: {result.returncode}")

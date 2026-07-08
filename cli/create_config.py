@@ -93,22 +93,60 @@ def create_config(args):
     output_dir = validate_path(args.output_dir, "Output directory",
                                must_exist=False, create_dir=True)
 
+    # Cell Ranger mode (count = GEX only; multi = paired GEX + VDJ)
+    mode = getattr(args, 'cellranger_mode', 'count')
+    print(f"\n  Cell Ranger mode: {mode}")
+
     # Sample information
     sample_info_path = None
     sample_ids = []
+    library_sheet_path = None
+    vdj_reference = None
 
-    if args.sample_pickle:
-        sample_info_path = validate_path(args.sample_pickle, "Sample pickle file")
-        import pickle
-        with open(sample_info_path, 'rb') as f:
-            sample_dict = pickle.load(f)
-        sample_ids = list(sample_dict.keys())
-        print(f"  Loaded {len(sample_ids)} samples from pickle")
-    elif args.sample_ids:
-        sample_ids = args.sample_ids
-        print(f"  Using {len(sample_ids)} sample IDs from command line")
+    if mode == 'multi':
+        # In multi mode the library sheet (from `ClusterCatcher inspect`) is the
+        # sample source: one row per library, grouped into patients by multi_id.
+        import pandas as pd
+        library_sheet_path = validate_path(args.library_sheet,
+                                           "Library sheet (from `ClusterCatcher inspect`)")
+        vdj_reference = validate_path(args.vdj_reference, "V(D)J reference directory")
+        sheet = pd.read_csv(library_sheet_path)
+        required_cols = {'multi_id', 'fastq_id', 'feature_type', 'fastqs'}
+        missing = required_cols - set(sheet.columns)
+        if missing:
+            raise ValueError(
+                f"Library sheet missing required columns {sorted(missing)}. "
+                f"Regenerate it with `ClusterCatcher inspect`."
+            )
+        sample_ids = sorted(sheet['multi_id'].astype(str).unique())
+        print(f"  Loaded library sheet: {len(sheet)} libraries -> {len(sample_ids)} multi groups")
+        # Optional metadata pickle (NOT the sample source in multi mode)
+        if args.sample_pickle:
+            sample_info_path = validate_path(args.sample_pickle, "Sample pickle file (metadata)")
+        # Lightweight composition sanity (inspect already vetted this; warn only)
+        for mid, sub in sheet.groupby('multi_id'):
+            fts = set(sub['feature_type'])
+            if 'Gene Expression' not in fts:
+                print(f"  WARNING: multi group '{mid}' has no Gene Expression library (VDJ orphan)")
+            if 'chemistry' in sub.columns and (fts & {'VDJ-T', 'VDJ-B'}):
+                chem = {str(c) for c in sub['chemistry']}
+                if not (chem & {'5p', 'auto'}):
+                    print(f"  WARNING: multi group '{mid}' pairs VDJ with non-5' chemistry {chem}")
     else:
-        raise ValueError("Must provide either --sample-pickle or --sample-ids")
+        if args.vdj_reference:
+            vdj_reference = validate_path(args.vdj_reference, "V(D)J reference directory")
+        if args.sample_pickle:
+            sample_info_path = validate_path(args.sample_pickle, "Sample pickle file")
+            import pickle
+            with open(sample_info_path, 'rb') as f:
+                sample_dict = pickle.load(f)
+            sample_ids = list(sample_dict.keys())
+            print(f"  Loaded {len(sample_ids)} samples from pickle")
+        elif args.sample_ids:
+            sample_ids = args.sample_ids
+            print(f"  Using {len(sample_ids)} sample IDs from command line")
+        else:
+            raise ValueError("Must provide either --sample-pickle or --sample-ids (count mode)")
 
     # Cell Ranger reference (REQUIRED)
     cellranger_ref = validate_path(args.cellranger_reference, "Cell Ranger reference")
@@ -255,16 +293,23 @@ def create_config(args):
             'fasta': reference_fasta,
             'gtf': gtf_file,
             'genome': args.genome,
+            'vdj': vdj_reference,
         },
 
         # Cell Ranger settings
         'cellranger': {
+            'mode': mode,
             'chemistry': args.chemistry,
             'expect_cells': args.expect_cells,
             'include_introns': args.include_introns,
             'localcores': args.threads,
             'localmem': args.memory_gb,
             'create_bam': True,
+        },
+
+        # cellranger multi settings (used when cellranger.mode == 'multi')
+        'multi': {
+            'library_sheet': library_sheet_path,
         },
 
         # QC settings (all parameters exposed)
@@ -418,6 +463,11 @@ def create_config(args):
     print(f"  Cell Ranger: {cellranger_ref}")
     print(f"  FASTA: {reference_fasta or 'Not found'}")
     print(f"  GTF: {gtf_file or 'Not found'}")
+    print(f"\nCell Ranger mode: {mode}")
+    if mode == 'multi':
+        print(f"  V(D)J reference: {vdj_reference}")
+        print(f"  Library sheet: {library_sheet_path}")
+        print(f"  Multi groups: {len(sample_ids)}")
     print(f"\nQC Mode: {args.qc_mode}")
     if args.qc_mode == 'adaptive':
         print(f"  Using MAD-based outlier detection (recommended)")
@@ -483,6 +533,12 @@ Examples:
     cellranger.add_argument('--include-introns', action='store_true', help='Include introns')
     cellranger.add_argument('--fastq-base-dir',
                             help='Base directory containing FASTQ files.')
+    cellranger.add_argument('--cellranger-mode', default='count', choices=['count', 'multi'],
+                            help='Cell Ranger mode: count (GEX only, default) or multi (paired GEX + VDJ)')
+    cellranger.add_argument('--vdj-reference',
+                            help='10x V(D)J reference directory (required for --cellranger-mode multi)')
+    cellranger.add_argument('--library-sheet',
+                            help='Library sheet CSV from `ClusterCatcher inspect` (required for --cellranger-mode multi)')
 
     # QC settings
     qc = parser.add_argument_group('QC Settings')
@@ -642,6 +698,12 @@ from types import SimpleNamespace
 @click.option('--include-introns', is_flag=True, default=False, help='Include intronic reads')
 @click.option('--fastq-base-dir', default=None,
               help='Base directory for FASTQ files; auto-derived from --sample-pickle if omitted')
+@click.option('--cellranger-mode', default='count', type=click.Choice(['count', 'multi']),
+              help='Cell Ranger mode: count (GEX only, default) or multi (paired GEX + VDJ)')
+@click.option('--vdj-reference', default=None,
+              help='10x V(D)J reference directory (required for --cellranger-mode multi)')
+@click.option('--library-sheet', default=None,
+              help='Library sheet CSV from `ClusterCatcher inspect` (required for --cellranger-mode multi)')
 # ---- QC ----
 @click.option('--qc-mode', default='adaptive', type=click.Choice(['adaptive', 'fixed']),
               help='QC filtering mode: adaptive (MAD-based, default) or fixed (threshold-based)')
@@ -719,6 +781,7 @@ def create_config_cmd(
     output_dir, cellranger_reference, reference_fasta, gtf_file, genome,
     sample_pickle, sample_ids, threads, memory_gb,
     chemistry, expect_cells, include_introns, fastq_base_dir,
+    cellranger_mode, vdj_reference, library_sheet,
     qc_mode, min_genes, max_mito_pct, min_cells, doublet_removal, doublet_rate,
     mad_n_counts, mad_n_genes, mad_top_genes, mad_mito,
     max_genes, min_counts, max_counts,
@@ -777,6 +840,9 @@ def create_config_cmd(
         expect_cells=expect_cells,
         include_introns=include_introns,
         fastq_base_dir=fastq_base_dir,
+        cellranger_mode=cellranger_mode,
+        vdj_reference=vdj_reference,
+        library_sheet=library_sheet,
         qc_mode=qc_mode,
         min_genes=min_genes,
         max_mito_pct=max_mito_pct,

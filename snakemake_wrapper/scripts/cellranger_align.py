@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-cellranger_count.py
+cellranger_align.py
 ===================
 
-Run Cell Ranger count on single-cell FASTQ files with automatic chemistry detection.
+Run Cell Ranger for single-cell FASTQ files, in one of two modes:
+  - count: `cellranger count` per SRR (GEX only) with chemistry auto-detection.
+  - multi: `cellranger multi` per patient (multi_id), pairing Gene Expression
+    with VDJ-T/VDJ-B libraries from a `ClusterCatcher inspect` library sheet,
+    then symlinking the per-sample outputs onto the standard flat filenames so
+    the validation checkpoint and every downstream rule see the same paths.
+
+Mode is chosen by snakemake.params.mode (from config cellranger.mode).
 
 This script is designed to work with SRAscraper output structure where:
 - Pickle file contains: {GSE_ID: DataFrame with run_accession column}
@@ -33,6 +40,7 @@ Requirements:
 """
 
 import os
+import glob
 import sys
 import json
 import yaml
@@ -576,6 +584,264 @@ def run_cellranger_for_gse(
 
 
 # =============================================================================
+# Cell Ranger multi (paired GEX + VDJ) Execution Functions
+# =============================================================================
+
+def _cr_chemistry_token(value):
+    """Map a library-sheet chemistry value to a Cell Ranger chemistry token.
+
+    Returns None to let `cellranger multi` auto-detect (used for 'auto').
+    A value already in Cell Ranger form (e.g. 'SC5P-R2') is passed through.
+    """
+    v = str(value).strip()
+    if v.lower().startswith('sc'):
+        return v
+    return {'5p': 'SC5P-R2', '3p': 'SC3Pv3', 'auto': None}.get(v.lower(), None)
+
+
+def _relink(src, dst):
+    """Create/replace a symlink dst -> src, handling a pre-existing file/link/dir."""
+    if os.path.islink(dst) or os.path.isfile(dst):
+        os.unlink(dst)
+    elif os.path.isdir(dst):
+        shutil.rmtree(dst)
+    os.symlink(src, dst)
+
+
+def _find_one(patterns):
+    """Return the first existing path among literal paths / globs, else None."""
+    for p in patterns:
+        if any(ch in p for ch in '*?['):
+            hits = sorted(glob.glob(p))
+            if hits:
+                return hits[0]
+        elif os.path.exists(p):
+            return p
+    return None
+
+
+def _tree(root, max_entries=200):
+    """Compact recursive listing, for surfacing layout in error messages."""
+    out = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        for name in sorted(dirnames) + sorted(filenames):
+            out.append(os.path.relpath(os.path.join(dirpath, name), root))
+            if len(out) >= max_entries:
+                out.append('... (truncated)')
+                return '\n'.join(out)
+    return '\n'.join(out)
+
+
+def write_multi_config(config_path, multi_id, libraries, gex_ref, vdj_ref,
+                       create_bam=True, include_introns=True):
+    """Write a per-patient `cellranger multi` config CSV from library-sheet rows.
+
+    libraries: list of dicts with keys multi_id, fastq_id, feature_type, fastqs,
+               and optionally chemistry (as produced by `ClusterCatcher inspect`).
+    """
+    gex_rows = [r for r in libraries if str(r.get('feature_type')) == 'Gene Expression']
+    vdj_rows = [r for r in libraries if str(r.get('feature_type')).startswith('VDJ')]
+
+    if not gex_rows:
+        raise ValueError(f"multi group '{multi_id}' has no Gene Expression library")
+
+    lines = ['[gene-expression]',
+             f'reference,{gex_ref}',
+             f'create-bam,{"true" if create_bam else "false"}']
+    if include_introns:
+        lines.append('include-introns,true')
+    # Chemistry from the GEX row; omit the line to let Cell Ranger auto-detect.
+    chem = _cr_chemistry_token(gex_rows[0].get('chemistry', 'auto'))
+    if chem:
+        lines.append(f'chemistry,{chem}')
+    lines.append('')
+
+    if vdj_rows:
+        if not vdj_ref:
+            raise ValueError(f"multi group '{multi_id}' has VDJ libraries but no V(D)J reference")
+        lines += ['[vdj]', f'reference,{vdj_ref}', '']
+
+    lines += ['[libraries]', 'fastq_id,fastqs,feature_types']
+    for r in libraries:
+        lines.append(f"{r['fastq_id']},{r['fastqs']},{r['feature_type']}")
+    lines.append('')
+
+    os.makedirs(os.path.dirname(config_path), exist_ok=True)
+    with open(config_path, 'w') as f:
+        f.write('\n'.join(lines))
+    logger.info(f"Wrote multi config: {config_path}")
+    return config_path
+
+
+def link_multi_outputs(real_run_dir, expected_outs_dir):
+    """Symlink `cellranger multi` per-sample outputs onto the standard flat
+    filenames that the checkpoint and downstream rules expect.
+
+    Paths are DISCOVERED by globbing rather than hardcoded, so this is robust
+    to the per_sample_outs sample-directory name and to CR 9 / 10 layout
+    differences. Raises FileNotFoundError with a directory tree if the expected
+    matrix/BAM cannot be located, making a version mismatch a one-line fix.
+
+    Returns a dict of the standard paths created (for the status JSON).
+    """
+    outs = os.path.join(real_run_dir, 'outs')
+    per_sample = os.path.join(outs, 'per_sample_outs')
+    sample_dirs = sorted(d for d in glob.glob(os.path.join(per_sample, '*')) if os.path.isdir(d))
+    if not sample_dirs:
+        raise FileNotFoundError(
+            f"No per_sample_outs directories under {per_sample}. outs tree:\n" + _tree(outs)
+        )
+    sdir = sample_dirs[0]                      # non-multiplexed multi -> single per-sample dir
+    count_dir = os.path.join(sdir, 'count')
+
+    h5 = _find_one([
+        os.path.join(count_dir, 'sample_filtered_feature_bc_matrix.h5'),
+        os.path.join(count_dir, '*filtered_feature_bc_matrix.h5'),
+    ])
+    mtx_dir = _find_one([
+        os.path.join(count_dir, 'sample_filtered_feature_bc_matrix'),
+        os.path.join(count_dir, '*filtered_feature_bc_matrix'),
+    ])
+    bam = _find_one([
+        os.path.join(count_dir, 'sample_alignments.bam'),
+        os.path.join(count_dir, '*.bam'),
+    ])
+    web = _find_one([os.path.join(sdir, 'web_summary.html')])
+    metrics = _find_one([os.path.join(sdir, 'metrics_summary.csv')])
+    vdj_t = _find_one([os.path.join(sdir, 'vdj_t')])
+
+    if not h5 or not mtx_dir:
+        raise FileNotFoundError(
+            f"Could not locate filtered matrix under {count_dir}. outs tree:\n" + _tree(outs)
+        )
+
+    os.makedirs(expected_outs_dir, exist_ok=True)
+    created = {}
+
+    # GEX matrix (both the .h5 and the MTX directory; the checkpoint stats
+    # barcodes.tsv.gz inside the directory).
+    std_h5 = os.path.join(expected_outs_dir, 'filtered_feature_bc_matrix.h5')
+    _relink(h5, std_h5); created['matrix_h5'] = std_h5
+    std_mtx = os.path.join(expected_outs_dir, 'filtered_feature_bc_matrix')
+    _relink(mtx_dir, std_mtx); created['matrix_dir'] = std_mtx
+
+    # BAM + index (create-bam,true in the config). Index if CR didn't ship a .bai.
+    if bam:
+        std_bam = os.path.join(expected_outs_dir, 'possorted_genome_bam.bam')
+        _relink(bam, std_bam); created['bam'] = std_bam
+        std_bai = std_bam + '.bai'
+        if os.path.exists(bam + '.bai'):
+            _relink(bam + '.bai', std_bai); created['bai'] = std_bai
+        else:
+            try:
+                subprocess.run(['samtools', 'index', std_bam], check=True)
+                created['bai'] = std_bai
+                logger.info(f"Indexed multi BAM: {std_bai}")
+            except Exception as e:
+                logger.warning(f"Could not index BAM {std_bam}: {e}")
+
+    if web:
+        p = os.path.join(expected_outs_dir, 'web_summary.html'); _relink(web, p); created['summary'] = p
+    if metrics:
+        p = os.path.join(expected_outs_dir, 'metrics_summary.csv'); _relink(metrics, p); created['metrics'] = p
+    if vdj_t:
+        # Expose the VDJ contigs/clonotypes for the custom TCR layer downstream.
+        p = os.path.join(expected_outs_dir, 'vdj_t'); _relink(vdj_t, p); created['vdj_t'] = p
+
+    logger.info(f"Linked multi outputs into {expected_outs_dir}: {sorted(created)}")
+    return created
+
+
+def run_cellranger_multi(multi_id, libraries, gex_ref, vdj_ref, output_dir,
+                         localcores=None, localmem=None, create_bam=True,
+                         include_introns=True):
+    """Run `cellranger multi` for one patient (multi_id), then link its outputs
+    onto the standard flat filenames. Returns a result dict."""
+    if localcores is None:
+        localcores = cpu_count()
+    if localmem is None:
+        localmem = 64
+
+    if not verify_cellranger_installed():
+        return {'success': False, 'multi_id': multi_id, 'error': 'Cell Ranger not found'}
+
+    # The real run lives under cellranger/multi_runs/{multi_id}; the expected
+    # path cellranger/{multi_id}/outs/ is then populated with symlinks. Kept
+    # separate so `cellranger multi` never sees a pre-existing --id directory.
+    runs_base = os.path.join(output_dir, 'cellranger', 'multi_runs')
+    os.makedirs(runs_base, exist_ok=True)
+    run_dir = os.path.join(runs_base, multi_id)
+    cleanup_directory(run_dir)
+
+    config_path = os.path.join(runs_base, f'{multi_id}_multi_config.csv')
+    try:
+        write_multi_config(config_path, multi_id, libraries, gex_ref, vdj_ref,
+                           create_bam=create_bam, include_introns=include_introns)
+    except Exception as e:
+        return {'success': False, 'multi_id': multi_id, 'error': f'config error: {e}'}
+
+    cmd = ['cellranger', 'multi', f'--id={multi_id}', f'--csv={config_path}',
+           f'--localcores={localcores}', f'--localmem={localmem}']
+    logger.info(f"Running: {' '.join(cmd)} (cwd={runs_base})")
+
+    original_dir = os.getcwd()
+    os.chdir(runs_base)
+    try:
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    finally:
+        os.chdir(original_dir)
+
+    if result.returncode != 0:
+        logger.error(f"cellranger multi failed for {multi_id}")
+        return {'success': False, 'multi_id': multi_id, 'error': format_error_output(result)}
+
+    expected_outs_dir = os.path.join(output_dir, 'cellranger', multi_id, 'outs')
+    try:
+        created = link_multi_outputs(run_dir, expected_outs_dir)
+    except Exception as e:
+        return {'success': False, 'multi_id': multi_id, 'error': f'link outputs: {e}'}
+
+    return {'success': True, 'multi_id': multi_id, 'chemistry': 'multi', 'paths': created}
+
+
+def run_multi_from_snakemake(sample_id, status_output, output_dir, gex_ref, vdj_ref,
+                             libraries, localcores, localmem, create_bam, include_introns):
+    """Snakemake entry for multi mode. Writes a status JSON exactly like the
+    count path, so the checkpoint contract is unchanged."""
+    if not libraries:
+        write_status_json(status_output, sample_id, success=False,
+                          error=f"No libraries for multi group {sample_id}")
+        return
+    if not vdj_ref and any(str(r.get('feature_type')).startswith('VDJ') for r in libraries):
+        write_status_json(status_output, sample_id, success=False,
+                          error="VDJ libraries present but reference.vdj not set")
+        return
+
+    logger.info("multi group %s: %s" % (
+        sample_id, ", ".join(f"{r['fastq_id']}({r['feature_type']})" for r in libraries)))
+
+    result = run_cellranger_multi(
+        multi_id=sample_id, libraries=libraries, gex_ref=gex_ref, vdj_ref=vdj_ref,
+        output_dir=output_dir, localcores=localcores, localmem=localmem,
+        create_bam=create_bam, include_introns=include_introns,
+    )
+
+    if not result['success']:
+        write_status_json(status_output, sample_id, success=False,
+                          error=result.get('error', 'cellranger multi failed'))
+        logger.info("="*60)
+        logger.info(f"cellranger multi FAILED for {sample_id} (excluded by checkpoint)")
+        logger.info("="*60)
+        return
+
+    write_status_json(status_output, sample_id, success=True, chemistry='multi',
+                      paths=result.get('paths', {}))
+    logger.info("="*60)
+    logger.info(f"cellranger multi completed for {sample_id}")
+    logger.info("="*60)
+
+
+# =============================================================================
 # Snakemake Integration
 # =============================================================================
 
@@ -607,6 +873,9 @@ def run_from_snakemake():
     create_bam = params.create_bam
     output_dir = params.output_dir
     fastq_base_dir = getattr(params, 'fastq_base_dir', None)
+    mode = getattr(params, 'mode', 'count')
+    vdj_reference = getattr(params, 'vdj_reference', None)
+    multi_libraries = getattr(params, 'multi_libraries', [])
     
     # Get sample information from params
     samples_dict = params.samples_dict
@@ -619,6 +888,21 @@ def run_from_snakemake():
         file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
         logger.addHandler(file_handler)
     
+    # =========================================================================
+    # Branch: multi mode (paired GEX + VDJ) vs count mode (GEX only)
+    # =========================================================================
+    if mode == 'multi':
+        logger.info("="*60)
+        logger.info(f"CELL RANGER MULTI - patient: {sample_id}")
+        logger.info("="*60)
+        run_multi_from_snakemake(
+            sample_id=sample_id, status_output=status_output, output_dir=output_dir,
+            gex_ref=transcriptome_ref, vdj_ref=vdj_reference, libraries=multi_libraries,
+            localcores=localcores, localmem=localmem, create_bam=create_bam,
+            include_introns=include_introns,
+        )
+        return
+
     logger.info("="*60)
     logger.info(f"CELL RANGER COUNT - GSE: {sample_id}")
     logger.info("="*60)
@@ -872,10 +1156,37 @@ Examples:
     common.add_argument('--expect-cells', type=int, default=None, help='Expected number of cells')
     common.add_argument('--include-introns', action='store_true', default=True, help='Include intronic reads')
     common.add_argument('--no-bam', action='store_true', help='Skip BAM generation')
-    
+
+    # multi mode (paired GEX + VDJ) - standalone
+    multi_group = parser.add_argument_group('multi mode (paired GEX + VDJ)')
+    multi_group.add_argument('--library-sheet', help='Library sheet CSV from `ClusterCatcher inspect`')
+    multi_group.add_argument('--multi-id', help='Which multi_id (patient) to run from the sheet')
+    multi_group.add_argument('--vdj-reference', help='10x V(D)J reference directory')
+
     args = parser.parse_args()
     
-    # Determine mode: GSE-level or SRR-level
+    # Determine mode: multi, GSE-level, or SRR-level
+    if args.library_sheet and args.multi_id:
+        # multi mode: run one patient (multi_id) from the library sheet
+        logger.info(f"Running in MULTI mode for {args.multi_id}")
+        sheet = pd.read_csv(args.library_sheet)
+        rows = sheet[sheet['multi_id'].astype(str) == str(args.multi_id)].to_dict('records')
+        if not rows:
+            logger.error(f"multi_id {args.multi_id} not found in {args.library_sheet}")
+            sys.exit(1)
+        result = run_cellranger_multi(
+            multi_id=str(args.multi_id), libraries=rows,
+            gex_ref=args.transcriptome, vdj_ref=args.vdj_reference,
+            output_dir=args.output_dir, localcores=args.cores, localmem=args.memory,
+            create_bam=not args.no_bam, include_introns=args.include_introns,
+        )
+        if result['success']:
+            logger.info("SUCCESS - cellranger multi")
+            sys.exit(0)
+        else:
+            logger.error(f"FAILED: {result.get('error')}")
+            sys.exit(1)
+
     if args.gse_id and args.pickle_file:
         # GSE-level processing
         logger.info(f"Running in GSE mode for {args.gse_id}")
