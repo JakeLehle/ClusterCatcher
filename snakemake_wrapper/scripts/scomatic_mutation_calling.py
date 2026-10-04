@@ -22,7 +22,7 @@ Usage:
     Called by Snakemake or run standalone with arguments.
 
 Author: Jake Lehle
-Date: 2025
+Date: 2026
 """
 
 import os
@@ -47,6 +47,7 @@ from math import ceil
 from time import perf_counter
 from os import cpu_count
 from pathlib import Path
+from collections import defaultdict
 
 # Configure logging
 logging.basicConfig(
@@ -534,8 +535,66 @@ def run_single_cell_genotype(args):
             shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-def filter_and_annotate_sc_genotypes(input_dir, variant_file, output_root, sample_id):
-    """Filter single cell genotypes and add trinucleotide context"""
+def build_barcode_map(adata_pp, sample_col):
+    """
+    Build {sample_id: {bare_barcode: adata_obs_name}}.
+
+    Why this exists
+    ---------------
+    Every SComatic output is keyed on a BARE barcode, because
+    SingleCellGenotype.py and SitesPerCell.py both do
+    ``barcode.split("-")[0]`` before writing. AnnData, meanwhile, is keyed on
+    the canonical name built in scanpy_qc_annotation.py:
+    ``f"{sample_id}_{cellranger_barcode}"`` -> e.g. SRR13177101_AAACCT...-1.
+
+    Previously the two sides were reconciled by string-building
+    ``bare + "-1-" + sample_id``, which matches NEITHER namespace, so every
+    join silently produced zero rows. Mapping through this dict instead keeps
+    the SComatic side anchored to the AnnData names, and does not assume the
+    CellRanger suffix is always "-1".
+    """
+    bc_map = defaultdict(dict)
+    samples = adata_pp.obs[sample_col].astype(str).values
+    bare = adata_pp.obs['original_barcode'].astype(str).values
+    obs_names = adata_pp.obs['cell_barcodes'].astype(str).values
+
+    collisions = 0
+    for s, b, o in zip(samples, bare, obs_names):
+        if b in bc_map[s]:
+            collisions += 1
+        bc_map[s][b] = o
+
+    if collisions:
+        logger.warning(
+            f"build_barcode_map: {collisions} duplicate (sample, barcode) pairs; "
+            "the last entry wins"
+        )
+
+    total = sum(len(v) for v in bc_map.values())
+    if total:
+        example = next(iter(next(iter(bc_map.values())).values()))
+        logger.info(
+            f"Built barcode map: {total} cells across {len(bc_map)} samples "
+            f"(canonical form: {example})"
+        )
+    else:
+        logger.error("Built barcode map: EMPTY - no SComatic output can be joined to AnnData")
+    return dict(bc_map)
+
+
+def filter_and_annotate_sc_genotypes(input_dir, variant_file, output_root, sample_id,
+                                     barcode_map=None):
+    """Filter single cell genotypes and add trinucleotide context.
+
+    barcode_map : dict {bare_barcode: adata_obs_name} for THIS sample.
+        Required. Barcodes with no AnnData match are dropped rather than
+        silently carried forward under a name nothing downstream can join on.
+    """
+    if not barcode_map:
+        raise ValueError(
+            f"filter_and_annotate_sc_genotypes({sample_id}): barcode_map is required. "
+            "Without it the emitted CB values cannot be joined to AnnData."
+        )
     final_output_dir = os.path.join(output_root, 'FilteredSingleCellAlleles')
     os.makedirs(final_output_dir, exist_ok=True)
     
@@ -650,8 +709,19 @@ def filter_and_annotate_sc_genotypes(input_dir, variant_file, output_root, sampl
                 logger.info(f"No matching variants after filtering in {input_file}")
                 continue
                 
-            # Add barcode suffix
-            df_filtered['CB'] = df_filtered['CB'] + f"-1-{sample_id}"
+            # Map SComatic's bare barcodes onto the canonical AnnData obs_names.
+            mapped = df_filtered['CB'].astype(str).map(barcode_map)
+            n_unmapped = int(mapped.isna().sum())
+            if n_unmapped:
+                logger.warning(
+                    f"{sample_id}: {n_unmapped}/{len(mapped)} genotype barcodes in "
+                    f"{os.path.basename(input_file)} had no AnnData match; dropping"
+                )
+            df_filtered = df_filtered.loc[mapped.notna()].copy()
+            if df_filtered.empty:
+                logger.warning(f"No barcodes mapped to AnnData in {input_file}")
+                continue
+            df_filtered['CB'] = mapped.loc[mapped.notna()].values
             
             # Add trinucleotide context
             def get_trinucleotide(row):
@@ -736,14 +806,28 @@ def run_trinucleotide_context(args):
             shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-def generate_complete_callable_sites(output_dir, valid_samples, adata_pp, cell_annotations, sample_col):
-    """Generate complete callable sites file including all cells"""
+def generate_complete_callable_sites(output_dir, valid_samples, adata_pp, cell_annotations,
+                                     sample_col, barcode_map=None):
+    """Generate complete callable sites file including all cells.
+
+    Seeds the table from the AnnData obs_names and maps each sample's bare
+    SComatic barcodes onto those names via barcode_map, so the two namespaces
+    actually meet. Uses a dict lookup rather than a per-row scan of a
+    170k-row frame.
+    """
     combined_callable_dir = os.path.join(output_dir, 'CombinedCallableSites')
     os.makedirs(combined_callable_dir, exist_ok=True)
-    
-    all_cells = pd.DataFrame({'CB': cell_annotations['cell_barcodes']})
+
+    if barcode_map is None:
+        barcode_map = build_barcode_map(adata_pp, sample_col)
+
+    all_cells = pd.DataFrame({'CB': cell_annotations['cell_barcodes'].astype(str)})
     all_cells['SitesPerCell'] = 0
-    
+
+    # Position lookup: O(1) per row instead of scanning all_cells['CB'].values
+    cb_to_pos = {cb: i for i, cb in enumerate(all_cells['CB'].values)}
+    sites = np.zeros(len(all_cells), dtype=np.int64)
+
     stats = {
         'total_cells': len(all_cells),
         'processed_cells': 0,
@@ -751,40 +835,45 @@ def generate_complete_callable_sites(output_dir, valid_samples, adata_pp, cell_a
         'samples_processed': 0,
         'samples_missing': 0,
         'files_processed': 0,
-        'files_skipped': 0
+        'files_skipped': 0,
+        'files_with_data': 0,
+        'barcodes_unmapped': 0,
     }
-    
+
     for sample_id in tqdm(valid_samples, desc="Processing callable sites"):
         mask = adata_pp.obs[sample_col] == sample_id
         subset = adata_pp[mask, :]
-        
+
         # Get series_id if available, otherwise use sample_id
-        series_id = subset.obs['series_id'].iloc[0] if 'series_id' in subset.obs.columns else sample_id
-        
+        series_id = (str(subset.obs['series_id'].iloc[0]) if 'series_id' in subset.obs.columns and pd.notna(subset.obs['series_id'].iloc[0]) else sample_id)
+
         callable_sites_dir = os.path.join(
             output_dir, 'scomatic', series_id, sample_id, 'UniqueCellCallableSites'
         )
-        
+
         if not os.path.exists(callable_sites_dir):
             stats['samples_missing'] += 1
             continue
-            
+
         stats['samples_processed'] += 1
-        
+        sample_lookup = barcode_map.get(str(sample_id), {})
+        if not sample_lookup:
+            logger.warning(f"No AnnData barcodes for sample {sample_id}; its callable sites cannot be joined")
+
         callable_files = glob.glob(os.path.join(callable_sites_dir, "*.SitesPerCell.tsv"))
-        
+
         if not callable_files:
             callable_files = glob.glob(os.path.join(callable_sites_dir, "*.tsv"))
-        
+
         for file_path in callable_files:
             try:
                 if os.path.getsize(file_path) < 20:
                     stats['files_skipped'] += 1
                     continue
-                
+
                 with open(file_path, 'r') as f:
                     first_line = f.readline()
-                
+
                 if ',' in first_line:
                     df = pd.read_csv(file_path, sep=',')
                 elif '\t' in first_line:
@@ -792,51 +881,78 @@ def generate_complete_callable_sites(output_dir, valid_samples, adata_pp, cell_a
                 else:
                     stats['files_skipped'] += 1
                     continue
-                
+
                 if df.empty:
                     stats['files_skipped'] += 1
                     continue
-                
+
                 if 'CB' not in df.columns or 'SitesPerCell' not in df.columns:
                     stats['files_skipped'] += 1
                     continue
-                    
-                df['CB'] = df['CB'] + f"-1-{sample_id}"
-                
-                cells_updated = 0
-                for _, row in df.iterrows():
-                    if row['CB'] in all_cells['CB'].values:
-                        idx = all_cells.index[all_cells['CB'] == row['CB']][0]
-                        all_cells.at[idx, 'SitesPerCell'] = row['SitesPerCell']
-                        cells_updated += 1
-                
-                stats['processed_cells'] += cells_updated
+
+                # A real per-cell table with real rows. If NONE of these ever
+                # match a cell, that is a namespace failure, not empty data.
+                stats['files_with_data'] += 1
+
+                # Bare SComatic barcode -> canonical AnnData obs_name
+                mapped = df['CB'].astype(str).map(sample_lookup)
+                stats['barcodes_unmapped'] += int(mapped.isna().sum())
+                keep = mapped.notna()
+                if not keep.any():
+                    stats['files_skipped'] += 1
+                    continue
+
+                positions = mapped[keep].map(cb_to_pos)
+                in_table = positions.notna()
+                if in_table.any():
+                    idx = positions[in_table].astype(int).values
+                    vals = pd.to_numeric(
+                        df.loc[keep, 'SitesPerCell'][in_table.values], errors='coerce'
+                    ).fillna(0).astype(np.int64).values
+                    sites[idx] = vals
+
+                stats['processed_cells'] += int(in_table.sum())
                 stats['files_processed'] += 1
-                    
+
             except Exception as e:
                 logger.error(f"Error processing {file_path}: {str(e)}")
                 stats['files_skipped'] += 1
                 continue
-            
+
+    all_cells['SitesPerCell'] = sites
     stats['missing_cells'] = stats['total_cells'] - stats['processed_cells']
-    
+
     output_path = os.path.join(combined_callable_dir, 'complete_callable_sites.tsv')
     all_cells.to_csv(output_path, sep='\t', index=False)
-    
+
     stats_path = os.path.join(combined_callable_dir, 'callable_sites_stats.txt')
     with open(stats_path, 'w') as f:
         f.write("Callable Sites Processing Statistics\n")
         f.write("="*50 + "\n")
         for key, value in stats.items():
             f.write(f"{key}: {value}\n")
-    
+
     logger.info(f"Saved complete callable sites to: {output_path}")
     logger.info(f"Statistics: {stats}")
-    
+
+    # Fail loud. Reading real per-cell files and matching zero cells is
+    # structurally impossible with correct barcodes, and silently writing a
+    # table of zeros is what let this go unnoticed across many runs.
+    if stats['files_with_data'] > 0 and stats['processed_cells'] == 0:
+        raise RuntimeError(
+            "Callable sites: read {f} populated per-cell files but matched 0 of {t} "
+            "cells ({u} barcodes had no AnnData match). This is a barcode namespace "
+            "mismatch, not an absence of data. Wrote {p} for inspection.".format(
+                f=stats['files_with_data'], t=stats['total_cells'],
+                u=stats['barcodes_unmapped'], p=output_path)
+        )
+
     return output_path
 
 
-def prepare_sample_args(sample_id, adata_pp, output_dir, scomatic_scripts_dir, ref_genome, sample_col, custom_genotype_script=None):
+
+
+def prepare_sample_args(sample_id, adata_pp, output_dir, scomatic_scripts_dir, ref_genome, sample_col, custom_genotype_script=None, barcode_map=None):
     """Prepare arguments for sample processing with phase completion validation"""
     if not all([adata_pp is not None, output_dir, scomatic_scripts_dir, ref_genome]):
         raise ValueError("Missing required arguments")
@@ -847,7 +963,7 @@ def prepare_sample_args(sample_id, adata_pp, output_dir, scomatic_scripts_dir, r
         return None
         
     subset = adata_pp[mask, :]
-    series_id = subset.obs['series_id'].iloc[0] if 'series_id' in subset.obs.columns else sample_id
+    series_id = (str(subset.obs['series_id'].iloc[0]) if 'series_id' in subset.obs.columns and pd.notna(subset.obs['series_id'].iloc[0]) else sample_id)
     
     scomatic_dir = os.path.join(output_dir, 'scomatic', series_id, sample_id)
     variant_calling_dir = os.path.join(scomatic_dir, 'VariantCalling')
@@ -918,6 +1034,7 @@ def prepare_sample_args(sample_id, adata_pp, output_dir, scomatic_scripts_dir, r
     
     return {
         'sample_id': sample_id,
+        'barcode_map': (barcode_map or {}).get(str(sample_id), {}),
         'callable_args': callable_args,
         'sites_per_cell_args': sites_per_cell_args,
         'genotype_args': genotype_args,
@@ -998,7 +1115,8 @@ def process_sample(sample_args):
                     raise FileNotFoundError(f"Input directory not found: {input_dir}")
                 
                 processed_files, combined_data = filter_and_annotate_sc_genotypes(
-                    input_dir, variant_file, sample_args['directories']['root'], sample_id
+                    input_dir, variant_file, sample_args['directories']['root'], sample_id,
+                    barcode_map=sample_args.get('barcode_map')
                 )
                 results['filtered_genotypes'] = bool(processed_files)
                 results['combined_data'] = combined_data
@@ -1153,6 +1271,10 @@ def run_scomatic_pipeline(
             valid_samples = [s for s in sample_ids if s in unique_samples_in_adata]
         
         logger.info(f"Found {len(valid_samples)} valid samples to process: {valid_samples}")
+
+        # Canonical (sample, bare barcode) -> AnnData obs_name map. Every
+        # SComatic -> AnnData join below goes through this.
+        barcode_map = build_barcode_map(adata_pp, sample_col)
         
         if not valid_samples:
             logger.error("No valid samples found! Check that sample IDs match between AnnData and config.")
@@ -1169,7 +1291,8 @@ def run_scomatic_pipeline(
             # Generate callable sites (all zeros)
             cell_annotations = pd.read_csv(cell_annotations_path, sep='\t')
             callable_path = generate_complete_callable_sites(
-                mutations_dir, [], adata_pp, cell_annotations, sample_col
+                mutations_dir, [], adata_pp, cell_annotations, sample_col,
+                barcode_map=build_barcode_map(adata_pp, sample_col)
             )
             
             return {
@@ -1194,7 +1317,7 @@ def run_scomatic_pipeline(
             subset = adata_pp[mask, :]
             
             # Get series_id if available, otherwise use sample_id
-            series_id = subset.obs['series_id'].iloc[0] if 'series_id' in subset.obs.columns else sample_id
+            series_id = (str(subset.obs['series_id'].iloc[0]) if 'series_id' in subset.obs.columns and pd.notna(subset.obs['series_id'].iloc[0]) else sample_id)
             
             # Find BAM file
             sample_cellranger_dir = os.path.join(cellranger_dir, sample_id, "outs")
@@ -1260,7 +1383,7 @@ def run_scomatic_pipeline(
         for sample_id in valid_samples:
             mask = adata_pp.obs[sample_col] == sample_id
             subset = adata_pp[mask, :]
-            series_id = subset.obs['series_id'].iloc[0] if 'series_id' in subset.obs.columns else sample_id
+            series_id = (str(subset.obs['series_id'].iloc[0]) if 'series_id' in subset.obs.columns and pd.notna(subset.obs['series_id'].iloc[0]) else sample_id)
             
             scomatic_sample_dir = os.path.join(mutations_dir, 'scomatic', series_id, sample_id)
             
@@ -1292,7 +1415,7 @@ def run_scomatic_pipeline(
         for sample_id in valid_samples:
             mask = adata_pp.obs[sample_col] == sample_id
             subset = adata_pp[mask, :]
-            series_id = subset.obs['series_id'].iloc[0] if 'series_id' in subset.obs.columns else sample_id
+            series_id = (str(subset.obs['series_id'].iloc[0]) if 'series_id' in subset.obs.columns and pd.notna(subset.obs['series_id'].iloc[0]) else sample_id)
             
             scomatic_sample_dir = os.path.join(mutations_dir, 'scomatic', series_id, sample_id)
             basecell_counts_dir = os.path.join(scomatic_sample_dir, 'BaseCellCounts')
@@ -1320,7 +1443,7 @@ def run_scomatic_pipeline(
         for sample_id in valid_samples:
             mask = adata_pp.obs[sample_col] == sample_id
             subset = adata_pp[mask, :]
-            series_id = subset.obs['series_id'].iloc[0] if 'series_id' in subset.obs.columns else sample_id
+            series_id = (str(subset.obs['series_id'].iloc[0]) if 'series_id' in subset.obs.columns and pd.notna(subset.obs['series_id'].iloc[0]) else sample_id)
             
             scomatic_sample_dir = os.path.join(mutations_dir, 'scomatic', series_id, sample_id)
             merged_counts_file = os.path.join(scomatic_sample_dir, 'MergedCounts', f"{sample_id}.BaseCellCounts.AllCellTypes.tsv")
@@ -1362,7 +1485,7 @@ def run_scomatic_pipeline(
         for sample_id in variant_valid_samples:
             mask = adata_pp.obs[sample_col] == sample_id
             subset = adata_pp[mask, :]
-            series_id = subset.obs['series_id'].iloc[0] if 'series_id' in subset.obs.columns else sample_id
+            series_id = (str(subset.obs['series_id'].iloc[0]) if 'series_id' in subset.obs.columns and pd.notna(subset.obs['series_id'].iloc[0]) else sample_id)
             
             scomatic_sample_dir = os.path.join(mutations_dir, 'scomatic', series_id, sample_id)
             variant_calling_dir = os.path.join(scomatic_sample_dir, 'VariantCalling')
@@ -1393,7 +1516,8 @@ def run_scomatic_pipeline(
                 scomatic_scripts_dir=scomatic_scripts_dir,
                 ref_genome=ref_genome,
                 sample_col=sample_col,
-                custom_genotype_script=custom_genotype_script
+                custom_genotype_script=custom_genotype_script,
+                barcode_map=barcode_map
             ) for sample_id in final_valid_samples
         ]
         all_sample_args = [args for args in all_sample_args if args is not None]
@@ -1447,7 +1571,8 @@ def run_scomatic_pipeline(
         # Generate callable sites
         cell_annotations = pd.read_csv(cell_annotations_path, sep='\t')
         callable_path = generate_complete_callable_sites(
-            mutations_dir, final_valid_samples, adata_pp, cell_annotations, sample_col
+            mutations_dir, final_valid_samples, adata_pp, cell_annotations, sample_col,
+            barcode_map=barcode_map
         )
         
         # Summary

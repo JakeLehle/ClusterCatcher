@@ -16,7 +16,7 @@ This script:
 7. Generates comprehensive visualizations
 
 Author: Jake Lehle
-Date: 2025
+Date: 2026
 """
 
 import os
@@ -249,7 +249,9 @@ def fit_signatures_nnls(mutation_matrix, signature_matrix, verbose=True):
         logger.info("Fitting signatures using NNLS...")
     
     # Align indices
-    if not all(mutation_matrix.index == signature_matrix.index):
+    # .equals() instead of all(a == b): the elementwise compare raises on a
+    # length mismatch, which is exactly the case this branch exists to handle.
+    if not mutation_matrix.index.equals(signature_matrix.index):
         common_contexts = mutation_matrix.index.intersection(signature_matrix.index)
         mutation_matrix = mutation_matrix.loc[common_contexts]
         signature_matrix = signature_matrix.loc[common_contexts]
@@ -349,8 +351,23 @@ def evaluate_reconstruction(original_matrix, reconstructed_matrix, verbose=True)
     pearson_corrs = np.array(pearson_corrs)
     cosine_sims = np.array(cosine_sims)
     
-    quality = "EXCELLENT" if relative_error < 0.1 else "GOOD" if relative_error < 0.2 else "MODERATE" if relative_error < 0.3 else "POOR"
-    quality_corr = "EXCELLENT" if np.nanmean(pearson_corrs) > 0.8 else "GOOD" if np.nanmean(pearson_corrs) > 0.6 else "MODERATE" if np.nanmean(pearson_corrs) > 0.4 else "POOR"
+    # An all-zero input matrix drives relative_error to 0 via the guard above,
+    # which previously reported "EXCELLENT" for a fit of nothing onto nothing.
+    # That label is what let a silently broken join look like a successful run.
+    if frobenius_norm_original == 0:
+        logger.error(
+            "Original mutation matrix is all zeros - reconstruction metrics are "
+            "meaningless. Check the callable-sites join and barcode namespaces."
+        )
+        quality = "N/A"
+    else:
+        quality = "EXCELLENT" if relative_error < 0.1 else "GOOD" if relative_error < 0.2 else "MODERATE" if relative_error < 0.3 else "POOR"
+
+    mean_r = np.nanmean(pearson_corrs) if len(pearson_corrs) else np.nan
+    if np.isnan(mean_r):
+        quality_corr = "N/A"
+    else:
+        quality_corr = "EXCELLENT" if mean_r > 0.8 else "GOOD" if mean_r > 0.6 else "MODERATE" if mean_r > 0.4 else "POOR"
     
     if verbose:
         logger.info(f"Frobenius error: {frobenius_error:.2f}, Relative: {100*relative_error:.2f}%")
@@ -530,9 +547,19 @@ def plot_signature_umaps(adata, sig_cols, output_dir):
 def run_signature_analysis(
     mutations_file, adata_path, cosmic_file, output_dir,
     callable_sites_file=None, use_scree=False, core_sigs=None,
-    candidate_order=None, mut_threshold=0, max_sigs=15, hnscc_only=False
+    candidate_order=None, mut_threshold=0, max_sigs=15, hnscc_only=False,
+    callable_handling='zero'
 ):
-    """Run complete signature analysis."""
+    """Run complete signature analysis.
+
+    callable_handling : {'zero', 'drop'}
+        What to do with cells that have no callable sites. 'zero' (the
+        historical behavior) sets their mutation counts to 0, which asserts
+        they carry no mutations. 'drop' removes them from the fit, which
+        treats them as unassessed. 'drop' is the more defensible choice for
+        burden comparisons; 'zero' is kept as the default so this patch does
+        not silently change results.
+    """
     logger.info("="*60)
     logger.info("SIGNATURE ANALYSIS PIPELINE")
     logger.info("="*60)
@@ -589,11 +616,55 @@ def run_signature_analysis(
         try:
             callable_df = pd.read_csv(callable_sites_file, sep='\t')
             if 'CB' in callable_df.columns:
-                callable_bcs = set(callable_df['CB'])
-                missing = set(mut_matrix.columns) - callable_bcs
+                callable_all = set(callable_df['CB'].astype(str))
+                mut_cols = set(mut_matrix.columns.astype(str))
+
+                overlap = len(mut_cols & callable_all)
+                logger.info(
+                    f"Callable-sites join: {overlap}/{len(mut_cols)} mutation barcodes "
+                    f"present in the callable-sites table"
+                )
+
+                # Zero overlap means the two files are in different barcode
+                # namespaces. Treating that as "no cell is callable" silently
+                # destroys every mutation, so refuse instead.
+                if overlap == 0:
+                    raise RuntimeError(
+                        "No mutation barcode matched the callable-sites table. This is a "
+                        "barcode namespace mismatch upstream, not an absence of mutations.\n"
+                        f"  example mutation barcode:       {sorted(mut_cols)[0]!r}\n"
+                        f"  example callable-sites barcode: {sorted(callable_all)[0]!r}"
+                    )
+
+                # A cell is assessable only if it has a positive callable-site
+                # count. Absent from the table is "unknown", not "zero".
+                if 'SitesPerCell' in callable_df.columns:
+                    counts = pd.to_numeric(callable_df['SitesPerCell'], errors='coerce').fillna(0)
+                    assessable = set(callable_df.loc[counts > 0, 'CB'].astype(str))
+                else:
+                    assessable = callable_all
+
+                missing = mut_cols - assessable
                 if missing:
-                    logger.info(f"Setting {len(missing)} cells not in callable sites to 0")
-                    mut_matrix.loc[:, list(missing)] = 0
+                    if str(callable_handling).lower() == 'drop':
+                        logger.info(
+                            f"Dropping {len(missing)} cells with no callable sites "
+                            f"(callable_handling='drop')"
+                        )
+                        mut_matrix = mut_matrix.drop(columns=list(missing))
+                    else:
+                        logger.info(f"Setting {len(missing)} cells not in callable sites to 0")
+                        mut_matrix.loc[:, list(missing)] = 0
+
+                if mut_matrix.shape[1] == 0 or not np.any(mut_matrix.values):
+                    raise RuntimeError(
+                        "Callable-sites handling left nothing to fit: "
+                        f"{len(missing)} of {len(mut_cols)} cells were removed or zeroed. "
+                        "Check that the callable-sites table actually has nonzero "
+                        "SitesPerCell values."
+                    )
+        except RuntimeError:
+            raise
         except Exception as e:
             logger.warning(f"Could not process callable sites file: {e}")
     
@@ -622,6 +693,13 @@ def run_signature_analysis(
     # Fit and evaluate
     fitting = fit_signatures_nnls(mut_matrix, final_sigs)
     evaluation = evaluate_reconstruction(mut_matrix, fitting['reconstruction'])
+
+    # A fit in which every weight is zero is not a result, it is a failed join.
+    if fitting['weights'].shape[1] > 0 and not np.any(fitting['weights'].values):
+        raise RuntimeError(
+            "Every signature weight came back zero. The matrix reaching NNLS held no "
+            "counts - check the callable-sites join logged above."
+        )
     
     # Plot results
     plot_results(fitting['weights'], evaluation, figures_dir)
@@ -644,6 +722,20 @@ def run_signature_analysis(
     
     # Add to adata
     muts_per_cell = mut_matrix.sum(axis=0)
+
+    matched = int(pd.Index(muts_per_cell.index.astype(str)).isin(adata.obs.index.astype(str)).sum())
+    logger.info(
+        f"AnnData join: {matched}/{len(muts_per_cell)} mutation barcodes matched "
+        f"adata.obs index"
+    )
+    if matched == 0:
+        raise RuntimeError(
+            "No mutation barcode matched adata.obs index, so total_mutations and every "
+            "SBS column would be written as zero.\n"
+            f"  example mutation barcode: {str(muts_per_cell.index[0])!r}\n"
+            f"  example adata obs_name:   {str(adata.obs.index[0])!r}"
+        )
+
     muts_reindex = muts_per_cell.reindex(adata.obs.index).fillna(0)
     adata.obs['total_mutations'] = muts_reindex.values.astype(int)
     
@@ -697,7 +789,8 @@ def run_from_snakemake():
         candidate_order=getattr(snakemake.params, 'candidate_order', None),
         mut_threshold=getattr(snakemake.params, 'mutation_threshold', 0),
         max_sigs=getattr(snakemake.params, 'max_signatures', 15),
-        hnscc_only=getattr(snakemake.params, 'hnscc_only', False)
+        hnscc_only=getattr(snakemake.params, 'hnscc_only', False),
+        callable_handling=getattr(snakemake.params, 'callable_handling', 'zero')
     )
 
 
@@ -715,6 +808,8 @@ def main():
     parser.add_argument('--mutation-threshold', type=int, default=0, help='Minimum mutations per cell')
     parser.add_argument('--max-signatures', type=int, default=15, help='Maximum signatures to test')
     parser.add_argument('--hnscc-only', action='store_true', help='Use HNSCC-specific signatures only')
+    parser.add_argument('--callable-handling', choices=['zero', 'drop'], default='zero',
+                        help="Cells with no callable sites: 'zero' their counts (default) or 'drop' them")
     
     args = parser.parse_args()
     
@@ -729,7 +824,8 @@ def main():
         candidate_order=args.candidate_order,
         mut_threshold=args.mutation_threshold,
         max_sigs=args.max_signatures,
-        hnscc_only=args.hnscc_only
+        hnscc_only=args.hnscc_only,
+        callable_handling=args.callable_handling
     )
 
 

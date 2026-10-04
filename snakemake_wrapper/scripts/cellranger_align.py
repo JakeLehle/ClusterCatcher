@@ -692,27 +692,33 @@ def link_multi_outputs(real_run_dir, expected_outs_dir):
             f"No per_sample_outs directories under {per_sample}. outs tree:\n" + _tree(outs)
         )
     sdir = sample_dirs[0]                      # non-multiplexed multi -> single per-sample dir
-    count_dir = os.path.join(sdir, 'count')
 
-    h5 = _find_one([
-        os.path.join(count_dir, 'sample_filtered_feature_bc_matrix.h5'),
-        os.path.join(count_dir, '*filtered_feature_bc_matrix.h5'),
-    ])
-    mtx_dir = _find_one([
-        os.path.join(count_dir, 'sample_filtered_feature_bc_matrix'),
-        os.path.join(count_dir, '*filtered_feature_bc_matrix'),
-    ])
-    bam = _find_one([
-        os.path.join(count_dir, 'sample_alignments.bam'),
-        os.path.join(count_dir, '*.bam'),
-    ])
+    # Per-sample outputs live either directly under per_sample_outs/{sample}/
+    # (Cell Ranger 8+) or under a count/ subdirectory (older layouts). Search
+    # both, preferring exact names over globs, so the shim is version-agnostic.
+    search_dirs = [os.path.join(sdir, 'count'), sdir]
+
+    h5 = _find_one(
+        [os.path.join(d, 'sample_filtered_feature_bc_matrix.h5') for d in search_dirs]
+        + [os.path.join(d, '*filtered_feature_bc_matrix.h5') for d in search_dirs]
+    )
+    mtx_dir = _find_one(
+        [os.path.join(d, 'sample_filtered_feature_bc_matrix') for d in search_dirs]
+        + [os.path.join(d, '*filtered_feature_bc_matrix') for d in search_dirs]
+    )
+    bam = _find_one(
+        [os.path.join(d, 'sample_alignments.bam') for d in search_dirs]
+        + [os.path.join(d, 'possorted_genome_bam.bam') for d in search_dirs]
+        + [os.path.join(d, '*.bam') for d in search_dirs]
+    )
     web = _find_one([os.path.join(sdir, 'web_summary.html')])
     metrics = _find_one([os.path.join(sdir, 'metrics_summary.csv')])
     vdj_t = _find_one([os.path.join(sdir, 'vdj_t')])
 
     if not h5 or not mtx_dir:
         raise FileNotFoundError(
-            f"Could not locate filtered matrix under {count_dir}. outs tree:\n" + _tree(outs)
+            f"Could not locate filtered matrix under {sdir} (or its count/ subdir). "
+            f"outs tree:\n" + _tree(outs)
         )
 
     os.makedirs(expected_outs_dir, exist_ok=True)
@@ -771,6 +777,28 @@ def run_cellranger_multi(multi_id, libraries, gex_ref, vdj_ref, output_dir,
     runs_base = os.path.join(output_dir, 'cellranger', 'multi_runs')
     os.makedirs(runs_base, exist_ok=True)
     run_dir = os.path.join(runs_base, multi_id)
+
+    # Idempotency: if a completed multi run already exists on disk, skip the
+    # (expensive, multi-hour) cellranger multi call and only rebuild the output
+    # symlinks. This lets a forced re-run relink in seconds after a shim fix,
+    # without repeating alignment. Checked BEFORE cleanup so we never delete a
+    # good run.
+    already_done = (
+        glob.glob(os.path.join(run_dir, 'outs', 'per_sample_outs', '*',
+                               'sample_filtered_feature_bc_matrix.h5'))
+        + glob.glob(os.path.join(run_dir, 'outs', 'per_sample_outs', '*',
+                                 'count', 'sample_filtered_feature_bc_matrix.h5'))
+    )
+    if already_done:
+        logger.info(f"Existing completed multi run found for {multi_id}; "
+                    f"skipping cellranger multi and relinking outputs only.")
+        expected_outs_dir = os.path.join(output_dir, 'cellranger', multi_id, 'outs')
+        try:
+            created = link_multi_outputs(run_dir, expected_outs_dir)
+        except Exception as e:
+            return {'success': False, 'multi_id': multi_id, 'error': f'link outputs: {e}'}
+        return {'success': True, 'multi_id': multi_id, 'chemistry': 'multi', 'paths': created}
+
     cleanup_directory(run_dir)
 
     config_path = os.path.join(runs_base, f'{multi_id}_multi_config.csv')
