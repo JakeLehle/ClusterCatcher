@@ -759,7 +759,7 @@ def generate_complete_callable_sites(output_dir, valid_samples, adata_pp, cell_a
         subset = adata_pp[mask, :]
         
         # Get series_id if available, otherwise use sample_id
-        series_id = subset.obs['series_id'].iloc[0] if 'series_id' in subset.obs.columns else sample_id
+        series_id = (str(subset.obs['series_id'].iloc[0]) if 'series_id' in subset.obs.columns and pd.notna(subset.obs['series_id'].iloc[0]) else sample_id)
         
         callable_sites_dir = os.path.join(
             output_dir, 'scomatic', series_id, sample_id, 'UniqueCellCallableSites'
@@ -847,7 +847,7 @@ def prepare_sample_args(sample_id, adata_pp, output_dir, scomatic_scripts_dir, r
         return None
         
     subset = adata_pp[mask, :]
-    series_id = subset.obs['series_id'].iloc[0] if 'series_id' in subset.obs.columns else sample_id
+    series_id = (str(subset.obs['series_id'].iloc[0]) if 'series_id' in subset.obs.columns and pd.notna(subset.obs['series_id'].iloc[0]) else sample_id)
     
     scomatic_dir = os.path.join(output_dir, 'scomatic', series_id, sample_id)
     variant_calling_dir = os.path.join(scomatic_dir, 'VariantCalling')
@@ -1194,7 +1194,7 @@ def run_scomatic_pipeline(
             subset = adata_pp[mask, :]
             
             # Get series_id if available, otherwise use sample_id
-            series_id = subset.obs['series_id'].iloc[0] if 'series_id' in subset.obs.columns else sample_id
+            series_id = (str(subset.obs['series_id'].iloc[0]) if 'series_id' in subset.obs.columns and pd.notna(subset.obs['series_id'].iloc[0]) else sample_id)
             
             # Find BAM file
             sample_cellranger_dir = os.path.join(cellranger_dir, sample_id, "outs")
@@ -1260,7 +1260,7 @@ def run_scomatic_pipeline(
         for sample_id in valid_samples:
             mask = adata_pp.obs[sample_col] == sample_id
             subset = adata_pp[mask, :]
-            series_id = subset.obs['series_id'].iloc[0] if 'series_id' in subset.obs.columns else sample_id
+            series_id = (str(subset.obs['series_id'].iloc[0]) if 'series_id' in subset.obs.columns and pd.notna(subset.obs['series_id'].iloc[0]) else sample_id)
             
             scomatic_sample_dir = os.path.join(mutations_dir, 'scomatic', series_id, sample_id)
             
@@ -1292,7 +1292,7 @@ def run_scomatic_pipeline(
         for sample_id in valid_samples:
             mask = adata_pp.obs[sample_col] == sample_id
             subset = adata_pp[mask, :]
-            series_id = subset.obs['series_id'].iloc[0] if 'series_id' in subset.obs.columns else sample_id
+            series_id = (str(subset.obs['series_id'].iloc[0]) if 'series_id' in subset.obs.columns and pd.notna(subset.obs['series_id'].iloc[0]) else sample_id)
             
             scomatic_sample_dir = os.path.join(mutations_dir, 'scomatic', series_id, sample_id)
             basecell_counts_dir = os.path.join(scomatic_sample_dir, 'BaseCellCounts')
@@ -1320,7 +1320,7 @@ def run_scomatic_pipeline(
         for sample_id in valid_samples:
             mask = adata_pp.obs[sample_col] == sample_id
             subset = adata_pp[mask, :]
-            series_id = subset.obs['series_id'].iloc[0] if 'series_id' in subset.obs.columns else sample_id
+            series_id = (str(subset.obs['series_id'].iloc[0]) if 'series_id' in subset.obs.columns and pd.notna(subset.obs['series_id'].iloc[0]) else sample_id)
             
             scomatic_sample_dir = os.path.join(mutations_dir, 'scomatic', series_id, sample_id)
             merged_counts_file = os.path.join(scomatic_sample_dir, 'MergedCounts', f"{sample_id}.BaseCellCounts.AllCellTypes.tsv")
@@ -1362,7 +1362,7 @@ def run_scomatic_pipeline(
         for sample_id in variant_valid_samples:
             mask = adata_pp.obs[sample_col] == sample_id
             subset = adata_pp[mask, :]
-            series_id = subset.obs['series_id'].iloc[0] if 'series_id' in subset.obs.columns else sample_id
+            series_id = (str(subset.obs['series_id'].iloc[0]) if 'series_id' in subset.obs.columns and pd.notna(subset.obs['series_id'].iloc[0]) else sample_id)
             
             scomatic_sample_dir = os.path.join(mutations_dir, 'scomatic', series_id, sample_id)
             variant_calling_dir = os.path.join(scomatic_sample_dir, 'VariantCalling')
